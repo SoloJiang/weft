@@ -1966,6 +1966,24 @@ pub async fn list_threads(db: &Db, workspace_id: i32) -> Result<Vec<thread::Mode
         .await?)
 }
 
+/// Deduped thread ids that own at least one direction in `repo_id`
+/// `delete_repo` removes those
+/// directions (the threads themselves survive), so its caller revokes these
+/// threads' computer routes; `session_is_live` then refuses the removed
+/// directions while still allowing each thread's surviving ones.
+pub async fn thread_ids_for_repo(db: &Db, repo_id: i32) -> Result<Vec<i32>> {
+    let mut ids: Vec<i32> = direction::Entity::find()
+        .filter(direction::Column::RepoId.eq(repo_id))
+        .all(&db.0)
+        .await?
+        .into_iter()
+        .map(|d| d.thread_id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
 pub async fn list_repos(db: &Db, workspace_id: i32) -> Result<Vec<repo_ref::Model>> {
     Ok(repo_ref::Entity::find()
         .filter(repo_ref::Column::WorkspaceId.eq(workspace_id))
@@ -6255,6 +6273,38 @@ pub async fn list_lead_messages(db: &Db, thread_id: i32) -> Result<Vec<lead_mess
     // all other rows keep creation order. id ASC breaks same-effective-key ties.
     Ok(lead_message::Entity::find()
         .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .order_by(Expr::cust("COALESCE(seq, id)"), Order::Asc)
+        .order_by_asc(lead_message::Column::Id)
+        .all(&db.0)
+        .await?)
+}
+
+/// Only the tool rows of ONE session that can possibly carry an inline-image
+/// collection (`content` mentions `"images"`), oldest-first — the narrow
+/// candidate set `lead_chat::engine::enforce_durable_inline_image_cap_db`
+/// prunes over. that function
+/// used to load the thread's ENTIRE message history on every image-bearing
+/// tool result and filter in memory — a screenshot-heavy session repeatedly
+/// re-scanned all historical content (other sessions included), quadratic as
+/// the timeline grows, on the engine-consumer path. The `LIKE` filter is the
+/// same cheap substring pre-check the in-memory filter applied (a
+/// parse-avoidance fast path, not the counting predicate — the caller still
+/// parses and requires a genuine top-level `images` key).
+pub async fn list_session_image_tool_messages(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+) -> Result<Vec<lead_message::Model>> {
+    use sea_orm::Order;
+    let session_filter = match session_id {
+        Some(id) => lead_message::Column::SessionId.eq(id),
+        None => lead_message::Column::SessionId.is_null(),
+    };
+    Ok(lead_message::Entity::find()
+        .filter(lead_message::Column::ThreadId.eq(thread_id))
+        .filter(lead_message::Column::Kind.eq("tool"))
+        .filter(session_filter)
+        .filter(lead_message::Column::Content.like("%\"images\"%"))
         .order_by(Expr::cust("COALESCE(seq, id)"), Order::Asc)
         .order_by_asc(lead_message::Column::Id)
         .all(&db.0)

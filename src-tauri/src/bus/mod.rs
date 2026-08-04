@@ -1,4 +1,5 @@
 pub mod builtin_allow;
+pub mod computer_srv;
 pub mod global;
 pub mod inject;
 pub mod server;

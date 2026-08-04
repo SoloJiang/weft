@@ -10,6 +10,7 @@ use crate::store::entities::lead_message;
 use crate::store::{repo, Db};
 use dashmap::{DashMap, DashSet};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -238,6 +239,14 @@ pub struct Outgoing {
     /// True when the original send carried files or images (computed from the
     /// ORIGINAL inputs before per-turn image-spill clears out.images).
     pub has_attachments: bool,
+    /// Absolute paths of images already spilled to `$TMP/weft-attachments` by
+    /// the per-turn image-spill step (see `send()`), populated ONLY for the
+    /// codex app-server transport — exec keeps to its plain-text path listing
+    /// appended into `text` and never reads this field. `spawn_codex_turn`/
+    /// `codex_consumer`'s queue flush hand these to `Client::
+    /// start_turn_with_images` as `localImage` input items alongside the text.
+    /// Always empty for every other tool/transport.
+    pub local_image_paths: Vec<String>,
 }
 
 /// Busy/queue bookkeeping for one engine. Mirrors the TUI's own semantics:
@@ -314,6 +323,7 @@ impl TurnState {
                     origin_tag: None,
                     queue_id: None,
                     has_attachments: false,
+                    local_image_paths: Vec::new(),
                 })
             }
             // A message queued before the wake goes first; the wake slides up one.
@@ -517,9 +527,10 @@ fn reset_failed_hidden_turn(inner: &mut EngineInner, turn_id: i32) -> Option<Vec
     // be waiting on the admission gate even though this hidden spawn rolled
     // back. Its DB result must still linearize before a retry can replay it.
     inner.child = None;
-    // Dropping `child` kills it (kill_on_drop), so its session_gate slot must go
-    // with it — see `child_permit`'s doc for the leak this closes.
-    inner.child_permit = None;
+    // Dropping `child` kills it (kill_on_drop), so its session_gate slot and its
+    // computer bearer both go with it — see `release_child_slot`. Inside the
+    // turn_id+busy guard, as that helper requires.
+    release_child_slot(inner);
     inner.stdin = None;
     inner.current = None;
     inner.interrupting = false;
@@ -1275,6 +1286,10 @@ fn tool_row_status(has_output: bool, trackable: bool, is_error: bool) -> &'stati
 /// knows about, so the frontend can anchor that thread's branch here. Neither
 /// key is present at all when empty/None, so an ordinary tool call's content
 /// is byte-identical to pre-#99 output — same contract as `text_row_content`.
+/// `images` (screenshot data URIs, if the call itself already carries any —
+/// see `proto::ToolCall::images`) follows the identical "present only when
+/// non-empty" rule, so an old persisted row with no `images` key and a fresh
+/// image-less row parse identically on the frontend (default empty array).
 /// Pure and DB-free by design: `persist_tool_calls` is the only caller in the
 /// live path, but keeping this separate lets it be unit-tested directly.
 fn tool_row_content(
@@ -1294,6 +1309,9 @@ fn tool_row_content(
         }
         if !call.collab_threads.is_empty() {
             obj.insert("collabThreads".into(), call.collab_threads.clone().into());
+        }
+        if !call.images.is_empty() {
+            obj.insert("images".into(), call.images.clone().into());
         }
     }
     content
@@ -1351,8 +1369,232 @@ async fn persist_tool_calls(
     }
 }
 
+/// Merge a `ToolResultItem` into its running row's already-persisted content —
+/// pure and DB-free by the same split as `tool_row_content` (its sibling
+/// assembly point), so it's unit-testable directly. `output`/`is_error` are
+/// UNCONDITIONALLY overwritten: the call-side row only ever held a running
+/// placeholder for them (empty string / false), so the result is the first and
+/// only authoritative value either field gets. `images` follows that SAME
+/// "result overrides the call side" rule — written (replacing whatever the
+/// call-side JSON held, if anything) when the result carries any, and the key
+/// removed otherwise, so a call-side stub can never survive stale into the
+/// terminal row. `collabThreads` is intentionally NOT symmetric with that: it
+/// keeps its own "merge when non-empty, otherwise leave whatever's already
+/// there untouched" rule (see the comment below) because a `spawnAgent`
+/// call's `receiverThreadIds` becoming known here is filling in a value the
+/// call side legitimately hadn't resolved yet — not a terminal result
+/// superseding the call's own claim, so an empty item-side list must never
+/// erase a real thread id the call side already recorded.
+fn merge_tool_result_content(content: &mut serde_json::Value, item: &super::proto::ToolResultItem) {
+    let Some(obj) = content.as_object_mut() else {
+        return;
+    };
+    obj.insert("output".into(), item.output.clone().into());
+    obj.insert("is_error".into(), item.is_error.into());
+    // a `spawnAgent` collab call's `receiverThreadIds` is empty at
+    // item/started (captured — emptily — into this row's content by
+    // persist_tool_calls) and only becomes known HERE, at item/completed.
+    // Merge it in now so the frontend can still anchor that thread's branch to
+    // this row once it re-renders — until then, the child's own rows (already
+    // tagged with agentThread) have no known anchor yet and correctly render
+    // top-level/flat (collabBranches.ts's groupTimeline is a stateless
+    // whole-array recompute, so this is an honest "not resolved yet", not a
+    // wrong guess: nothing is hidden, it just hasn't grouped yet).
+    if !item.collab_threads.is_empty() {
+        obj.insert("collabThreads".into(), item.collab_threads.clone().into());
+    }
+    if item.images.is_empty() {
+        obj.remove("images");
+    } else {
+        obj.insert("images".into(), item.images.clone().into());
+    }
+}
+
+/// how many of a session's most
+/// recent tool-result rows may keep their inline screenshot data URIs in
+/// `content.images` at once. Screenshot data URIs run from a few hundred KB
+/// to a couple MB each (see `lead_chat::proto::cap_and_dedup_images`'s own
+/// `MAX_CHARS`); an unthrottled screenshot loop — Full/Always-granted
+/// computer use, no per-call card left to slow it down — can otherwise
+/// persist hundreds of these into SQLite with NO bound at all: this
+/// module's own per-CALL cap (`cap_and_dedup_images`, ≤4 images per single
+/// result) does nothing to stop that ACROSS calls, and `history` load then
+/// hands the whole accumulated payload to the frontend on every reload. Kept
+/// SMALL: an older screenshot is still reachable by its file path, which
+/// lives in the SAME row's `output` text (the "text path
+/// is never dropped" rule) — this cap only prunes the redundant INLINE
+/// base64 copy once it's no longer among the most recent few, never the
+/// on-disk file or the row's own text, and never the CURRENT call's own
+/// inline image (see `merge_tool_results`'s own doc). The
+/// P2: this cap is enforced per-SESSION (see
+/// `enforce_durable_inline_image_cap_db`'s own doc) — a thread's several
+/// lead/worker timelines each get their own `MAX_INLINE_IMAGE_ROWS` budget,
+/// not one shared across all of them.
+const MAX_INLINE_IMAGE_ROWS: usize = 4;
+
+/// Push a newly-completed, image-bearing tool row onto `rows` (oldest first)
+/// and return the updated queue plus every entry that must be evicted to
+/// keep it at [`MAX_INLINE_IMAGE_ROWS`] or fewer (oldest evicted first).
+/// Pure/synchronous — no `Db`/`AppHandle` — so this exact retention decision
+/// is unit-testable directly; `merge_tool_results` is the only production
+/// caller, and owns applying each eviction as its own `repo::
+/// update_lead_message` rewrite (stripping `images` from that row's OWN
+/// already-persisted content, keeping its `output` text untouched).
+fn track_inline_image_row(
+    mut rows: std::collections::VecDeque<(i32, bool, serde_json::Value)>,
+    new_row: (i32, bool, serde_json::Value),
+) -> (
+    std::collections::VecDeque<(i32, bool, serde_json::Value)>,
+    Vec<(i32, bool, serde_json::Value)>,
+) {
+    rows.push_back(new_row);
+    let mut evicted = Vec::new();
+    while rows.len() > MAX_INLINE_IMAGE_ROWS {
+        if let Some(oldest) = rows.pop_front() {
+            evicted.push(oldest);
+        }
+    }
+    (rows, evicted)
+}
+
+/// the DURABLE, restart-safe half of the inline-
+/// image retention cap. `inner.inline_image_rows` above only ever sees rows
+/// written during THIS process's own lifetime — a restart starts that queue
+/// empty, so a session that keeps napping computer-use screenshots across
+/// restarts could silently re-accumulate past `MAX_INLINE_IMAGE_ROWS` inline
+/// images in SQLite forever: nothing before this change closed the gap
+/// between "capped for one process's lifetime" and "capped, full stop", and
+/// `history` loads read straight off the store (`repo::list_lead_messages`,
+/// the SAME query this uses), so an unbounded on-disk backlog was handed to
+/// the frontend on every reload regardless of how recently the app itself
+/// restarted.
+///
+/// Queries this thread's OWN persisted `kind:"tool"` rows fresh — ascending
+/// by id/seq, matching `history`'s own order — every time a NEW inline image
+/// is about to be written, and strips `images` from every row beyond the
+/// `MAX_INLINE_IMAGE_ROWS` most recent, DURABLY, in the SAME store `history`
+/// reads from. Since the row just written is always the newest by id order,
+/// it can never itself land in the stripped slice as long as the cap is at
+/// least 1 — nothing here needs to special-case "never touch the row this
+/// very call just wrote". `inner.inline_image_rows`'s in-memory pass (in
+/// `merge_tool_results`, right after this call) stays as an additional
+/// (redundant but harmless — stripping an already-stripped row's absent
+/// `images` key is a no-op) fast path; THIS is now the authoritative one.
+///
+/// Split from the `&AppHandle`-taking wrapper below ([`enforce_durable_
+/// inline_image_cap`]) purely so this exact DB-mutating decision is
+/// unit-testable directly: this crate's `AppHandle` is the concrete `Wry`
+/// runtime with no `tauri::test::mock_app` path (see `post_stall_notice_via`'s
+/// own doc for the identical wall), so a function taking `&AppHandle` is
+/// unreachable from any test. Returns every `(row_id, content, status)` this
+/// call actually stripped and durably rewrote, so the wrapper can push each
+/// as a `Push::ToolResult` after this returns.
+///
+/// `session_id` scopes the candidate rows
+/// to ONE session's own timeline — `None` for the lead, `Some(id)` for a
+/// chat-mode worker — mirroring how every other per-timeline read in this
+/// module (e.g. `rewind`'s own `filter(|m| m.session_id == snap.session_id)`)
+/// treats `lead_message.session_id` as the timeline key, NOT `thread_id`
+/// alone. A thread can host several lead/worker sessions at once, each with
+/// its OWN chat history; before this fix, `list_lead_messages(db, thread_id)`
+/// pulled every session's tool rows into ONE shared retention queue, so a
+/// screenshot-heavy worker in repo A could strip the most-recent inline
+/// images off a DIFFERENT worker's (repo B's) timeline, leaving B under the
+/// `MAX_INLINE_IMAGE_ROWS` cap it's entitled to on its own.
+async fn enforce_durable_inline_image_cap_db(
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+) -> Vec<(i32, String, String)> {
+    // query ONLY this session's
+    // image-candidate tool rows — the old whole-thread `list_lead_messages`
+    // load re-scanned every session's entire history on each new screenshot,
+    // quadratic as the timeline grows, on the engine-consumer path.
+    let Ok(messages) = repo::list_session_image_tool_messages(db, thread_id, session_id).await
+    else {
+        return Vec::new();
+    };
+    // Oldest-first (matches the query's own order) every persisted
+    // tool row that STILL carries an inline image, scoped to THIS session
+    // alone (`session_id` above), paired with its already-parsed JSON.
+    //
+    // a row counts toward the
+    // retention limit ONLY when its parsed JSON has a genuine TOP-LEVEL
+    // `images` collection — NOT merely a `"images"` substring somewhere in the
+    // serialized content. A tool result can legitimately mention `"images"`
+    // below the top level (e.g. nested inside its own serialized input), and
+    // the strip below already refuses to touch such a row; but COUNTING it
+    // still inflated `keep_from` and could push a genuine older screenshot
+    // into the stripped slice even while fewer than `MAX_INLINE_IMAGE_ROWS`
+    // real image rows existed. Parsing up front and requiring a top-level key
+    // makes the boundary reflect real image rows only. The cheap `.contains`
+    // pre-check stays purely as a parse-avoidance fast path (this session's
+    // non-image rows never pay for a parse), NOT as the counting predicate.
+    let image_bearing: Vec<(&lead_message::Model, serde_json::Value)> = messages
+        .iter()
+        .filter_map(|m| {
+            let value = serde_json::from_str::<serde_json::Value>(&m.content).ok()?;
+            let has_top_level_images = value
+                .as_object()
+                .is_some_and(|obj| obj.contains_key("images"));
+            has_top_level_images.then_some((m, value))
+        })
+        .collect();
+    let keep_from = image_bearing.len().saturating_sub(MAX_INLINE_IMAGE_ROWS);
+    let mut stripped = Vec::new();
+    for (m, mut value) in image_bearing.into_iter().take(keep_from) {
+        // Guaranteed an object with a top-level `images` key — that is exactly
+        // the filter `image_bearing` was built from — so `remove` here always
+        // strips a real inline-image collection.
+        let Some(obj) = value.as_object_mut() else { continue };
+        if obj.remove("images").is_none() {
+            continue;
+        }
+        let content_str = value.to_string();
+        if repo::update_lead_message(db, m.id, &content_str, &m.status)
+            .await
+            .is_ok()
+        {
+            stripped.push((m.id, content_str, m.status.clone()));
+        }
+    }
+    stripped
+}
+
+/// The live wrapper: runs [`enforce_durable_inline_image_cap_db`] and pushes
+/// a `Push::ToolResult` for each row it actually stripped, so an open
+/// frontend timeline reflects the durable trim immediately rather than only
+/// on the next reload. `session_id` is threaded straight through to scope the
+/// cap to the calling session's own timeline (the
+/// Rec — see [`enforce_durable_inline_image_cap_db`]'s own doc for why).
+async fn enforce_durable_inline_image_cap(
+    app: &AppHandle,
+    db: &Db,
+    thread_id: i32,
+    session_id: Option<i32>,
+) {
+    for (message_id, content, status) in
+        enforce_durable_inline_image_cap_db(db, thread_id, session_id).await
+    {
+        let _ = app.emit(EVENT, Push::ToolResult { thread_id, message_id, content, status });
+    }
+}
+
 /// Merge tool results into their running rows (claude tool_result / codex
 /// item.completed); a result for an untracked row is dropped.
+///
+/// a result carrying inline images is tracked in
+/// `inner.inline_image_rows` (bounded, in-memory, this engine's own
+/// lifetime) AFTER it persists — [`track_inline_image_row`] then reports any
+/// OLDER row that must be pruned to stay at the cap, and each one has its
+/// `images` key stripped from its ALREADY-persisted content and rewritten,
+/// right here. This never touches the CURRENT item's own `content` (already
+/// written above, images intact) — M3-B's "this screenshot inlines for a
+/// capable engine" contract is unaffected; only OLDER rows' accumulated
+/// history is pruned. the AUTHORITATIVE cap is no
+/// longer this in-memory pass — see [`enforce_durable_inline_image_cap`],
+/// called right after it, for the restart-safe, DB-sourced enforcement that
+/// now bounds this regardless of how many times the app has restarted since.
 async fn merge_tool_results(
     app: &AppHandle,
     db: &Db,
@@ -1364,23 +1606,7 @@ async fn merge_tool_results(
         let Some((row_id, mut content)) = inner.tool_rows.remove(&item.id) else {
             continue;
         };
-        if let Some(obj) = content.as_object_mut() {
-            obj.insert("output".into(), item.output.into());
-            obj.insert("is_error".into(), item.is_error.into());
-            // issue #99: a `spawnAgent` collab call's `receiverThreadIds` is
-            // empty at item/started (captured — emptily — into this row's
-            // content by persist_tool_calls) and only becomes known HERE, at
-            // item/completed. Merge it in now so the frontend can still anchor
-            // that thread's branch to this row once it re-renders — until
-            // then, the child's own rows (already tagged with agentThread)
-            // have no known anchor yet and correctly render top-level/flat
-            // (collabBranches.ts's groupTimeline is a stateless whole-array
-            // recompute, so this is an honest "not resolved yet", not a wrong
-            // guess: nothing is hidden, it just hasn't grouped yet).
-            if !item.collab_threads.is_empty() {
-                obj.insert("collabThreads".into(), item.collab_threads.clone().into());
-            }
-        }
+        merge_tool_result_content(&mut content, &item);
         let status = if item.is_error { "error" } else { "complete" };
         let content_str = content.to_string();
         let _ = repo::update_lead_message(db, row_id, &content_str, status).await;
@@ -1393,6 +1619,41 @@ async fn merge_tool_results(
                 status: status.into(),
             },
         );
+        if !item.images.is_empty() {
+            let rows = std::mem::take(&mut inner.inline_image_rows);
+            let (rows, evicted) = track_inline_image_row(rows, (row_id, item.is_error, content));
+            inner.inline_image_rows = rows;
+            for (old_row_id, old_is_error, mut old_content) in evicted {
+                if let Some(obj) = old_content.as_object_mut() {
+                    obj.remove("images");
+                }
+                let old_status = if old_is_error { "error" } else { "complete" };
+                let old_content_str = old_content.to_string();
+                if repo::update_lead_message(db, old_row_id, &old_content_str, old_status)
+                    .await
+                    .is_ok()
+                {
+                    let _ = app.emit(
+                        EVENT,
+                        Push::ToolResult {
+                            thread_id,
+                            message_id: old_row_id,
+                            content: old_content_str,
+                            status: old_status.into(),
+                        },
+                    );
+                }
+            }
+            // the DB-write-path cap runs on every
+            // new inline image regardless of the in-memory pass above — see
+            // `enforce_durable_inline_image_cap`'s own doc for why this one,
+            // not the in-memory queue, is the authoritative bound.
+            // `inner.session_id` scopes it to THIS
+            // session's own timeline so a different session sharing the same
+            // thread can't have ITS most-recent inline images stripped by an
+            // unrelated session's screenshot volume.
+            enforce_durable_inline_image_cap(app, db, thread_id, inner.session_id).await;
+        }
     }
 }
 
@@ -1524,6 +1785,7 @@ async fn apply_lead_sentinels(
                         origin_tag: None,
                         queue_id: None,
                         has_attachments: false,
+                        local_image_paths: Vec::new(),
                     };
                     queue_hidden_delivery(app, inner, out);
                 }
@@ -1679,6 +1941,22 @@ async fn finalize_text_row(
     }
 }
 
+/// Nothing about a turn is in flight or half-written: no busy turn, no open
+/// text or tool rows, no queue. [`cleanup_disconnected_turn`] has nothing to
+/// tear down in that state and returns immediately.
+///
+/// Named rather than inlined because callers reason about the skip. Notably
+/// `codex_consumer`: an app-server that dies BETWEEN turns finds the engine in
+/// exactly this state, so anything that must happen on a disconnect — the
+/// bearer revoke especially — cannot be placed inside that cleanup alone.
+fn turn_state_is_untouched(inner: &EngineInner) -> bool {
+    !inner.turn.busy
+        && inner.current.is_none()
+        && inner.open_texts.is_empty()
+        && inner.turn.queue.is_empty()
+        && inner.tool_rows.is_empty()
+}
+
 async fn cleanup_disconnected_turn(
     app: &AppHandle,
     db: &Db,
@@ -1686,12 +1964,7 @@ async fn cleanup_disconnected_turn(
     fallback_status: &str,
 ) {
     let mut inner = eng.lock().await;
-    if !inner.turn.busy
-        && inner.current.is_none()
-        && inner.open_texts.is_empty()
-        && inner.turn.queue.is_empty()
-        && inner.tool_rows.is_empty()
-    {
+    if turn_state_is_untouched(&inner) {
         return;
     }
     let thread_id = inner.thread_id;
@@ -1726,8 +1999,15 @@ async fn cleanup_disconnected_turn(
     inner.child = None;
     // This reset carries STOP semantics (`stopped = true` below), so nothing
     // will respawn a child until the human sends again — quite possibly never.
-    // The slot goes back with the process it belonged to.
-    inner.child_permit = None;
+    // The slot and the bearer both go back with the process they belonged to.
+    //
+    // This is also the ONLY teardown a codex app-server death reaches: that
+    // child is owned by the app-server client, never by `inner.child`, so it
+    // never passes through `spawn_reader`'s EOF branches — `codex_consumer`
+    // routes a genuine disconnect straight here. Without the revoke, a crashed
+    // app-server whose session is never reconnected leaves its generation
+    // current for the life of the process.
+    release_child_slot(&mut inner);
     inner.stdin = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
@@ -1953,10 +2233,75 @@ pub struct EngineInner {
     pub cwd: std::path::PathBuf,
     /// Ask-hook + MCP injection args, appended to every spawn.
     pub extra_args: Vec<String>,
-    /// Per-engine environment injected at spawn. OpenCode uses this for a
-    /// session-scoped inline MCP config; keeping it on the engine prevents two
-    /// sessions sharing one worktree from overwriting each other's bus URL.
+    /// Environment variables set on every spawned tool child alongside
+    /// `extra_args`. Two producers today: the codex computer-use bearer
+    /// (the bearer must ride the child's
+    /// environment, owner-only readable, instead of `-c` argv which is
+    /// world-readable via process listings), and OpenCode's session-scoped
+    /// inline MCP config (OPENCODE_CONFIG_CONTENT — keeping it on the engine
+    /// prevents two sessions sharing one worktree from overwriting each
+    /// other's bus URL). See `bus::inject::Injection::env`.
     pub extra_env: Vec<(String, String)>,
+    /// The computer-use injection, held SEPARATELY from `extra_args`/
+    /// `extra_env` rather than flattened into them at construction — see
+    /// [`refresh_computer_injection`] for why it has to be replaceable.
+    ///
+    /// Both halves of one `bus::inject::Injection`: `computer_args` are argv
+    /// entries (claude's `--mcp-config <file>`, codex's two `-c
+    /// mcp_servers.weft_computer.*` flags) and `computer_env` the child-env
+    /// ones (codex's bearer, opencode's inline config). Empty for engines
+    /// that must never receive computer use at all — concierge and curator
+    /// leads — and that emptiness is exactly what
+    /// [`refresh_computer_injection`] keys on to avoid ever GRANTING the
+    /// tool to an engine that was constructed without it.
+    ///
+    /// Assembled onto a spawn by [`build_args`] and [`spawn_env`]; never
+    /// read directly at a spawn site, so a future spawn path can't silently
+    /// omit (or double-apply) it.
+    pub computer_args: Vec<String>,
+    /// The env half of the computer injection — see [`Self::computer_args`].
+    pub computer_env: Vec<(String, String)>,
+    /// The bearer generation this engine's live computer injection was minted
+    /// at — its OWNERSHIP STAMP over a shared identity. `None` before the first
+    /// mint, and after a teardown consumed it.
+    ///
+    /// Required because `(thread_id, ask_dir, worktree_id)` is not unique to an
+    /// engine: for a worker it is `(thread, direction, worktree)`, and a second
+    /// session opened on the same direction and worktree shares it. So the
+    /// identity's generation can be rotated out from under this engine by
+    /// somebody else's injection while this engine's child is still winding
+    /// down. Revoking the identity's CURRENT generation at that point would
+    /// kill the replacement's live bearer and 401 a healthy session; no local
+    /// counter can detect it, since `generation`/`turn_id` are per-engine and
+    /// agree that this engine's own teardown is legitimate.
+    ///
+    /// [`revoke_engine_bearer`] compares this stamp against the identity's
+    /// current generation and revokes only on a match — see
+    /// `computer_srv::revoke_computer_session_token_generation`.
+    ///
+    /// ACP additionally keeps [`Self::acp_route_gen`], because its route
+    /// outlives individual turns while the mint does not.
+    ///
+    /// Set for ALL FOUR engine shapes. Three receive it through
+    /// `Injection::computer_guard` in [`refresh_computer_injection`]; ACP,
+    /// whose bearer never travels through an `Injection` at all, receives it
+    /// from `bus::inject::AcpMcpInjection` at session establishment. In every
+    /// case it is written ONLY by [`commit_computer_mint`] — an uncommitted
+    /// mint revokes itself instead of landing here.
+    pub computer_gen: Option<u64>,
+    /// The generation the CURRENT ACP route owns, shared with the consumer that
+    /// will revoke it when the backend dies. `0` means "none". `None` on every
+    /// non-ACP engine.
+    ///
+    /// A cell rather than a value because the two move on different clocks:
+    /// `spawn_acp_turn` re-mints on EVERY turn, but a consumer is spawned only
+    /// when the route is new (`need_sub`). A consumer holding a snapshot taken
+    /// at turn 1 would, at exit, compare-and-revoke a long-superseded
+    /// generation — a silent no-op that leaves the LAST injected URL usable.
+    /// Updating the cell in place on each resume keeps "what this route owns"
+    /// true, while still being per-route: a genuinely new route gets a NEW cell,
+    /// so a lingering old consumer can never reach the replacement's bearer.
+    pub acp_route_gen: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     pub system_prompt: String,
     pub native_id: Option<String>,
     /// A mechanical digest of the thread's history, staged by an engine/model
@@ -2010,6 +2355,19 @@ pub struct EngineInner {
     /// rest of the process: the gate is a `OnceLock` singleton, so a session
     /// that was stopped hours ago keeps counting against the ceiling until the
     /// app restarts — see `stop_quiet_releases_the_session_gate_slot`.
+    ///
+    /// Every entry in that list EXCEPT the two respawn overwrites goes through
+    /// [`release_child_slot`], which drops the permit and revokes the child's
+    /// computer-use bearer together. The list above is the reason: bearer
+    /// revocation needs the identical enumeration, and maintaining it twice
+    /// guarantees drift. The respawn overwrites are the deliberate exception —
+    /// they re-mint in the same critical section, which rotates the generation
+    /// on its own. See that helper's doc before adding a teardown site here.
+    ///
+    /// The permit release is unconditional; the revoke half is not. A live
+    /// `codex_client` is the bearer's holder and survives a child teardown, so
+    /// `release_child_slot` skips only the revoke in that case — the client's
+    /// own death sites handle it. The slot always comes back.
     ///
     /// The pairing is directional both ways: a respawn must also release the
     /// DEAD child's permit *before* queuing for a new one, or a saturated gate
@@ -2076,6 +2434,19 @@ pub struct EngineInner {
     /// its persisted `kind:"tool"` row id and content JSON, so the out-of-band
     /// result merges its output without re-reading the row. Cleared per turn.
     pub tool_rows: std::collections::HashMap<String, (i32, serde_json::Value)>,
+    /// this session's most recent completed
+    /// tool-result rows that currently carry inline screenshot data URIs in
+    /// their persisted `content.images` — oldest first, `(row_id, is_error,
+    /// content)`. Capped at `MAX_INLINE_IMAGE_ROWS` by `merge_tool_results`,
+    /// which evicts the OLDEST entry's inline images (stripping `images`
+    /// from THAT row's own already-persisted content, keeping its `output`
+    /// text — the screenshot's file path — untouched) the moment a NEW
+    /// image-bearing row would push this past the cap. In-memory only,
+    /// scoped to THIS engine's own lifetime — see `merge_tool_results`'s own
+    /// doc for why that is an accepted, disclosed limitation rather than a
+    /// durable migration. Never cleared per-turn (unlike `tool_rows`): the
+    /// retention window spans the whole session, not one turn.
+    pub inline_image_rows: std::collections::VecDeque<(i32, bool, serde_json::Value)>,
     /// Explicit user/guard stop. Hidden plumbing must not resurrect stopped
     /// engines; explicit sends/ensure clear this and restart as needed.
     pub stopped: bool,
@@ -2569,7 +2940,239 @@ fn build_args(inner: &EngineInner) -> Vec<String> {
         a.push(id.clone());
     }
     a.extend(inner.extra_args.iter().cloned());
+    // The computer injection rides LAST and comes from its own field — see
+    // `EngineInner::computer_args`. Appending here (rather than at
+    // construction) is what lets `refresh_computer_injection` replace it
+    // before a respawn without any argv surgery.
+    a.extend(inner.computer_args.iter().cloned());
     a
+}
+
+/// Re-mint this engine's computer-use injection immediately before a child
+/// is spawned, replacing [`EngineInner::computer_args`]/`computer_env`.
+///
+/// Why every respawn needs this: `bus::inject::inject_computer` ROTATES the
+/// identity's bearer generation, and every teardown revokes it too
+/// (see [`release_child_slot`] / [`revoke_engine_bearer`]). A resident
+/// engine respawns from the argv/env captured when it was CONSTRUCTED, so
+/// without a refresh the new child would carry a bearer that was already
+/// invalidated — every computer call from a resumed session would 401.
+/// Refreshing here is what makes revoke-on-stop safe.
+///
+/// NEVER grants the tool to an engine that didn't already have it. A
+/// concierge or curator lead is constructed with both fields empty (see
+/// `lead_chat::commands::lead_engine`'s branch), and this returns early on
+/// that emptiness rather than consulting thread kind a second time — so the
+/// "these two lead kinds never receive computer use" rule can't be
+/// re-litigated (or accidentally inverted) here. Same early return when the
+/// original injection produced nothing at all (an unwritable `weft_home`,
+/// an ACP tool, an unresolved worktree): a session that started without the
+/// tool never gains it at a respawn.
+///
+/// Best-effort by construction: `inject_computer` already falls back to an
+/// empty injection rather than erroring. If it does, the fields are left
+/// UNCHANGED rather than cleared — a spawn with a stale (possibly revoked)
+/// config degrades to 401s on computer calls, whereas clearing them would
+/// silently strip a working tool from a session that legitimately had it.
+#[must_use = "the returned mint is revoked on drop — hand it to               `commit_computer_mint` once the child is live"]
+fn refresh_computer_injection(
+    app: &AppHandle,
+    inner: &mut EngineInner,
+) -> Option<crate::bus::computer_srv::MintGuard> {
+    if inner.computer_args.is_empty() && inner.computer_env.is_empty() {
+        return None;
+    }
+    let Some(base) = app.try_state::<crate::BusBase>().map(|b| b.0.clone()) else {
+        return None;
+    };
+    if base.is_empty() {
+        return None;
+    }
+    let mut fresh = crate::bus::inject::inject_computer(
+        &base,
+        inner.thread_id,
+        &inner.ask_dir,
+        &inner.tool,
+        inner.worktree_id,
+    );
+    // Taken BEFORE the empty-injection bail: the mint rotated the identity's
+    // generation either way, so that bearer has to stay revocable even when the
+    // arm produced nothing usable (an unwritable config is exactly the case
+    // nothing else would clean up). Dropping `fresh` here would revoke it —
+    // correct, but the CALLER is the one that knows whether a child took it.
+    let mint = fresh.computer_guard.take();
+    // PUBLISH the pending generation immediately, before returning to a caller
+    // that may await a long handshake before it can commit. The guard is a
+    // LOCAL and a concurrent Stop cannot see it; `computer_gen` is what
+    // `stop_quiet` reaches. Without this, a Stop landing during a codex
+    // connect or an ACP session open could only revoke the PREDECESSOR, while
+    // the bearer this mint already handed the backend through its environment
+    // stayed valid for the rest of the handshake.
+    //
+    // The two halves cover different failures and compose because revocation is
+    // compare-and-revoke — whichever fires second is inert:
+    //   * the stamp is reachable by a Stop that races the hand-off;
+    //   * the guard covers a path that returns with no Stop involved at all.
+    if let Some(mint) = &mint {
+        inner.computer_gen = Some(mint.generation());
+    }
+    if fresh.args.is_empty() && fresh.env.is_empty() {
+        return mint;
+    }
+    inner.computer_args = fresh.args;
+    inner.computer_env = fresh.env;
+    mint
+}
+
+/// A live child or connection now carries the bearer this mint produced:
+/// record its generation as the engine's and disarm the drop-revoke.
+///
+/// The ONLY way a mint stops being revocable. Every path from
+/// [`refresh_computer_injection`] to a running child must end either here or in
+/// a drop — there is no third option, which is the point (see
+/// `computer_srv::MintGuard`). `None` (this engine never had the tool) is a
+/// no-op.
+fn commit_computer_mint(
+    inner: &mut EngineInner,
+    mint: Option<crate::bus::computer_srv::MintGuard>,
+) {
+    if let Some(mint) = mint {
+        // The stamp is normally already published (at mint time, so a racing
+        // Stop could reach it); re-asserting it keeps this the single place a
+        // caller has to think about, and covers the ACP path whose mint does
+        // not go through `refresh_computer_injection`.
+        inner.computer_gen = Some(mint.commit());
+    }
+}
+
+/// The env pairs for ONE spawn: the engine's own injections plus the
+/// computer injection, deep-merged.
+///
+/// The merge is not cosmetic. An opencode session's bus config AND its
+/// computer config BOTH ride `OPENCODE_CONFIG_CONTENT`, and `Command::envs`
+/// is last-wins per key — so handing the two through unmerged silently drops
+/// the bus server. `coalesce_env` deep-merges the duplicates (see its own
+/// doc). It used to run at construction, when both halves were flattened
+/// into `extra_env` together; now that the computer half is replaceable it
+/// has to run at ASSEMBLY time instead, or a refreshed computer config would
+/// be merged against nothing and clobber the bus entry.
+fn spawn_env(inner: &EngineInner) -> Vec<(String, String)> {
+    let mut pairs = inner.extra_env.clone();
+    pairs.extend(inner.computer_env.iter().cloned());
+    crate::bus::inject::coalesce_env(pairs)
+}
+
+/// Hand back a dead child's session_gate slot AND kill the computer-use bearer
+/// it was launched with, in one step.
+///
+/// The two belong together, and keeping them together is the point of this
+/// helper. `EngineInner::child_permit` already carries an EXHAUSTIVE list of
+/// the sites that tear a child down — miss one and the gate slot leaks. Bearer
+/// revocation needs that same list for a sharper reason: a generation only
+/// rotates at INJECTION, and an engine whose child just died may never inject
+/// again, while the session's DB rows keep `session_is_live` true. So a token
+/// that leaked out of the injected config/env/argv — to an orphaned descendant,
+/// or to any same-uid process that read it — stays valid indefinitely and can
+/// go on driving the desktop under a standing Full/Always grant. Two lists that
+/// must stay identical inevitably drift; one call site each cannot.
+///
+/// Use at every teardown that does NOT immediately respawn. The two respawn
+/// overwrites (`ensure_running_locked`, `spawn_turn`) release the stale permit
+/// and mint a fresh injection inside the same critical section; that mint
+/// rotates the generation itself, so the dead child's bearer dies there without
+/// an explicit revoke — and revoking after the mint would kill the token the
+/// NEW child is about to carry. That is why those two sites clear the permit
+/// inline instead of calling this.
+///
+/// Callers that sit behind an ownership guard (`turn_id`/`busy`, or a reader's
+/// `generation`) must keep this inside the guard, exactly as the bare permit
+/// release had to be: a stale caller revoking would strip a NEWER child's live
+/// bearer, and unlike a wrongly-released permit that failure is user-visible —
+/// every computer call from a healthy session starts 401ing.
+///
+/// Free for engines that never had the tool (concierge/curator leads, workers
+/// with an unresolved worktree): revoking an identity that never minted is a
+/// no-op bump, so teardown paths stay uniform instead of re-deriving who was
+/// eligible.
+fn release_child_slot(inner: &mut EngineInner) {
+    inner.child_permit = None;
+    // A LIVE app-server client is the holder of this engine's bearer, and a
+    // child teardown does not destroy it — `spawn_codex_turn`'s reuse arm hands
+    // the next turn that same client WITHOUT refreshing its injection, so
+    // revoking here would 401 a connection that is about to be used again.
+    // Every path that genuinely ends the client takes it out of this field
+    // first (`stop_quiet`, both exec fallbacks) or revokes at the client's own
+    // death site (`codex_consumer`), so the revoke is never merely deferred.
+    if inner.codex_client.is_some() {
+        return;
+    }
+    revoke_engine_bearer(inner);
+}
+
+/// Revoke a NAMED generation, for the one owner that holds a generation but no
+/// [`MintGuard`](crate::bus::computer_srv::MintGuard): the ACP route consumer.
+///
+/// Everywhere else, an uncommitted mint revokes itself by dropping, and a
+/// committed one is revoked through [`EngineInner::computer_gen`]. The ACP
+/// consumer is neither — it outlives the turn that minted (which committed at
+/// its own hand-off point) and learns the route's CURRENT generation from a
+/// shared cell that resumes update in place. So it must name what it revokes.
+///
+/// Compare-and-revoke, so a consumer whose route was already replaced changes
+/// nothing.
+async fn revoke_engine_generation_locked(eng: &EngineRef, generation: Option<u64>) {
+    revoke_engine_generation(&*eng.lock().await, generation);
+}
+
+/// [`revoke_engine_generation_locked`] for a caller that already holds the lock.
+fn revoke_engine_generation(inner: &EngineInner, generation: Option<u64>) {
+    let Some(generation) = generation else {
+        return;
+    };
+    crate::bus::computer_srv::revoke_computer_session_token_generation(
+        inner.thread_id,
+        &inner.ask_dir,
+        inner.worktree_id,
+        generation,
+    );
+}
+
+/// Revoke the bearer THIS engine minted — and only if it is still the current
+/// one for the identity.
+///
+/// Consumes the record: [`EngineInner::computer_gen`] is taken, so a second
+/// call before the next mint is a no-op. That makes it safe to revoke
+/// defensively (early AND late around an unlocked teardown, say) without a
+/// second revoke landing on a generation someone else minted in between.
+///
+/// Also the bearer half of [`release_child_slot`] for the process this engine
+/// owns that is NOT `inner.child`: the codex app-server. That client spawns and
+/// owns its own child, so it holds no `child_permit`, never passes through
+/// `spawn_reader`, and its death is not a teardown site in `child_permit`'s
+/// enumeration — the reason it needs saying separately. The rule is the same
+/// one: whenever THIS engine's app-server is shut down or found disconnected,
+/// the bearer it was launched with dies with it, because nothing else will
+/// rotate that generation until the next injection, which may never come.
+///
+/// `cleanup_disconnected_turn` is not sufficient on its own even though it
+/// routes through `release_child_slot`: it early-returns on an already-idle
+/// engine, and an app-server that dies BETWEEN turns — the ordinary case for a
+/// resident client nothing reconnects — is exactly that shape.
+///
+/// Call it only for a client this engine still owns (`ptr_eq`, or an explicit
+/// `take`). An exec fallback that deliberately replaces the client may call it
+/// too: `spawn_turn` re-mints immediately afterwards, so the new child still
+/// starts live.
+fn revoke_engine_bearer(inner: &mut EngineInner) {
+    let Some(generation) = inner.computer_gen.take() else {
+        return;
+    };
+    crate::bus::computer_srv::revoke_computer_session_token_generation(
+        inner.thread_id,
+        &inner.ask_dir,
+        inner.worktree_id,
+        generation,
+    );
 }
 
 fn merge_init_slash_commands(
@@ -2633,6 +3236,33 @@ async fn ensure_running_locked(
     }
     crate::process_quota::admit_new_work(app)?;
     crate::claude::ensure_trusted(&inner.cwd);
+    // 先还旧槽,再排队要新的。走到这里 `child` 要么是 None、要么已被上面的
+    // try_wait 判定为死进程,它的 permit 是陈的;若留着不放就去 await 新槽,gate
+    // 打满时这个会话会卡在等一个它自己占着的槽上(自锁),得等别的会话结束才解开。
+    //
+    // 走 `release_child_slot`(而非裸释放):此刻还没有重铸,所以撤销打掉的正是
+    // 那个已死子进程的 bearer——它本该随进程一起死,而下面的排队可能很久。
+    //
+    // 这条路径通常是冗余的:子进程真正死亡时,reader 的 EOF 分支已经撤销过了。
+    // 留着是为了覆盖「EOF 尚未被处理就走到这里」的竞态——那正是排队等待会把
+    // 窗口拉长的情形。
+    //
+    // 取舍写明:若紧随其后的重铸拿不到 `BusBase`(应用状态缺失/为空)而提前返回,
+    // 这次撤销就没有替代品,该会话的 computer 调用会 401 到下一次成功 spawn 为止。
+    // 选择 fail-closed:宁可一个本该能用的工具暂时不可用,也不让一个无主的
+    // bearer 跨过一段不确定长度的排队。
+    release_child_slot(inner);
+    // 活跃会话软上限:拿一个会话槽,已满则在此排队等某个在跑的会话结束(与上面
+    // admit_new_work 的总进程数硬闸互补——那个拒绝、这个排队,不丢会话)。
+    let session_permit = crate::session_gate::acquire_session_slot().await;
+    // 重铸放在拿到槽位之后,不能提前。这个 await 在 gate 打满时可以阻塞任意久,
+    // 而 `ensure_running_locked` 全程握着引擎锁——期间 Stop 连锁都拿不到,更谈不上
+    // 撤销。若先铸币,一个全新的、有效的 bearer(claude 还会把它写进磁盘上的 MCP
+    // 配置)就会在没有任何子进程的情况下一直有效,同 uid 的进程读到即可用。
+    // 铸币必须紧贴 spawn,中间不留可阻塞的等待。
+    // Held until the child is confirmed running. Every `?` between here and the
+    // commit below drops it, which revokes — no explicit cleanup at any of them.
+    let mint = refresh_computer_injection(app, inner);
     // Resolve the actual binary: a per-session pin, else the global override for
     // "claude" (e.g. a user-aliased `cc-claude`), else "claude" itself.
     let program = crate::tool_command::effective(inner.command.as_deref(), &inner.tool);
@@ -2645,18 +3275,16 @@ async fn ensure_running_locked(
         .args(build_args(inner))
         .current_dir(&inner.cwd)
         .env("PATH", crate::detect::tool_path())
-        .envs(inner.extra_env.iter().cloned())
+        // injection-supplied env (the codex computer
+        // bearer travels here, never argv — see `EngineInner::extra_env`).
+        // `spawn_env` (not `extra_env` directly) — it appends the
+        // computer injection and deep-merges the shared
+        // OPENCODE_CONFIG_CONTENT key; see its own doc.
+        .envs(spawn_env(inner).iter().map(|(k, v)| (k.clone(), v.clone())))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    // 先还旧槽,再排队要新的。走到这里 `child` 要么是 None、要么已被上面的
-    // try_wait 判定为死进程,它的 permit 是陈的;若留着不放就去 await 新槽,gate
-    // 打满时这个会话会卡在等一个它自己占着的槽上(自锁),得等别的会话结束才解开。
-    inner.child_permit = None;
-    // 活跃会话软上限:拿一个会话槽,已满则在此排队等某个在跑的会话结束(与上面
-    // admit_new_work 的总进程数硬闸互补——那个拒绝、这个排队,不丢会话)。
-    let session_permit = crate::session_gate::acquire_session_slot().await;
     // T1: own process group + marker before spawn, register PAIRED with the child.
     let configured = crate::proc_registry::configure(&mut command, owner);
     let mut child = command.spawn()?;
@@ -2677,6 +3305,9 @@ async fn ensure_running_locked(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("child stdout not piped"))?;
+    // The child is up and carries the bearer: hand the mint over. Anything that
+    // returned before this point revoked by dropping it.
+    commit_computer_mint(inner, mint);
     inner.child = Some(child);
     inner.child_reg = Some(reg);
     // permit 与 child_reg 同寿:child 被 take/overwrite/stop 清掉时一并 drop=释放槽。
@@ -3120,6 +3751,7 @@ async fn admit_pending_durable_batch_admitted(
             origin_tag: Some(hidden_delivery_tag(row.id)),
             queue_id: None,
             has_attachments: false,
+            local_image_paths: vec![],
         };
         match delivery {
             HiddenDelivery::Noop => {
@@ -3187,10 +3819,12 @@ pub(crate) fn invalidate_resident(inner: &mut EngineInner) {
     if let Some(mut child) = inner.child.take() {
         let _ = child.start_kill();
     }
-    // The killed child's session_gate slot goes with it. Unconditional (not
-    // folded into the `if let`): a permit with no child left to represent is
-    // exactly the leak, whichever way `child` came to be None.
-    inner.child_permit = None;
+    // The killed child's session_gate slot and computer bearer go with it.
+    // Unconditional (not folded into the `if let`): a permit with no child left
+    // to represent is exactly the leak, whichever way `child` came to be None,
+    // and the bearer wants revoking on both paths regardless. `ensure_running_locked`
+    // re-mints before the respawn this invalidation sets up.
+    release_child_slot(inner);
 }
 
 /// Undo the turn reservation made by `send` Phase 1 when later persistence
@@ -3431,6 +4065,150 @@ fn advance_dequeued_turn(inner: &mut EngineInner, next: &Option<Outgoing>) {
         .as_ref()
         .and_then(|n| n.origin_tag.clone())
         .filter(|tag| hidden_delivery_id_from_tag(Some(tag)).is_none());
+}
+
+/// a process-local, unpredictable nonce appended to
+/// the codex app-server attachment spill's own file name (`send`'s image-spill
+/// loop, below) — mirrors the identical fix for the per-hook-call
+/// attachment path. `AtomicU64`, not per-call randomness: cheap, monotonic,
+/// and unique for the life of this process, which is all "a co-resident
+/// process can't pre-place a same-named symlink before this write runs"
+/// needs — the write itself also goes through `create_new` (O_EXCL), so even
+/// a GUESSED name would still be refused; the nonce just makes guessing
+/// itself infeasible in the first place.
+static ATTACH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// a per-PROCESS random nonce
+/// folded into codex app-server attachment file names. `ATTACH_SEQ` above is
+/// monotonic and unique only WITHIN one process — two concurrent Weft
+/// processes sharing the OS temp dir (an installed app plus `tauri dev`, which
+/// use SEPARATE databases and can therefore mint the SAME `row_id`) both start
+/// that counter at 0 and generate identical `msg<row>-<i>-<seq>` paths. The
+/// app-server branch writes with `create_new` (O_EXCL), so whichever process
+/// loses that collision silently drops the human's image from
+/// `local_image_paths` while its text turn proceeds. A random component that is
+/// stable for THIS process's lifetime (but disjoint from any other process's)
+/// makes the two processes' paths never collide, without disturbing the
+/// PREDICTABLE non-app-server names `rewind::dispatched_text` reconstructs.
+fn attach_process_nonce() -> u64 {
+    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *NONCE.get_or_init(rand::random::<u64>)
+}
+
+/// write a codex app-server image attachment to `p`
+/// guarded against a pre-placed symlink/existing file at that exact path —
+/// mirrors `computer::screenshot_window`'s own no-follow/exclusive/owner-only
+/// write for the identical "a background process on this account swaps the
+/// target the instant before Weft writes it" hazard (the same fix landed for the
+/// analogous per-hook-call attachment path the same way). `create_new`
+/// (O_EXCL) refuses to write through anything already at `p` (the caller's
+/// own `ATTACH_SEQ` nonce means this never spuriously collides with a prior,
+/// legitimate attachment of this process's own); `O_NOFOLLOW` refuses to
+/// follow a symlink leaf even if one raced into place after `create_dir_all`
+/// but before this call. `mode(0o600)` keeps the file owner-only from the
+/// moment of creation. Returns `false` (never panics) on ANY failure —
+/// best-effort, mirroring the plain `std::fs::write(...).is_ok()` this
+/// replaces for the codex app-server branch: a skipped image must never fail
+/// the whole chat turn, it just means that one attachment doesn't make it
+/// into this turn.
+///
+/// RESIDUAL (documented, not closed here — mirrors the attachment-write note,
+/// and the broader TOCTOU tracking): after this call returns and the
+/// file handle closes, a SAME-UID process can still `readdir` the (shared)
+/// spill directory, discover the real (nonce-bearing) file name, and swap it
+/// for a symlink before the codex app-server PROCESS ITSELF later opens
+/// `local_image_paths` to build its own `turn/start` payload — this closes
+/// the window up through THIS write, not the separate one between this write
+/// and codex's own later read. Fully closing that needs codex itself to
+/// either accept raw bytes (never a path at all) or open with its own
+/// `O_NOFOLLOW` — neither is in this codebase's control.
+#[cfg(unix)]
+fn write_attachment_no_follow(p: &std::path::Path, bytes: &[u8]) -> bool {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opt = std::fs::OpenOptions::new();
+    opt.write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    match opt.open(p) {
+        Ok(mut f) => f.write_all(bytes).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Non-unix fallback: the pre-existing plain write — owner-only/no-follow
+/// hardening is a unix-only concept this crate can portably act on (see this
+/// function's own `#[cfg(unix)]` sibling above).
+#[cfg(not(unix))]
+fn write_attachment_no_follow(p: &std::path::Path, bytes: &[u8]) -> bool {
+    std::fs::write(p, bytes).is_ok()
+}
+
+/// write a PER-TURN dialect's image attachment to
+/// `p` guarded against a pre-placed symlink, EXTENDING the earlier
+/// no-follow defense (see [`write_attachment_no_follow`]'s own doc) to every
+/// spill branch, not just codex app-server. An earlier fix scoped the hardened
+/// write to app-server alone, reasoning that every OTHER per-turn dialect
+/// only ever lists the spilled path in TEXT for the agent to read itself —
+/// a materially lower-severity exposure than app-server's own first-class
+/// `localImage` turn/start input. The hazard:
+/// reasoning incomplete: the vulnerable step is this WRITE itself, not what
+/// happens to the path afterward — plain `std::fs::write` (what this
+/// replaces for every non-app-server branch) follows a symlink and
+/// TRUNCATES its target, so a same-UID process that predicts the next
+/// `msg<row_id>-<i>.<ext>` name and pre-plants a symlink to an arbitrary
+/// user-writable file gets it clobbered by Weft's own write the instant a
+/// human's next image attachment lands — regardless of whether any agent
+/// ever reads the resulting path.
+///
+/// Unlike [`write_attachment_no_follow`], this does NOT use `create_new`
+/// (O_EXCL): these branches use a PREDICTABLE name (`msg<row_id>-<i>.<ext>`,
+/// no `ATTACH_SEQ` nonce), and a rewind can re-dispatch the SAME user row —
+/// same `row_id`, same predictable path — a second time. `create_new` would
+/// then spuriously refuse Weft's own earlier, legitimate write sitting at
+/// that exact path, breaking replay (`rewind::dispatched_text`'s own
+/// persisted-`dispatched`-field fallback aside, this write must still be
+/// ABLE to happen a second time). `create(true).truncate(true)` instead
+/// permits overwriting an ordinary pre-existing file (our own prior write),
+/// while `O_NOFOLLOW` still refuses the kernel-level `open(2)` outright
+/// (`ELOOP`) the instant the leaf is a symlink — closing exactly the vector
+/// named above, without reopening the earlier replay
+/// concern. `mode(0o600)` keeps this owner-only from creation, matching
+/// every other attachment/screenshot write this codebase already hardens
+/// this way.
+///
+/// RESIDUAL (documented, not closed here — same shape as
+/// [`write_attachment_no_follow`]'s own note): a same-UID process using a
+/// HARD LINK instead of a symlink at the predictable path is not caught by
+/// `O_NOFOLLOW` (which only ever refuses a symlink leaf) — `truncate(true)`
+/// would still write through a hard-linked file, corrupting whatever else
+/// it's linked to. Closing that fully needs either `create_new` (which
+/// breaks the replay case above) or moving spilled attachments into a
+/// directory no other account/process can write into at all; tracked as a
+/// follow-up, not required to close the SYMLINK vector this
+/// round's fix targets.
+#[cfg(unix)]
+fn write_attachment_no_follow_allow_overwrite(p: &std::path::Path, bytes: &[u8]) -> bool {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opt = std::fs::OpenOptions::new();
+    opt.write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    match opt.open(p) {
+        Ok(mut f) => f.write_all(bytes).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Non-unix fallback — see [`write_attachment_no_follow`]'s own sibling for
+/// why owner-only/no-follow hardening is unix-only here.
+#[cfg(not(unix))]
+fn write_attachment_no_follow_allow_overwrite(p: &std::path::Path, bytes: &[u8]) -> bool {
+    std::fs::write(p, bytes).is_ok()
 }
 
 /// Send a human message: optimistic-persist + either write through or queue.
@@ -3743,19 +4521,103 @@ pub async fn send(
             outbound.push_str(&format!("- {f}\n"));
         }
     }
+    // Hoisted above the spill loop (rather than computed only at Phase 3 below,
+    // as it used to be) so the loop can tell app-server codex apart from every
+    // other per-turn dialect/transport while it's spilling.
+    let is_codex_appserver = ctx.tool == "codex" && codex_appserver_enabled();
     // Per-turn dialects take no inline image blocks: spill pasted images to
     // temp files and hand over paths — every agent can read those itself.
+    let mut local_image_paths: Vec<String> = Vec::new();
     let images = if per_turn(&ctx.tool) && !images.is_empty() {
         use base64::Engine as _;
         let dir = std::env::temp_dir().join("weft-attachments");
         let _ = std::fs::create_dir_all(&dir);
-        outbound.push_str("\n\nAttached images (read them as needed):\n");
-        for (i, (mt, data)) in images.iter().enumerate() {
+        // refuse a SYMLINK
+        // planted at the shared spill dir. `create_dir_all` FOLLOWS a symlink
+        // already sitting at this path, and the `set_permissions` below would
+        // then chmod — and every spill write would traverse — whatever it
+        // points to; the per-file `O_NOFOLLOW` writes only guard the LEAF file
+        // name, never this parent. Verify the dir itself is a real directory
+        // via `symlink_metadata`; if it is not, spill NOTHING (iterate an empty
+        // slice below) rather than write through an attacker-substituted
+        // parent — the human's text turn still goes out, just without inline
+        // images.
+        let dir_is_real = std::fs::symlink_metadata(&dir)
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false);
+        // best-effort tighten the shared spill
+        // directory to owner-only — defense in depth alongside the per-file
+        // hardening below, for the identical "shared tmp dir, permissive
+        // process umask" hazard `computer::screenshot_window` also closes.
+        // Best-effort: a failure here (already-wrong ownership, a read-only
+        // mount, non-unix) never blocks the spill itself.
+        #[cfg(unix)]
+        {
+            if dir_is_real {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        if dir_is_real {
+            outbound.push_str("\n\nAttached images (read them as needed):\n");
+        }
+        // A symlinked/unsafe spill dir yields an empty iteration — no image is
+        // written through it, and `local_image_paths` stays empty.
+        let spill: &[(String, String)] = if dir_is_real { &images } else { &[] };
+        for (i, (mt, data)) in spill.iter().enumerate() {
             let ext = mt.rsplit('/').next().unwrap_or("png");
-            let p = dir.join(format!("msg{row_id}-{i}.{ext}"));
+            // ONLY the codex app-server branch gets
+            // a NONCE-bearing name — that's the ONLY transport that later
+            // hands this exact path to the agent as a first-class
+            // `localImage` turn/start input (`is_codex_appserver` branch just
+            // below); every OTHER per-turn dialect keeps the PREDICTABLE
+            // `msg<row_id>-<i>.<ext>` name `rewind::dispatched_text`'s own
+            // fallback reconstruction relies on for rows that predate its
+            // persisted-`dispatched`-field stamping (see this function's own
+            // "Persist the EXACT dispatched text" comment below).
+            //
+            // EVERY branch now gets a no-follow
+            // guarded write, not just app-server — see
+            // `write_attachment_no_follow_allow_overwrite`'s own doc for why
+            // The OLD app-server-only scoping
+            // incomplete: a plain `std::fs::write` at a predictable name
+            // follows a symlink and truncates whatever it points at,
+            // regardless of whether any agent later reads the resulting
+            // path — the vulnerable step is THIS write, not the later read.
+            let p = if is_codex_appserver {
+                let seq = ATTACH_SEQ.fetch_add(1, Ordering::SeqCst);
+                // the per-process
+                // nonce disjoins this name from any OTHER Weft process's spill
+                // (which could share `row_id`/`seq` with an independent counter)
+                // — see `attach_process_nonce`'s own doc. Only the app-server
+                // branch: the `else` branch's name stays PREDICTABLE for
+                // `rewind::dispatched_text`'s reconstruction.
+                dir.join(format!("msg{row_id}-{i}-{}-{seq}.{ext}", attach_process_nonce()))
+            } else {
+                dir.join(format!("msg{row_id}-{i}.{ext}"))
+            };
             if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
-                if std::fs::write(&p, bytes).is_ok() {
+                let written = if is_codex_appserver {
+                    // Nonce-named — never collides with a prior write of our
+                    // own, so `create_new` (O_EXCL) is both safe and stricter.
+                    write_attachment_no_follow(&p, &bytes)
+                } else {
+                    // Predictable name — a rewind can re-dispatch the SAME
+                    // row a second time, landing on this SAME path, so this
+                    // must still allow overwriting our own prior write (see
+                    // `write_attachment_no_follow_allow_overwrite`'s own doc)
+                    // while still refusing a symlink leaf.
+                    write_attachment_no_follow_allow_overwrite(&p, &bytes)
+                };
+                if written {
                     outbound.push_str(&format!("- {}\n", p.display()));
+                    // app-server transport ALSO gets these as first-class
+                    // `localImage` input items on turn/start (codex_app_server::
+                    // turn_start_params_with_images) — not just a path listed in
+                    // the text. exec has no such channel, so it stays text-only.
+                    if is_codex_appserver {
+                        local_image_paths.push(p.display().to_string());
+                    }
                 }
             }
         }
@@ -3796,13 +4658,13 @@ pub async fn send(
         origin_tag: ctx.origin_tag.clone(),
         queue_id: if ctx.direct { None } else { Some(row_id) },
         has_attachments,
+        local_image_paths,
     };
 
     // Phase 3: re-acquire the lock and COMMIT against CURRENT state — deliver,
     // enqueue, promote, or abort is decided here, not enforced from the Phase-1
     // snapshot (which only decided the row's optimistic status). The lock drops
     // before any turn-spawning awaits.
-    let is_codex_appserver = ctx.tool == "codex" && codex_appserver_enabled();
     let is_acp = is_acp_tool(&ctx.tool);
     let is_connection = is_codex_appserver || is_acp;
     let spawn_now = ctx.direct && per_turn(&ctx.tool) && !is_connection;
@@ -4066,6 +4928,9 @@ async fn spawn_codex_turn(
     out: Outgoing,
     expected_epoch: Option<u64>,
 ) -> anyhow::Result<()> {
+    // No `extra_env` in this snapshot: the app-server connection's env is
+    // assembled inside the connect arm below, after the computer injection is
+    // re-minted.
     let (native, cwd, sid, thread_id_i, system_prompt, extra_args, existing, program) = {
         let i = eng.lock().await;
         // Atomic with the snapshot: don't start a codex turn for a stopped engine
@@ -4096,9 +4961,12 @@ async fn spawn_codex_turn(
     // Per-session app-server: reuse the engine's connection or spawn one with this
     // session's `-c mcp_servers` bus flags. Its own process keeps the per-thread
     // MCP isolated (app-server MCP is app-scoped).
-    let (client, freshly_connected) = match existing {
-        Some(c) if c.is_alive().await => (c, false),
-        _ => {
+    // `mint`: the ownership receipt for the bearer the connect arm minted for
+    // THIS app-server, held until the client is published. `None` on the reuse
+    // arm — it does not mint, and the live client's bearer must not be touched.
+    let (client, freshly_connected, mint) = match existing {
+        Some(c) if c.is_alive().await => (c, false, None),
+        dead => {
             // Pre-accept folder trust (like the exec adapter's prepare) so the
             // app-server's first thread/start doesn't block on codex's trust prompt.
             crate::codex::ensure_codex_trusted(&cwd);
@@ -4106,9 +4974,67 @@ async fn spawn_codex_turn(
                 Some(s) => crate::proc_registry::Owner::session(s.to_string()),
                 None => crate::proc_registry::Owner::lead_thread(thread_id_i.to_string()),
             };
+            // Re-mint the computer bearer for the app-server child about to
+            // be spawned — but ONLY on this arm, never on the
+            // reuse arm above: refreshing rotates the identity's generation,
+            // which would 401 the computer tool of a still-live client that
+            // is holding the previous bearer. The outer snapshot's
+            // `extra_args`/`extra_env` deliberately carry no computer entries
+            // (they live in their own fields), so this re-lock is what
+            // assembles the pair the connection actually spawns with.
+            let (spawn_args, spawn_pairs, mint) = {
+                let mut i = eng.lock().await;
+                // Re-check cancellation under THIS lock, before minting. The
+                // `is_alive()` guard on the reuse arm above is an `.await`, so
+                // a Stop can acquire the engine lock and revoke this identity
+                // between the outer snapshot's check and here. Re-minting
+                // unconditionally would hand an ALREADY-STOPPED engine a
+                // fresh, VALID bearer — undoing the very revoke that Stop just
+                // performed. Failing here matches the outer snapshot's own
+                // fail-closed shape (the caller rolls back or falls through to
+                // exec).
+                if i.stopped
+                    || i.interrupting
+                    || expected_epoch.is_some_and(|e| e != i.reset_epoch)
+                {
+                    return Err(anyhow::anyhow!("engine stopped; not starting a codex turn"));
+                }
+                // DETACH the dead client before minting. `is_alive()` said no,
+                // but it is still published, and its consumer may not have
+                // processed the channel closure yet — so its `ptr_eq` disconnect
+                // guard still passes. Left in place, that consumer would prove
+                // ownership of the OLD pointer and then consume the stamp we are
+                // about to overwrite, revoking the REPLACEMENT's bearer before
+                // its app-server ever used it. Detaching makes `ptr_eq` fail
+                // instead, which is the truth: that client is gone.
+                //
+                // Revoke its generation on the way out — this is the teardown
+                // its own disconnect would have performed, done here because we
+                // are taking that opportunity away from it. Only when the field
+                // still holds the very client we tested: another task may have
+                // published a live replacement while we awaited `is_alive`, and
+                // severing that would cut a healthy connection.
+                let ours = matches!(
+                    (&i.codex_client, &dead),
+                    (Some(current), Some(tested)) if current.ptr_eq(tested)
+                );
+                if ours {
+                    i.codex_client = None;
+                    revoke_engine_bearer(&mut i);
+                }
+                let mint = refresh_computer_injection(&app, &mut i);
+                let mut args = extra_args.clone();
+                args.extend(i.computer_args.iter().cloned());
+                (args, spawn_env(&i), mint)
+            };
+            // A connect failure returns through this `?`, dropping `mint` —
+            // which revokes. The `or_exec` fallback could never have cleaned
+            // this up: its revoke is guarded on having a client to take, and
+            // nothing was ever published here.
             let c = crate::codex_app_server::Client::connect_session(
                 &program,
-                &extra_args,
+                &spawn_args,
+                &spawn_pairs,
                 &cwd,
                 owner,
             )
@@ -4118,7 +5044,7 @@ async fn spawn_codex_turn(
             // RESTARTED send's client out of the registry (a restart may reuse
             // whatever is registered), or let a restarted send adopt a connection
             // the stop already doomed.
-            (c, true)
+            (c, true, mint)
         }
     };
     let cwd = cwd.to_string_lossy().into_owned();
@@ -4137,6 +5063,10 @@ async fn spawn_codex_turn(
                 // would leak the app-server child (reader/writer tasks hold
                 // clones) alive alongside the exec fallback. Shut it down.
                 if freshly_connected {
+                    // Before the await, not at scope end: the reap can take a
+                    // while and the bearer must not outlive the decision that
+                    // this connection is dead.
+                    drop(mint);
                     client.shutdown_and_reap().await;
                 }
                 return Err(e);
@@ -4180,8 +5110,28 @@ async fn spawn_codex_turn(
         // it down, failing start_turn below) — that is the designed teardown.
         let mut g = eng.lock().await;
         let won = g.stopped || expected_epoch.is_some_and(|e| e != g.reset_epoch);
-        if !won && freshly_connected {
+        // Publish AND commit under ONE lock acquisition, so `codex_client` and
+        // `computer_gen` describe the same connection from the moment either is
+        // set. The dead predecessor was detached in the connect arm, so nothing
+        // else holds this identity here.
+        //
+        // When the stop won, this simply does NOT commit — `mint` then falls
+        // out of scope and revokes, killing the bearer the connection now being
+        // torn down was spawned with. Nothing to write for that case, which is
+        // the whole point of the guard. A REUSED client carries no mint at all:
+        // the stop took it out of the registry and shut it down itself,
+        // revoking on the way through.
+        if won {
+            // Drop HERE, inside this lock, rather than letting scope-end do it.
+            // The teardown below AWAITS `shutdown_and_reap`, and a `MintGuard`
+            // runs at the end of the FUNCTION, not at the moment the decision is
+            // made — so the bearer would stay valid for the whole kill/reap
+            // wait, which is precisely the window the Stop is trying to close.
+            // See `MintGuard`'s note on drop timing.
+            drop(mint);
+        } else if freshly_connected {
             g.codex_client = Some(client.clone());
+            commit_computer_mint(&mut g, mint);
         }
         won
     };
@@ -4202,7 +5152,9 @@ async fn spawn_codex_turn(
     // the prompt is prepended to the FIRST turn of a brand-new thread; a resumed
     // thread already carries it in conversation history.
     let first_text = codex_first_turn_text(&system_prompt, &out.text, had_native);
-    let turn = client.start_turn(&thread, &first_text).await?;
+    let turn = client
+        .start_turn_with_images(&thread, &first_text, &out.local_image_paths)
+        .await?;
     client.set_active_turn(&thread, &turn).await;
     // The turn is in flight, so the thread is real and carries the system prompt:
     // now it's safe to persist the native id (a later resume reuses this rollout).
@@ -4252,7 +5204,15 @@ async fn spawn_codex_turn_or_exec(
         // subscription may already be live, and a lingering consumer (single-thread
         // routing) could finalize/reset the exec fallback turn or break thread-less
         // routing on the next retry. shutdown() drops the child + closes the consumer.
-        let stale = eng.lock().await.codex_client.take();
+        // Its bearer goes too — the `spawn_turn` below re-mints for the exec child.
+        let stale = {
+            let mut inner = eng.lock().await;
+            let c = inner.codex_client.take();
+            if c.is_some() {
+                revoke_engine_bearer(&mut inner);
+            }
+            c
+        };
         if let Some(c) = stale {
             c.shutdown().await;
         }
@@ -4310,7 +5270,7 @@ async fn spawn_acp_turn(
     out: Outgoing,
     expected_epoch: Option<u64>,
 ) -> anyhow::Result<()> {
-    let (native, cwd, sid, thread_id_i, system_prompt, tool, command, ask_dir) = {
+    let (native, cwd, sid, thread_id_i, system_prompt, tool, command, ask_dir, worktree_id) = {
         let i = eng.lock().await;
         // `tearing_down` included as defence in depth: the hidden path already
         // refuses, but this is the one gate every ACP turn passes through.
@@ -4330,6 +5290,12 @@ async fn spawn_acp_turn(
             i.tool.clone(),
             i.command.clone(),
             i.ask_dir.clone(),
+            // this worker's own worktree id, already
+            // resolved at engine-build time (`EngineInner::worktree_id`'s own
+            // doc) — reused here to pin `weft_computer`'s `?wt=` query param
+            // instead of the multi-repo-direction "first worktree" fallback.
+            // `None` for the lead lane (a lead has no worktree at all).
+            i.worktree_id,
         )
     };
     let backend =
@@ -4343,53 +5309,86 @@ async fn spawn_acp_turn(
         .try_state::<crate::BusBase>()
         .map(|b| b.0.clone())
         .unwrap_or_default();
+    // `weft_computer` is now injected
+    // UNCONDITIONALLY for every issue-lead/worker engine (concierge/curator
+    // still never get it) — the setting/kill-switch is enforced dynamically,
+    // server-side, on every single call by `bus::computer_srv::run_action`'s
+    // own `computer::enabled` gate (fail-closed with a "disabled in weft
+    // settings" result). This used to re-check `computer::enabled(&db)` here
+    // and pass that as `include_computer`, which meant an engine spawned (or
+    // an ACP session opened) BEFORE the human turned the setting on would
+    // simply never present the tool at all on this per-turn path either.
+    // Always injecting means the human flipping the setting takes effect
+    // immediately, on the NEXT tool call, without needing to rebuild
+    // anything — see `lead_chat::commands.rs`'s own three non-ACP injection
+    // points for the identical change, and `bus::inject::inject_computer`'s
+    // doc for why the endpoint itself was always designed to be always-safe
+    // to hand out (the description also says it needs enabling in Settings,
+    // and the server denies every call otherwise).
     let mcp = if base.is_empty() {
-        vec![]
+        crate::bus::inject::AcpMcpInjection { servers: vec![], computer_guard: None }
     } else if sid.is_none() {
         // Lead-kind engine: choose MCP from thread kind.
-        let kind = repo::get_thread(&db, thread_id_i)
-            .await
-            .ok()
-            .flatten()
-            .map(|th| th.kind)
-            .unwrap_or_default();
-        match kind.as_str() {
-            // Concierge: weft_global only (never bus).
-            "concierge" => crate::bus::inject::acp_mcp_servers(
-                &base,
-                thread_id_i,
-                "lead",
-                None,
-                false,
-                false,
-                true,
-                false,
-            ),
-            // Curator: curator MCP + bus under LEAD identity.
-            "curator" => crate::bus::inject::acp_mcp_servers(
-                &base,
-                thread_id_i,
-                crate::bus::LEAD,
-                None,
-                true,
-                false,
-                false,
-                true,
-            ),
-            // Issue lead: planner + bus.
-            _ => crate::bus::inject::acp_mcp_servers(
-                &base,
-                thread_id_i,
-                crate::bus::LEAD,
-                None,
-                true,
-                true,
-                false,
-                false,
-            ),
+        // : a TRANSIENT `get_thread` failure must fail
+        // CLOSED — the old `.ok().flatten()...unwrap_or_default()` collapsed an
+        // error into `""`, which the `_` arm below classifies as an issue lead
+        // and injects `weft_computer` into, even for a concierge/curator lead
+        // that must NEVER receive it (and whose bearer would then work once the
+        // DB recovers, an existing Full grant authorizing input with no card).
+        // On a lookup ERROR inject NO MCP servers at all this open (the turn
+        // still runs; it simply gets no injected server, and definitely not
+        // computer-use); a genuine `Ok(None)` keeps the prior default.
+        match repo::get_thread(&db, thread_id_i).await {
+            Err(_) => {
+                crate::bus::inject::AcpMcpInjection { servers: vec![], computer_guard: None }
+            }
+            Ok(row) => match row.map(|th| th.kind).unwrap_or_default().as_str() {
+                // Concierge: weft_global only (never bus, never computer).
+                "concierge" => crate::bus::inject::acp_mcp_servers(
+                    &base, thread_id_i, "lead", None, false, false, true, false, false, None,
+                ),
+                // Curator: curator MCP + bus under LEAD identity (never computer).
+                "curator" => crate::bus::inject::acp_mcp_servers(
+                    &base,
+                    thread_id_i,
+                    crate::bus::LEAD,
+                    None,
+                    true,
+                    false,
+                    false,
+                    true,
+                    false,
+                    None,
+                ),
+                // Issue lead: planner + bus + computer (always injected, gated
+                // server-side). No worktree of its own (see
+                // §5) — always `None`, and no persisted session id either.
+                _ => crate::bus::inject::acp_mcp_servers(
+                    &base,
+                    thread_id_i,
+                    crate::bus::LEAD,
+                    None,
+                    true,
+                    true,
+                    false,
+                    false,
+                    true,
+                    None,
+                ),
+            },
         }
     } else {
-        // Worker: bus only under direction id.
+        // Worker: bus under direction id + computer pinned to this worker's
+        // OWN worktree.
+        // : computer ONLY with a POSITIVELY resolved
+        // worktree — `EngineInner::worktree_id` collapses a missing row or a
+        // failed lookup to `None`, and the absent-`wt` URL shape is legitimate
+        // ONLY for the lead lane; server-side it deliberately resolves to the
+        // direction's FIRST worktree, so an unresolved ACP worker would mint a
+        // bearer for (and write audit/screenshots under) a SIBLING session's
+        // identity in a multi-repo direction. Identity fails closed instead:
+        // no computer server at all until a rebuild resolves the worktree —
+        // mirroring the non-ACP rebuild path's identical guard.
         crate::bus::inject::acp_mcp_servers(
             &base,
             thread_id_i,
@@ -4399,9 +5398,47 @@ async fn spawn_acp_turn(
             false,
             false,
             false,
+            worktree_id.is_some(),
+            worktree_id,
         )
     };
 
+    // The ACP bearer is minted inside `acp_mcp_servers`, not by
+    // `refresh_computer_injection` (ACP supplies MCP on session/new|resume, so
+    // `inject_computer` produces nothing for it). Stamp the engine with the
+    // generation it just minted, or an ACP teardown would have no bearer of its
+    // own to revoke — see `EngineInner::computer_gen`.
+    // Held until the route is established. Every abort between here and the
+    // commit — the cancellation re-check below, both session-open failures, the
+    // stop-won teardown — drops it, which revokes. None of them needs a cleanup
+    // call, which is exactly the class of omission this guard exists to end.
+    let mint = mcp.computer_guard;
+    {
+        // Re-check cancellation HERE, not only at the entry gate. Reaching this
+        // point crossed `client()` and a thread lookup, both awaits, so a Stop
+        // can have completed — and revoked — in between. The mint above already
+        // rotated a fresh, VALID bearer for an engine the user just stopped,
+        // undoing that revoke; the codex connect arm re-checks for the identical
+        // reason.
+        let mut g = eng.lock().await;
+        let cancelled =
+            g.stopped || g.interrupting || expected_epoch.is_some_and(|e| e != g.reset_epoch);
+        if cancelled {
+            return Err(anyhow::anyhow!("engine stopped; not starting an ACP turn"));
+        }
+        // Publish the pending generation before the session open below, which
+        // awaits `session/new` or `session/resume` — a request that can sit
+        // through long flush and reply budgets. The guard is a local and a Stop
+        // landing in that window cannot see it; `computer_gen` is what
+        // `stop_quiet` revokes. `refresh_computer_injection` does the same for
+        // the three non-ACP shapes; ACP mints in `acp_mcp_servers` instead, so
+        // it has to publish here. Compare-and-revoke makes the guard's own
+        // later drop inert if the Stop got there first.
+        if let Some(mint) = &mint {
+            g.computer_gen = Some(mint.generation());
+        }
+    }
+    let mcp = mcp.servers;
     let had_native = native.is_some();
     let prior_native = native.clone();
     // Keep mcp specs for Session Info seeding (moved into open calls via clone).
@@ -4434,6 +5471,11 @@ async fn spawn_acp_turn(
                         // permission events into this engine after the retry
                         // opened a different session, and the surviving route
                         // also pins the pooled client so it can never retire.
+                        // Before the teardown awaits: no consumer will ever
+                        // exist to revoke this mint, the route just torn down
+                        // was never subscribed under it, and scope-end is three
+                        // awaits away.
+                        drop(mint);
                         let _ = client.cancel(&id).await;
                         client.unsubscribe(&id).await;
                         clear_acp_native_never_prompted(&app, &db, &eng, sid, thread_id_i).await;
@@ -4447,6 +5489,8 @@ async fn spawn_acp_turn(
                 Ok(o) => o,
                 Err(e) => {
                     eprintln!("[weft][acp] session/new failed: {e}");
+                    // Same as the resume/load failure above: the mint happened,
+                    // the session did not, and the return drops it.
                     return Err(anyhow::anyhow!("acp_session_open_failed"));
                 }
             };
@@ -4503,6 +5547,30 @@ async fn spawn_acp_turn(
     // Always resubscribe when the runtime lost the route (child restart /
     // shutdown clears sessions) even if the engine still holds acp_client.
     let need_sub = !client.is_subscribed(&session_id).await;
+    // What THIS route owns, in a cell its consumer shares — see
+    // `EngineInner::acp_route_gen`. A new route gets a new cell (so a lingering
+    // old consumer can never reach the replacement's bearer); a resume of the
+    // live route updates the existing one in place, because the mint above
+    // rotated while that route's consumer kept running.
+    let route_gen_cell = {
+        let mut g = eng.lock().await;
+        // Seed/refresh the route's cell from the mint WITHOUT committing: the
+        // stop-won check below can still tear this turn down, and only there is
+        // the hand-off actually final. `MintGuard::generation` exists for
+        // exactly this — name the generation while ownership is still pending.
+        let pending = mint.as_ref().map(|m| m.generation());
+        if !need_sub {
+            if let (Some(generation), Some(cell)) = (pending, g.acp_route_gen.as_ref()) {
+                cell.store(generation, std::sync::atomic::Ordering::SeqCst);
+            }
+            None
+        } else {
+            let cell =
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(pending.unwrap_or(0)));
+            g.acp_route_gen = Some(cell.clone());
+            Some(cell)
+        }
+    };
     if need_sub {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         client.subscribe(&session_id, tx).await?;
@@ -4513,6 +5581,13 @@ async fn spawn_acp_turn(
         // events from the abandoned session as live, appending or finalizing
         // stale text onto a session that was stopped or switched.
         let route_epoch = eng.lock().await.reset_epoch;
+        // The computer bearer THIS route owns — read from the shared cell at
+        // exit, never from `computer_gen`: a later session establishment
+        // re-stamps the engine, and revoking the stamp then would kill the
+        // replacement's live bearer.
+        // `revoke_computer_session_token_generation` no-ops on a superseded
+        // generation, so a route that was replaced revokes nothing.
+        let route_generation = route_gen_cell.clone();
         let (a, d, e, c, s) = (
             app.clone(),
             db.clone(),
@@ -4520,9 +5595,9 @@ async fn spawn_acp_turn(
             client.clone(),
             session_id.clone(),
         );
-        tauri::async_runtime::spawn(
-            async move { acp_consumer(a, d, e, c, s, rx, route_epoch).await },
-        );
+        tauri::async_runtime::spawn(async move {
+            acp_consumer(a, d, e, c, s, rx, route_epoch, route_generation).await
+        });
     }
 
     let stop_won = {
@@ -4530,11 +5605,24 @@ async fn spawn_acp_turn(
         // Ordinary composer Stop sets `interrupting` without bumping epoch until
         // the delayed force reset — must not publish acp_client or arm prompt.
         let won = g.stopped || g.interrupting || expected_epoch.is_some_and(|e| e != g.reset_epoch);
-        if !won {
+        // The hand-off is final HERE, not at the route block above: only past
+        // this check is the turn actually going to run.
+        if won {
+            // Dropped inside this lock, not at scope end. The teardown below
+            // AWAITS cancel and unsubscribe, and a `MintGuard` runs at the end
+            // of the FUNCTION — so the bearer would stay valid across those
+            // waits, exactly the window the Stop is closing. Same rule as the
+            // codex stop-won path; see `MintGuard`'s note on drop timing.
+            //
+            // The route's consumer will also try, reading the cell seeded
+            // earlier; compare-and-revoke makes whichever lands second inert.
+            drop(mint);
+        } else {
             g.acp_client = Some(client.clone());
             if g.native_id.as_deref() != Some(session_id.as_str()) {
                 g.native_id = Some(session_id.clone());
             }
+            commit_computer_mint(&mut g, mint);
         }
         won
     };
@@ -5019,6 +6107,17 @@ fn acp_permission_risk(
         // establishes mutation, so the verb-derived tier is the honest floor.
         PermissionIntent::Write { paths } => file_risk("Edit", paths, crate::ask::RiskLevel::Write),
         PermissionIntent::Network => crate::ask::classify_risk(crate::ask::RiskSignal::Network),
+        // GUI computer-use requests (omp's native `computer`/`browser` tools):
+        // the action word alone decides the tier — observation actions are
+        // ReadOnly, injected input is Write, anything unrecognized stays
+        // Unknown. Same closed word list the weft_computer MCP path uses.
+        PermissionIntent::Gui { action } => crate::ask::classify_gui_action(action),
+        // defensive only — the ACP consumer replies
+        // AllowOnce for this intent before any risk is ever computed (see the
+        // handler's own carve-out), so this arm is never reached in
+        // production. The honest tier is still the action word's own, same as
+        // the Gui arm above, so nothing downstream could ever under-tier it.
+        PermissionIntent::WeftComputerMcp { action } => crate::ask::classify_gui_action(action),
         PermissionIntent::Other { kind } => {
             crate::ask::classify_risk(crate::ask::RiskSignal::Other {
                 tool_name: kind,
@@ -5026,6 +6125,84 @@ fn acp_permission_risk(
             })
         }
     }
+}
+
+/// whether an ACP permission `intent` is OMP's
+/// own native `computer`/`browser` tool (see `acp::permission::
+/// PermissionIntent::Gui`'s own doc) — the ONE question `acp_consumer`'s
+/// `SessionEvent::Permission` arm now asks before it does ANYTHING else with
+/// the request.
+///
+/// Superseding rounds 7/9/10 entirely (`gui_or_ordinary_auto_decision`,
+/// `gui_kill_switch_denies`, `permission_reply_must_reject`,
+/// `computer_enabled_for_acp` — all deleted by this change, none had any
+/// other caller): those rounds still let a native GUI request run through
+/// the SAME auto-grant/human-card machinery an ordinary permission gets,
+/// gated only by `computer::enabled`. That design is what produced every
+/// one of this change's own findings, because OMP's native `computer`/
+/// `browser` tool executes the OS action ITSELF — Weft never sees the call
+/// happen, so it cannot fit its control lease, global Escape, completion
+/// guard, or coordinate model around an action some OTHER process already
+/// ran; there is no completion guard Weft could wrap around a process it
+/// doesn't own. So a GUI intent is no longer a permission DECISION at
+/// all — it is rejected outright, unconditionally, before anything else
+/// runs:
+///  - no card is ever shown, so a native `type` action's literal keystrokes
+///    never reach an IM card's `detail`;
+///  - no Always/Full grant is ever written, so the plaintext-carrying
+///    `grant_id` this arm folds into `action_key` a few lines below never
+///    reaches the durable grants store for a GUI intent (review 4858,
+///    "原生授权键含明文");
+///  - the reply always lands before any DB/lease await, needs no lease, and
+///    answers to Stop the same way the pre-existing `reject_now` teardown
+///    check above already does.
+///
+/// Depth-in-depth note: `ask::AskRegistry::cancel_gui_asks`
+/// still generalizes emergency-stop cancellation to any GUI-marked
+/// `action_key`, so a future path that somehow DID register a GUI-shaped
+/// card would still be reachable by Stop — but THIS check's job is to make
+/// sure that future path never exists for OMP's native tool in the first
+/// place.
+///
+/// No wire-level "use `weft_computer` instead" hint travels with the
+/// rejection: ACP's `session/request_permission` reply is a bare
+/// `{outcome:{outcome:"selected", optionId}}` (see `acp::permission::
+/// selected_outcome`) with no field for one, and `acp::permission`/
+/// `acp::runtime` are outside this change's file scope — the reply reuses
+/// the EXACT SAME channel the pre-existing `reject_now` teardown check
+/// above already replies through. The guidance belongs here, in this
+/// module's own doc trail, and in whatever an agent's own UI shows for a
+/// rejected native tool call: use the injected `weft_computer` MCP tool
+/// instead — it has a permission card, the control lease, and the
+/// emergency stop.
+///
+/// Pure and synchronous so this exact decision is unit-testable without the
+/// surrounding async ACP event loop, which needs a live
+/// `acp::runtime::ClientHandle` and isn't itself practical to drive from a
+/// plain `#[test]`.
+fn is_gui_intent(intent: &crate::acp::permission::PermissionIntent) -> bool {
+    matches!(intent, crate::acp::permission::PermissionIntent::Gui { .. })
+}
+
+/// whether this permission
+/// request is for weft's OWN injected `weft_computer` MCP tool — see
+/// `permission::PermissionIntent::WeftComputerMcp`'s doc (and
+/// `is_weft_computer_mcp_call`'s, for the strict title recognition and its
+/// trust argument). The ACP consumer auto-ALLOWS these, checked BEFORE the
+/// `is_gui_intent` rejection above would match the same `rawInput.action`
+/// shape: the call's real side effect is an HTTP request to weft's own
+/// `bus::computer_srv` gate chain (enabled check, approval card, control
+/// lease, throttle, Stop, audit), so rejecting it broke every omp-side
+/// computer-use action that omp permission-gates, and carding it here would
+/// double-card what that server already cards — the same reasoning
+/// `bus::server::AUTO_APPROVED_INTERNAL_TOOLS` records for this exact tool
+/// on the claude/opencode hook path. Pure and synchronous for the same
+/// unit-testability reason as `is_gui_intent` above.
+fn is_weft_computer_mcp_intent(intent: &crate::acp::permission::PermissionIntent) -> bool {
+    matches!(
+        intent,
+        crate::acp::permission::PermissionIntent::WeftComputerMcp { .. }
+    )
 }
 
 /// How much of the reasoning stream the busy-line chip shows.
@@ -5090,6 +6267,10 @@ async fn acp_consumer(
     // caller BEFORE this task was spawned, so it names the session that created
     // the route rather than whatever won a race afterwards.
     start_epoch: u64,
+    // The generation this ACP route owns, shared with the turn path so a resume
+    // can update it in place — see `EngineInner::acp_route_gen`. Read at exit,
+    // never snapshotted here.
+    route_generation: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 ) {
     use super::proto::ChatEvent;
     use crate::acp::runtime::SessionEvent;
@@ -5377,6 +6558,32 @@ async fn acp_consumer(
                         .await;
                     continue;
                 }
+                // weft's
+                // OWN injected `weft_computer` MCP tool is auto-allowed,
+                // BEFORE the native-GUI rejection below (whose broadened
+                // `rawInput.action` match would otherwise swallow it) — the
+                // server-side gate chain owns the real approval. See
+                // `is_weft_computer_mcp_intent`'s doc for the full rationale
+                // and the strict provenance recognition behind the intent.
+                if is_weft_computer_mcp_intent(&intent) {
+                    client
+                        .reply_permission(&request_id, &options, crate::acp::Want::AllowOnce)
+                        .await;
+                    continue;
+                }
+                // every ACP GUI intent (OMP's own
+                // native `computer`/`browser` tool) is rejected outright,
+                // unconditionally — no card, no grant lookup, no kill-switch
+                // consultation, no lease — BEFORE anything below builds a
+                // card or persists a grant for it. See `is_gui_intent`'s own
+                // doc for the full rationale and the specific findings this
+                // converges.
+                if is_gui_intent(&intent) {
+                    client
+                        .reply_permission(&request_id, &options, crate::acp::Want::RejectOnce)
+                        .await;
+                    continue;
+                }
                 // Precise Always key (issue #89): ACP family + session intent +
                 // the canonical action identity, so two different actions never
                 // share a grant. NOT `detail`: that is the stringified
@@ -5384,6 +6591,7 @@ async fn acp_consumer(
                 // whose only difference lives in `toolCall.locations` — the
                 // very field the risk classifier reads first. `grant_id`
                 // folds every named location in; see `permission::grant_identity`.
+                // `intent` is guaranteed non-GUI past the check above.
                 let action_key = crate::ask::action_key(&["Acp", &intent_key, &grant_id]);
                 // Clone the registry BEFORE any await — State guards are !Send.
                 let asks = app
@@ -5468,9 +6676,21 @@ async fn acp_consumer(
                 // `reject_now` sample and the `auto_decision` verdict reached
                 // the wire as an allow — queued ahead of `session/cancel`,
                 // starting a tool after the user had stopped the turn.
+                //
+                // Note: a GUI intent never reaches
+                // this point at all (rejected above, before any await) — the
+                // the "recheck computer::enabled a second time
+                // after the human-review await" machinery this gate used to
+                // also carry is gone with it: `computer::enabled` and Stop's
+                // interaction with a native GUI request are no longer this
+                // gate's problem, because a native GUI request can no longer
+                // reach a human-review await in the first place.
                 let want = {
-                    let g = eng.lock().await;
-                    if g.stopped || g.interrupting || g.reset_epoch != start_epoch {
+                    let teardown = {
+                        let g = eng.lock().await;
+                        g.stopped || g.interrupting || g.reset_epoch != start_epoch
+                    };
+                    if teardown {
                         crate::acp::Want::RejectOnce
                     } else {
                         want
@@ -5481,6 +6701,25 @@ async fn acp_consumer(
             SessionEvent::Chat(_) => {}
         }
     }
+    // The event stream closed: this ACP session is over — the backend exited,
+    // crashed, or its route was retired. It is the ACP twin of `codex_consumer`'s
+    // genuine disconnect, and the ONLY place an ACP backend's death is observed:
+    // ACP has no `inner.child`, so it reaches neither `spawn_reader`'s EOF nor
+    // any site in `child_permit`'s teardown list. Without this, a crashed ACP
+    // backend leaves its bearer current while the session's rows keep
+    // `session_is_live` true — an orphan holding the URL keeps desktop access
+    // under a standing Full/Always grant.
+    //
+    // Scoped to the generation THIS route owns — read now, so a resume that
+    // re-minted mid-route is accounted for — and compare-and-revoke, so a route
+    // that was already replaced revokes nothing (the replacement's own mint
+    // rotated ours away long before). A retiring Stop reaches the same
+    // generation through `stop_quiet`; both are compare-and-revoke, so whichever
+    // lands second is inert.
+    let owned = route_generation
+        .map(|cell| cell.load(std::sync::atomic::Ordering::SeqCst))
+        .filter(|generation| *generation != 0);
+    revoke_engine_generation_locked(&eng, owned).await;
     let _ = client; // keep handle for permission replies while loop runs
 }
 
@@ -5999,7 +7238,10 @@ async fn codex_consumer(
                     if let Some(qid) = n.queue_id {
                         snapshot_turn_checkpoint(&app, &db, session_id, turn_id, qid).await;
                     }
-                    match client.start_turn(&thread, &n.text).await {
+                    match client
+                        .start_turn_with_images(&thread, &n.text, &n.local_image_paths)
+                        .await
+                    {
                         Ok(t) => {
                             mark_queued_delivered(&app, &db, thread_id, session_id, &n).await;
                             client.set_active_turn(&thread, &t).await;
@@ -6027,8 +7269,16 @@ async fn codex_consumer(
                                 // Take + shut down the (closing) client first — same as
                                 // the direct-send fallback — so THIS consumer sees it's
                                 // superseded (ptr_eq) and skips cleanup, instead of
-                                // racing spawn_turn and resetting the exec turn.
-                                let stale = eng.lock().await.codex_client.take();
+                                // racing spawn_turn and resetting the exec turn. The
+                                // bearer dies with it; `spawn_turn` re-mints for exec.
+                                let stale = {
+                                    let mut inner = eng.lock().await;
+                                    let c = inner.codex_client.take();
+                                    if c.is_some() {
+                                        revoke_engine_bearer(&mut inner);
+                                    }
+                                    c
+                                };
                                 if let Some(c) = stale {
                                     c.shutdown().await;
                                 }
@@ -6177,7 +7427,23 @@ async fn codex_consumer(
     // Only a GENUINE disconnect runs the turn cleanup. If the engine's client was
     // taken/replaced (the exec-fallback teardown shut us down on purpose), skip it
     // — else this cleanup races spawn_turn and can kill/stop the fallback turn.
-    let still_active = matches!(&eng.lock().await.codex_client, Some(c) if c.ptr_eq(&client));
+    let still_active = {
+        let mut inner = eng.lock().await;
+        let ours = matches!(&inner.codex_client, Some(c) if c.ptr_eq(&client));
+        if ours {
+            // The app-server this consumer was attached to is gone: kill its
+            // bearer under the SAME lock that proved the client is still ours,
+            // so a replacement connected in between can't have its live one
+            // revoked instead. `ptr_eq` plays the role `generation` plays for
+            // `spawn_reader`'s EOF.
+            //
+            // Not left to `cleanup_disconnected_turn` below, even though that
+            // revokes too: it early-returns on an idle engine, which is exactly
+            // an app-server that died between turns. See `revoke_engine_bearer`.
+            revoke_engine_bearer(&mut inner);
+        }
+        ours
+    };
     if still_active {
         cleanup_disconnected_turn(&app, &db, &eng, "error").await;
     }
@@ -6360,14 +7626,32 @@ async fn spawn_turn(
     let adapter = crate::adapters::adapter_for(&inner.tool)
         .ok_or_else(|| anyhow::anyhow!("unknown per-turn lead tool {}", inner.tool))?;
     adapter.prepare(&inner.cwd);
-    let (_program, args) = adapter.build_argv(&crate::adapters::AdapterContext {
+    // 活跃会话软上限:拿一个会话槽,已满则排队(与 admit_new_work 硬闸互补)。
+    // Hoisted ABOVE the re-mint: this await can block for as long as the gate
+    // stays saturated, and `spawn_turn` holds the engine lock across it — so a
+    // bearer minted first would be live, with no child and no way for Stop to
+    // acquire the lock and revoke it, for the whole queue wait. The mint must
+    // sit flush against the spawn, with nothing blocking in between.
+    let session_permit = crate::session_gate::acquire_session_slot().await;
+    // Re-mint the computer bearer before this turn's child — a per-turn tool
+    // spawns from the engine's stored injection just like the resident path,
+    // so a Stop-revoked bearer would otherwise ride into the new process
+    // Same hand-off discipline as the resident path: held until the child is
+    // running, dropped (revoked) by any early return in between.
+    let mint = refresh_computer_injection(&app, &mut inner);
+    // The computer injection is appended here rather than living in
+    // `extra_args`, mirroring `build_args` — see `EngineInner::computer_args`.
+    let mut adapter_extra = inner.extra_args.clone();
+    adapter_extra.extend(inner.computer_args.iter().cloned());
+    let built = adapter.build_argv(&crate::adapters::AdapterContext {
         cwd: &inner.cwd,
         system_prompt: &inner.system_prompt,
-        extra_args: &inner.extra_args,
+        extra_args: &adapter_extra,
         native_id: inner.native_id.as_deref(),
         message: &out.text,
         slash_commands: &inner.slash_commands,
-    })?;
+    });
+    let (_program, args) = built?;
     // The adapter's program is the tool identity; resolve it through the
     // per-session pin / global override map so an aliased binary is spawned.
     let program = crate::tool_command::effective(inner.command.as_deref(), &inner.tool);
@@ -6380,14 +7664,17 @@ async fn spawn_turn(
         .args(&args)
         .current_dir(&inner.cwd)
         .env("PATH", crate::detect::tool_path())
-        .envs(inner.extra_env.iter().cloned())
+        // injection-supplied env (the codex computer
+        // bearer travels here, never argv — see `EngineInner::extra_env`).
+        // `spawn_env` (not `extra_env` directly) — it appends the
+        // computer injection and deep-merges the shared
+        // OPENCODE_CONFIG_CONTENT key; see its own doc.
+        .envs(spawn_env(&inner).iter().map(|(k, v)| (k.clone(), v.clone())))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         // stderr → app log: a per-turn CLI that dies prints its reason there.
         .stderr(std::process::Stdio::inherit())
         .kill_on_drop(true);
-    // 活跃会话软上限:拿一个会话槽,已满则排队(与 admit_new_work 硬闸互补)。
-    let session_permit = crate::session_gate::acquire_session_slot().await;
     // T1: own process group + marker before spawn, register PAIRED with the child.
     let configured = crate::proc_registry::configure(&mut command, owner);
     let mut child = command.spawn()?;
@@ -6396,6 +7683,7 @@ async fn spawn_turn(
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("child stdout not piped"))?;
+    commit_computer_mint(&mut inner, mint);
     inner.stdin = None;
     inner.child = Some(child);
     inner.child_reg = Some(reg);
@@ -6951,6 +8239,7 @@ async fn send_hidden_inner(
         origin_tag: hidden_delivery_id.map(hidden_delivery_tag),
         queue_id: None,
         has_attachments: false,
+        local_image_paths: Vec::new(),
     };
 
     match hidden_delivery(
@@ -7281,8 +8570,10 @@ fn reset_ignored_cancel_turn(inner: &mut EngineInner, turn_id: i32) -> Option<Ca
     // Inside the turn_id+busy guard on purpose: only the caller that OWNS this
     // frozen turn may hand its slot back. Releasing outside the guard would drop
     // a NEWER turn's permit while its child is still running (issue #118's whole
-    // point is that this path can fire late), under-counting the live gate.
-    inner.child_permit = None;
+    // point is that this path can fire late), under-counting the live gate — and
+    // would revoke that newer child's live bearer, which `release_child_slot`
+    // documents as the sharper half of the same mistake.
+    release_child_slot(inner);
     inner.stdin = None;
     Some(CancelledTurnDrain {
         current,
@@ -7398,6 +8689,20 @@ async fn stop_quiet_admitted(eng: &EngineRef) -> StopQuietOutcome {
     if let Some(c) = inner.codex_client.take() {
         c.shutdown().await;
     }
+    // Kill the bearer BEFORE the lock goes, not only at the release below.
+    // Stop is the user saying "no more actions from this session", and the ACP
+    // cancel/unsubscribe this function is about to await can block on a backend
+    // that is still running — for an ACP engine that is precisely the window in
+    // which its child, or an orphan holding the session URL, could keep issuing
+    // computer actions under a standing Full/Always grant. Bumping the epoch
+    // does not help: the HTTP endpoint authenticates the bearer, not the epoch.
+    //
+    // The later `release_child_slot` is still required and is NOT redundant: a
+    // send admitted during the unlocked window can reach `spawn_turn` and mint
+    // a REPLACEMENT bearer, and that one has to die with this stop too. Doing
+    // both is safe because `revoke_engine_bearer` consumes the stamp — the
+    // second call is a no-op unless a new mint re-stamped it.
+    revoke_engine_bearer(&mut inner);
     // Cancel any in-flight ACP prompt and drop the session route so a late
     // acp_emit_turn_end cannot overwrite stopped → idle after takeover.
     let AcpTeardown {
@@ -7430,8 +8735,22 @@ async fn stop_quiet_admitted(eng: &EngineRef) -> StopQuietOutcome {
     // send again — holding its slot until a respawn that never comes is a leak
     // for the life of the process (the gate is a `OnceLock` singleton), and it
     // is exactly what the resource dashboard (issue #112) surfaces as an
-    // active-session count that never falls back to zero.
-    inner.child_permit = None;
+    // active-session count that never falls back to zero. The bearer rides the
+    // same helper: this is the chokepoint every teardown funnels through (hard
+    // stop, switch teardown, restart), and resume stays safe because every
+    // respawn path re-mints first (`refresh_computer_injection`).
+    //
+    // The SECOND of this teardown's two revokes, and not redundant with the
+    // one before the lock was dropped for the ACP cancel. That window does not
+    // set `stopped` until this function returns, so a send admitted inside it
+    // reaches `spawn_turn` and mints a REPLACEMENT bearer — which this Stop
+    // must kill too. The early revoke can't see that mint; this one can't
+    // protect the ACP child during the cancel await. Both are needed.
+    //
+    // Safe to repeat because `revoke_engine_bearer` consumes the stamp: with
+    // no new mint in between this is inert, and it can never reach past its
+    // own generation into a bearer that now belongs to somebody else.
+    release_child_slot(&mut inner);
     inner.stdin = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
@@ -7754,7 +9073,19 @@ async fn rewind_reserved(
             session_id: inner.session_id,
             tool: inner.tool.clone(),
             command: inner.command.clone(),
-            extra_args: inner.extra_args.clone(),
+            // The CURRENT injection, deliberately NOT refreshed: this
+            // snapshot spawns a short-lived codex client to fork a thread,
+            // alongside the engine's own still-live one. Re-minting here
+            // would rotate the identity's generation and 401 the live
+            // client's computer tool. A transient fork client
+            // never makes computer calls, so carrying a possibly-stale
+            // bearer costs nothing.
+            extra_args: {
+                let mut a = inner.extra_args.clone();
+                a.extend(inner.computer_args.iter().cloned());
+                a
+            },
+            extra_env: spawn_env(&inner),
             cwd: inner.cwd.clone(),
             native_id: inner.native_id.clone(),
             system_prompt: inner.system_prompt.clone(),
@@ -8424,6 +9755,7 @@ struct RewindSnap {
     tool: String,
     command: Option<String>,
     extra_args: Vec<String>,
+    extra_env: Vec<(String, String)>,
     cwd: std::path::PathBuf,
     native_id: Option<String>,
     /// The prepend the FIRST ACP user turn carries (`{system}\n\n{user}`).
@@ -8459,6 +9791,7 @@ async fn fork_codex_thread(
     let c = crate::codex_app_server::Client::connect_session(
         &program,
         &snap.extra_args,
+        &snap.extra_env,
         &snap.cwd,
         owner,
     )
@@ -9051,7 +10384,15 @@ fn spawn_reader(
             // queued turn, it re-acquires its own permit inside `spawn_turn` — fairly,
             // through the same queue any other waiting session would go through,
             // rather than this session silently keeping the slot it already earned.
-            inner.child_permit = None;
+            //
+            // The bearer dies with it: a per-turn dialect's end-of-turn EOF is a
+            // real child death that no teardown chokepoint sees, and the session's
+            // rows keep `session_is_live` true afterwards. Runs BEFORE the queued
+            // dispatch below on purpose — that respawn goes through `spawn_turn`,
+            // which re-mints, so the next child still starts with a live bearer.
+            // Inside this branch's `generation` guard, as `release_child_slot`
+            // requires: a superseded reader must not revoke the newer child's.
+            release_child_slot(&mut inner);
             let worker_admission = match acquire_dequeued_worker_turn_admission(&inner).await {
                 Ok(admission) => admission,
                 Err(error) => {
@@ -9165,8 +10506,10 @@ fn spawn_reader(
             // process just died (crash, or the kill an `interrupt()` issued) and
             // nothing respawns it until the next send — which may never come. Its
             // slot has to go back now, or a session the user interrupted and then
-            // left alone counts as active forever.
-            inner.child_permit = None;
+            // left alone counts as active forever; its bearer likewise, or an
+            // orphaned descendant outlives the crash still holding a live one.
+            // `ensure_running_locked` re-mints if that next send ever arrives.
+            release_child_slot(&mut inner);
             inner.stdin = None;
             inner.turn = TurnState::default();
             inner.clock = TurnClock::default();
@@ -9251,6 +10594,10 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
         cwd: "/tmp".into(),
         extra_args: vec![],
         extra_env: vec![],
+        computer_args: vec![],
+        computer_env: vec![],
+        computer_gen: None,
+        acp_route_gen: None,
         system_prompt: String::new(),
         native_id: None,
         pending_context_digest: None,
@@ -9281,6 +10628,7 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
         probe_committed: 0,
         current_origin_tag: None,
         tool_rows: std::collections::HashMap::new(),
+        inline_image_rows: std::collections::VecDeque::new(),
         stopped: false,
         codex_client: None,
         acp_client: None,
@@ -9384,6 +10732,118 @@ mod tests {
         allow_running_persist.notify_one();
         worker.await.expect("worker task joins").expect("worker start");
         check.await.expect("check task joins");
+    }
+
+    // —— hardened codex app-server attachment write ——
+
+    /// The happy path: a brand-new path (nothing there yet) writes normally.
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_writes_a_fresh_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("msg1-0-123.png");
+        assert!(write_attachment_no_follow(&p, b"hello"));
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::symlink_metadata(&p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "must be created owner-only");
+    }
+
+    /// The exact race this fix exists to close: something (a co-resident
+    /// process, standing in for an attacker) has ALREADY placed a symlink at
+    /// the exact path this function is about to write to, pointing at an
+    /// unrelated file elsewhere. `create_new` + `O_NOFOLLOW` must refuse to
+    /// write through it — the call must fail closed (return `false`) and the
+    /// symlink's target must be left untouched, never overwritten with the
+    /// attacker's chosen bytes appearing to have been "written by weft".
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_refuses_a_preexisting_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("victim.png");
+        std::fs::write(&target, b"original").unwrap();
+        let p = tmp.path().join("msg1-0-456.png");
+        std::os::unix::fs::symlink(&target, &p).unwrap();
+
+        let ok = write_attachment_no_follow(&p, b"attacker-controlled");
+        assert!(!ok, "a pre-placed symlink must make this fail, not follow it");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"original",
+            "the symlink's target must never be overwritten"
+        );
+    }
+
+    /// A plain, pre-existing (non-symlink) file at the target path must also
+    /// be refused — `create_new` (O_EXCL) is what closes this, distinct from
+    /// the symlink case above but the same "never write through something
+    /// already there" discipline.
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_refuses_an_existing_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("msg1-0-789.png");
+        std::fs::write(&p, b"already here").unwrap();
+
+        let ok = write_attachment_no_follow(&p, b"new bytes");
+        assert!(!ok, "an already-existing file must make this fail, not overwrite it");
+        assert_eq!(std::fs::read(&p).unwrap(), b"already here");
+    }
+
+    // —— hardened write for EVERY OTHER per-turn
+    // dialect's predictable-name attachment spill ——
+
+    /// The happy path: a brand-new predictable path writes normally, owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_allow_overwrite_writes_a_fresh_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("msg7-0.png");
+        assert!(write_attachment_no_follow_allow_overwrite(&p, b"hello"));
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::symlink_metadata(&p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "must be created owner-only");
+    }
+
+    /// The exact vector: a co-resident process
+    /// pre-places a symlink at the predictable `msg<row_id>-<i>.<ext>` path,
+    /// pointing at an arbitrary file elsewhere. `O_NOFOLLOW` must refuse to
+    /// follow it — the call fails closed and the symlink's target is left
+    /// untouched, never truncated/overwritten by Weft's own write.
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_allow_overwrite_refuses_a_preexisting_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("victim.png");
+        std::fs::write(&target, b"original").unwrap();
+        let p = tmp.path().join("msg7-0.png");
+        std::os::unix::fs::symlink(&target, &p).unwrap();
+
+        let ok = write_attachment_no_follow_allow_overwrite(&p, b"attacker-controlled");
+        assert!(!ok, "a pre-placed symlink must make this fail, not follow it");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"original",
+            "the symlink's target must never be overwritten"
+        );
+    }
+
+    /// UNLIKE the app-server helper: a plain, pre-existing (non-symlink) file
+    /// at the predictable path — standing in for a rewind re-dispatching the
+    /// SAME user row a second time — must be OVERWRITTEN, not refused. This is
+    /// the deliberate difference from `write_attachment_no_follow`'s own
+    /// `create_new` behavior: predictable names must survive replay.
+    #[cfg(unix)]
+    #[test]
+    fn write_attachment_no_follow_allow_overwrite_overwrites_an_existing_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("msg7-0.png");
+        std::fs::write(&p, b"already here").unwrap();
+
+        let ok = write_attachment_no_follow_allow_overwrite(&p, b"new bytes");
+        assert!(ok, "an ordinary pre-existing file (our own prior write) must be overwritable");
+        assert_eq!(std::fs::read(&p).unwrap(), b"new bytes");
     }
 
     /// Stop must actually stop. `interrupt()` sets `interrupting` without
@@ -9615,6 +11075,67 @@ mod tests {
             crate::ask::RiskLevel::Unknown,
             "an unauditable read must not be auto-released as read-only"
         );
+    }
+
+    // —— every ACP GUI intent is rejected
+    // outright, unconditionally, before any card or grant — superseding
+    // rounds 7/9/10's own "GUI intent still goes through auto-decision, just
+    // gated by computer::enabled" design entirely ——
+
+    /// `is_gui_intent` recognizes every GUI action regardless of WHICH action
+    /// it names — `type` included, closing the exact leak (a native `type`
+    /// action's literal keystrokes reaching an IM card)
+    /// converges by never letting ANY GUI intent build a card at all.
+    #[test]
+    fn is_gui_intent_recognizes_every_gui_action() {
+        use crate::acp::permission::PermissionIntent;
+
+        for action in ["screenshot", "left_click", "type", "scroll", "key", "some_future_action"] {
+            assert!(
+                is_gui_intent(&PermissionIntent::Gui { action: action.into() }),
+                "GUI action {action:?} must be recognized regardless of which action it names"
+            );
+        }
+    }
+
+    /// Every non-GUI intent variant is unaffected — `is_gui_intent` is a
+    /// precise, exhaustive discriminator, never a loose heuristic that could
+    /// accidentally also catch an ordinary command/file/network/other
+    /// intent.
+    #[test]
+    fn is_gui_intent_never_matches_a_non_gui_intent() {
+        use crate::acp::permission::PermissionIntent;
+
+        assert!(!is_gui_intent(&PermissionIntent::Command("rm -rf /".into())));
+        assert!(!is_gui_intent(&PermissionIntent::Read { paths: Vec::new() }));
+        assert!(!is_gui_intent(&PermissionIntent::Write { paths: Vec::new() }));
+        assert!(!is_gui_intent(&PermissionIntent::Network));
+        assert!(!is_gui_intent(&PermissionIntent::Other { kind: "think".into() }));
+        // the injected weft_computer MCP intent must
+        // NEVER hit the native-GUI rejection — it has its own auto-allow arm.
+        assert!(!is_gui_intent(&PermissionIntent::WeftComputerMcp {
+            action: "left_click".into()
+        }));
+    }
+
+    /// the auto-allow
+    /// carve-out matches EXACTLY the injected-MCP intent variant — every other
+    /// intent (the native Gui one above all) keeps its existing handling.
+    #[test]
+    fn is_weft_computer_mcp_intent_matches_only_its_own_variant() {
+        use crate::acp::permission::PermissionIntent;
+
+        assert!(is_weft_computer_mcp_intent(&PermissionIntent::WeftComputerMcp {
+            action: "screenshot".into()
+        }));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Gui {
+            action: "screenshot".into()
+        }));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Command("echo".into())));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Read { paths: Vec::new() }));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Write { paths: Vec::new() }));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Network));
+        assert!(!is_weft_computer_mcp_intent(&PermissionIntent::Other { kind: "think".into() }));
     }
 
     /// An image-only message is addressable in ACP and not in claude, and the
@@ -10311,6 +11832,7 @@ mod tests {
             output: None,
             is_error: false,
             collab_threads,
+            images: Vec::new(),
         }
     }
 
@@ -10325,6 +11847,23 @@ mod tests {
         assert_eq!(v["name"], "read_file");
         assert!(v.get("agentThread").is_none());
         assert!(v.get("collabThreads").is_none());
+        // Same "present only when non-empty" contract for images.
+        assert!(v.get("images").is_none());
+    }
+
+    /// A call that already carries images (no current dialect populates
+    /// `ToolCall::images`, but `tool_row_content` must still honor it — the
+    /// symmetric counterpart to `merge_tool_result_content_*` below) gets an
+    /// `images` key; an image-less call gets none at all, matching
+    /// `collabThreads`'s own "present only when non-empty" contract.
+    #[test]
+    fn tool_row_content_carries_images_when_the_call_has_any() {
+        let call = super::super::proto::ToolCall {
+            images: vec!["data:image/png;base64,QUJD".to_string()],
+            ..test_tool_call("read_file", Vec::new())
+        };
+        let v = tool_row_content(&call, None);
+        assert_eq!(v["images"], serde_json::json!(["data:image/png;base64,QUJD"]));
     }
 
     #[test]
@@ -10347,6 +11886,379 @@ mod tests {
         let v = tool_row_content(&call, None);
         assert!(v.get("agentThread").is_none());
         assert_eq!(v["collabThreads"], serde_json::json!(["sub-1", "sub-2"]));
+    }
+
+    fn test_tool_result(images: Vec<String>) -> super::super::proto::ToolResultItem {
+        super::super::proto::ToolResultItem {
+            id: "call_1".into(),
+            output: "the output".into(),
+            is_error: false,
+            collab_threads: Vec::new(),
+            images,
+        }
+    }
+
+    /// `merge_tool_result_content`'s images half: a result carrying images
+    /// writes the `images` key (present-only-when-non-empty, same contract as
+    /// `tool_row_content`'s own images/collabThreads keys).
+    #[test]
+    fn merge_tool_result_content_writes_images_when_the_result_has_any() {
+        let mut content = tool_row_content(&test_tool_call("Bash", Vec::new()), None);
+        assert!(content.get("images").is_none(), "no images before merge");
+        let item = test_tool_result(vec!["data:image/png;base64,QUJD".to_string()]);
+        merge_tool_result_content(&mut content, &item);
+        assert_eq!(content["output"], "the output");
+        assert_eq!(content["images"], serde_json::json!(["data:image/png;base64,QUJD"]));
+    }
+
+    /// The result's images OVERRIDE the call side, exactly like `output` does
+    /// — never appended/merged, and an empty result REMOVES whatever the call
+    /// side had, so a stale call-side stub can't survive into the terminal
+    /// row. This is the deliberately asymmetric choice vs. `collabThreads`
+    /// (see `merge_tool_result_content`'s doc for why the two differ).
+    #[test]
+    fn merge_tool_result_content_images_override_not_append_and_clear_when_empty() {
+        // The call side already had an image (hypothetical — no current dialect
+        // populates ToolCall::images, but the row's content JSON can still carry
+        // a stale key from some other source).
+        let mut content = serde_json::json!({
+            "name": "Bash",
+            "output": "",
+            "is_error": false,
+            "images": ["data:image/png;base64,STALE"],
+        });
+        // A result with a DIFFERENT image replaces it — not appends.
+        let replaced = test_tool_result(vec!["data:image/png;base64,NEW".to_string()]);
+        merge_tool_result_content(&mut content, &replaced);
+        assert_eq!(content["images"], serde_json::json!(["data:image/png;base64,NEW"]));
+
+        // A subsequent empty-images result (e.g. a different call id's row that
+        // never had a real screenshot) clears the key entirely rather than
+        // leaving the previous result's images stranded on it.
+        let empty = test_tool_result(Vec::new());
+        merge_tool_result_content(&mut content, &empty);
+        assert!(content.get("images").is_none());
+    }
+
+    /// Pre-existing merge behavior (output/is_error/collabThreads) must be
+    /// unchanged by the images work — regression guard for the refactor into
+    /// `merge_tool_result_content`.
+    #[test]
+    fn merge_tool_result_content_keeps_existing_output_and_collab_threads_behavior() {
+        let mut content = tool_row_content(&test_tool_call("collabAgentToolCall", Vec::new()), None);
+        let item = super::super::proto::ToolResultItem {
+            id: "call_1".into(),
+            output: "done".into(),
+            is_error: true,
+            collab_threads: vec!["sub-1".into()],
+            images: Vec::new(),
+        };
+        merge_tool_result_content(&mut content, &item);
+        assert_eq!(content["output"], "done");
+        assert_eq!(content["is_error"], true);
+        assert_eq!(content["collabThreads"], serde_json::json!(["sub-1"]));
+        assert!(content.get("images").is_none());
+    }
+
+    // —— bounded inline-image-row retention ——
+
+    fn inline_row(id: i32) -> (i32, bool, serde_json::Value) {
+        (id, false, serde_json::json!({"images": [format!("data:image/png;base64,img{id}")]}))
+    }
+
+    /// Pushing one row past the cap evicts exactly the OLDEST one, in FIFO
+    /// order — the surviving queue holds the `MAX_INLINE_IMAGE_ROWS` most
+    /// recent rows, oldest-of-survivors first.
+    #[test]
+    fn track_inline_image_row_evicts_the_oldest_once_over_the_cap() {
+        let mut rows = std::collections::VecDeque::new();
+        let mut evicted_ids = Vec::new();
+        for i in 0..(MAX_INLINE_IMAGE_ROWS as i32 + 2) {
+            let (next_rows, evicted) = track_inline_image_row(rows, inline_row(i));
+            rows = next_rows;
+            evicted_ids.extend(evicted.into_iter().map(|(id, _, _)| id));
+        }
+        assert_eq!(rows.len(), MAX_INLINE_IMAGE_ROWS);
+        assert_eq!(evicted_ids, vec![0, 1], "the two oldest (ids 0 and 1) must be evicted, in order");
+        let surviving_ids: Vec<i32> = rows.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(
+            surviving_ids,
+            (2..(MAX_INLINE_IMAGE_ROWS as i32 + 2)).collect::<Vec<_>>(),
+            "survivors are the MOST RECENT rows, in insertion order"
+        );
+    }
+
+    /// Under the cap, nothing is evicted at all.
+    #[test]
+    fn track_inline_image_row_evicts_nothing_under_the_cap() {
+        let mut rows = std::collections::VecDeque::new();
+        for i in 0..MAX_INLINE_IMAGE_ROWS as i32 {
+            let (next_rows, evicted) = track_inline_image_row(rows, inline_row(i));
+            rows = next_rows;
+            assert!(evicted.is_empty(), "must not evict while at or under the cap");
+        }
+        assert_eq!(rows.len(), MAX_INLINE_IMAGE_ROWS);
+    }
+
+    /// the DB-write-path cap is what actually
+    /// bounds persisted inline images — unlike `inner.inline_image_rows`
+    /// (this engine's own in-memory queue, empty again on every restart),
+    /// `enforce_durable_inline_image_cap_db` is called with NO in-memory
+    /// state carried between iterations here at all, standing in for a
+    /// fresh engine (empty queue) running after every single write — i.e. a
+    /// "restart" between every screenshot. The persisted count must still
+    /// never exceed `MAX_INLINE_IMAGE_ROWS`. All rows here are the lead's own
+    /// (`session_id: None`) — see the earlier P2 test below for the
+    /// multi-session scoping this now enforces.
+    #[tokio::test]
+    async fn enforce_durable_inline_image_cap_db_bounds_persisted_inline_images_across_a_simulated_restart() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
+
+        let n = MAX_INLINE_IMAGE_ROWS + 2;
+        for i in 0..n {
+            let content = serde_json::json!({
+                "name": "computer",
+                "summary": "screenshot",
+                "input": {},
+                "output": format!("/tmp/shot-{i}.png"),
+                "is_error": false,
+                "images": [format!("data:image/png;base64,img{i}")],
+            });
+            repo::insert_lead_message(
+                &db,
+                t.id,
+                None,
+                1,
+                "assistant",
+                "tool",
+                &content.to_string(),
+                "complete",
+            )
+            .await
+            .unwrap();
+            // No in-memory queue passed in at all — each call here is as
+            // independent as if a brand-new engine (empty `inline_image_rows`)
+            // ran after every single write, i.e. a "restart" in between each.
+            enforce_durable_inline_image_cap_db(&db, t.id, None).await;
+        }
+
+        let messages = repo::list_lead_messages(&db, t.id).await.unwrap();
+        assert_eq!(messages.len(), n, "no row is ever deleted, only its images key stripped");
+        let with_images: Vec<&lead_message::Model> =
+            messages.iter().filter(|m| m.content.contains("\"images\"")).collect();
+        assert_eq!(
+            with_images.len(),
+            MAX_INLINE_IMAGE_ROWS,
+            "persisted inline images must stay at the cap no matter how many restarts happen in between"
+        );
+        // The most recent write must still carry its own inline image.
+        let last = messages.last().unwrap();
+        assert!(
+            last.content.contains("\"images\""),
+            "the current call's own screenshot must stay inline: {}",
+            last.content
+        );
+        // An older, evicted row keeps its `output` path text intact — only
+        // the inline data URI is stripped, never the on-disk reference.
+        let first = &messages[0];
+        assert!(!first.content.contains("\"images\""));
+        assert!(
+            first.content.contains("shot-0.png"),
+            "the path reference must survive the strip: {}",
+            first.content
+        );
+    }
+
+    /// a tool row that merely
+    /// MENTIONS `"images"` below the top level (here inside its serialized
+    /// `input`) must NOT count toward the retention limit. Before the fix, the
+    /// bare-substring count inflated `keep_from` and could strip a genuine
+    /// older screenshot even while fewer than `MAX_INLINE_IMAGE_ROWS` real
+    /// image rows existed.
+    #[tokio::test]
+    async fn enforce_durable_inline_image_cap_db_ignores_non_top_level_images_mentions() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+
+        // Exactly MAX_INLINE_IMAGE_ROWS genuine screenshots (top-level
+        // `images`) — all belong under the cap and must be kept.
+        for i in 0..MAX_INLINE_IMAGE_ROWS {
+            let content = serde_json::json!({
+                "name": "computer",
+                "summary": "screenshot",
+                "input": {},
+                "output": format!("/tmp/real-{i}.png"),
+                "is_error": false,
+                "images": [format!("data:image/png;base64,real{i}")],
+            });
+            repo::insert_lead_message(&db, t.id, None, 1, "assistant", "tool", &content.to_string(), "complete")
+                .await
+                .unwrap();
+        }
+        // Two LATER rows that only MENTION "images" inside their `input` — no
+        // top-level `images` key, nothing to strip. Under the old substring
+        // count these padded the total to 6 → `keep_from` = 2 → the two OLDEST
+        // genuine screenshots got stripped even though only 4 real ones exist.
+        for i in 0..2 {
+            let content = serde_json::json!({
+                "name": "some_tool",
+                "summary": "unrelated",
+                "input": { "images": [format!("query-mention-{i}")] },
+                "output": "done",
+                "is_error": false,
+            });
+            repo::insert_lead_message(&db, t.id, None, 1, "assistant", "tool", &content.to_string(), "complete")
+                .await
+                .unwrap();
+        }
+
+        enforce_durable_inline_image_cap_db(&db, t.id, None).await;
+
+        let messages = repo::list_lead_messages(&db, t.id).await.unwrap();
+        let genuine_screenshots_kept = messages
+            .iter()
+            .filter(|m| {
+                serde_json::from_str::<serde_json::Value>(&m.content)
+                    .ok()
+                    .and_then(|v| v.as_object().map(|o| o.contains_key("images")))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            genuine_screenshots_kept, MAX_INLINE_IMAGE_ROWS,
+            "no genuine screenshot may be stripped when only non-top-level \"images\" mentions padded the count"
+        );
+        // The mention rows are left entirely untouched.
+        assert!(
+            messages.iter().any(|m| m.content.contains("query-mention-0")),
+            "a non-image row's own content must be left intact"
+        );
+    }
+
+    /// a thread hosting TWO sessions —
+    /// the lead (`session_id: None`) and a chat-mode worker (`session_id:
+    /// Some(7)`) — each writing more than `MAX_INLINE_IMAGE_ROWS` inline
+    /// screenshots, must keep each session's OWN cap independently. Before
+    /// this fix, `enforce_durable_inline_image_cap_db` pooled every
+    /// session's tool rows into ONE shared retention queue keyed only by
+    /// `thread_id`, so calling it while enforcing the lead's cap could strip
+    /// images off the untouched worker's timeline (and vice versa). Here,
+    /// only the worker's cap is ever invoked — the lead's rows must come out
+    /// with every inline image still intact.
+    #[tokio::test]
+    async fn enforce_durable_inline_image_cap_db_scopes_the_cap_to_one_session() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude")
+            .await
+            .unwrap();
+        // Post-merge with main's workspace-fence governance,
+        // `insert_lead_message` refuses a session with no writable
+        // thread/direction/repo owner — so the worker session must be REAL
+        // rows, not a synthetic id.
+        let repo_ref = repo::add_repo_ref(&db, ws.id, "api", "/tmp/img-cap-repo", "main", "", true)
+            .await
+            .unwrap();
+        let direction = repo::create_direction(
+            &db,
+            t.id,
+            "impl",
+            "claude",
+            repo_ref.id,
+            "why",
+            "impl-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let session = repo::create_session(&db, direction.id, repo_ref.id, "claude", "/tmp/img-cap-wt")
+            .await
+            .unwrap();
+
+        let worker_session_id = Some(session.id);
+        let n = MAX_INLINE_IMAGE_ROWS + 2;
+
+        // The lead writes its own screenshots first — session_id: None.
+        for i in 0..n {
+            let content = serde_json::json!({
+                "name": "computer",
+                "summary": "screenshot",
+                "input": {},
+                "output": format!("/tmp/lead-shot-{i}.png"),
+                "is_error": false,
+                "images": [format!("data:image/png;base64,lead-img{i}")],
+            });
+            repo::insert_lead_message(
+                &db,
+                t.id,
+                None,
+                1,
+                "assistant",
+                "tool",
+                &content.to_string(),
+                "complete",
+            )
+            .await
+            .unwrap();
+        }
+
+        // The worker (session_id: Some(7)) then writes its own screenshots,
+        // enforcing ONLY its own cap after each one — the lead's cap is never
+        // invoked here at all.
+        for i in 0..n {
+            let content = serde_json::json!({
+                "name": "computer",
+                "summary": "screenshot",
+                "input": {},
+                "output": format!("/tmp/worker-shot-{i}.png"),
+                "is_error": false,
+                "images": [format!("data:image/png;base64,worker-img{i}")],
+            });
+            repo::insert_lead_message(
+                &db,
+                t.id,
+                worker_session_id,
+                1,
+                "assistant",
+                "tool",
+                &content.to_string(),
+                "complete",
+            )
+            .await
+            .unwrap();
+            enforce_durable_inline_image_cap_db(&db, t.id, worker_session_id).await;
+        }
+
+        let messages = repo::list_lead_messages(&db, t.id).await.unwrap();
+        assert_eq!(messages.len(), 2 * n, "no row is ever deleted, only its images key stripped");
+
+        let lead_rows: Vec<&lead_message::Model> =
+            messages.iter().filter(|m| m.session_id.is_none()).collect();
+        let worker_rows: Vec<&lead_message::Model> = messages
+            .iter()
+            .filter(|m| m.session_id == worker_session_id)
+            .collect();
+        assert_eq!(lead_rows.len(), n);
+        assert_eq!(worker_rows.len(), n);
+
+        let lead_with_images = lead_rows.iter().filter(|m| m.content.contains("\"images\"")).count();
+        assert_eq!(
+            lead_with_images, n,
+            "the lead's timeline was never touched by the worker's cap enforcement — \
+             every one of its inline images must survive intact"
+        );
+
+        let worker_with_images =
+            worker_rows.iter().filter(|m| m.content.contains("\"images\"")).count();
+        assert_eq!(
+            worker_with_images, MAX_INLINE_IMAGE_ROWS,
+            "the worker's OWN cap still applies to its own rows"
+        );
     }
 
     /// PersistedMeta roundtrip + tolerance: apply restores every last_* field,
@@ -10481,6 +12393,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         };
         let mut turn = TurnState::default();
         assert!(!has_pending_user_test_update(&turn));
@@ -10503,6 +12416,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         });
         let next = t.on_turn_end();
         assert_eq!(next.map(|o| o.text).as_deref(), Some("second"));
@@ -10584,6 +12498,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         });
         t.request_bus_read(); // wake lands AFTER "earlier" was queued
                               // "earlier" preceded the wake, so it drains first, then the read.
@@ -10607,6 +12522,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         });
         // The wake arrived before "later", so the inbox read comes first — the
         // agent can't answer the newer prompt without seeing the bus message.
@@ -11981,6 +13897,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         });
         let turn_id = mark_hidden_turn_started_with_delivery(&mut inner, Some(9));
         assert_eq!(inner.turn_user_row, Some(-9));
@@ -12041,6 +13958,7 @@ mod tests {
             origin_tag: None,
             queue_id: Some(99),
             has_attachments: false,
+            local_image_paths: Vec::new(),
         });
 
         let drain = reset_ignored_cancel_turn(&mut inner, 5).expect("same turn, still busy");
@@ -12160,6 +14078,409 @@ mod tests {
         assert!(eng.lock().await.child_permit.is_none());
     }
 
+    /// Give `inner` a distinct computer identity and mint the bearer its
+    /// (notional) child was launched with. Returns that bearer; compare it
+    /// against `computer_session_token` for the same identity afterwards —
+    /// equal means the generation never moved and the dead child's token is
+    /// still live.
+    fn mint_bearer_for(inner: &mut EngineInner, thread: i32) -> String {
+        inner.thread_id = thread;
+        inner.worktree_id = None;
+        let minted = crate::bus::computer_srv::rotate_and_mint_computer_session_token(
+            thread,
+            &inner.ask_dir,
+            None,
+        );
+        // Exactly what a spawn path does once the child is live: commit the
+        // mint, which both disarms the drop-revoke and records the generation
+        // this engine's teardown may revoke. Without the commit the guard would
+        // drop at the end of this helper and kill the bearer the caller is
+        // about to assert on.
+        commit_computer_mint(inner, Some(minted.guard));
+        minted.token
+    }
+
+    fn bearer_is_live(inner: &EngineInner, minted: &str) -> bool {
+        crate::bus::computer_srv::computer_session_token(
+            inner.thread_id,
+            &inner.ask_dir,
+            inner.worktree_id,
+        ) == minted
+    }
+
+    /// Every teardown that releases the slot also kills the bearer. The two
+    /// are one helper (`release_child_slot`) precisely so this list can't
+    /// diverge from `child_permit`'s enumeration — so assert the pairing on
+    /// each synchronous member of it rather than on the helper alone.
+    #[tokio::test]
+    async fn the_synchronous_teardowns_revoke_the_dead_child_bearer() {
+        let mut wedged = test_inner("claude");
+        let wedged_bearer = mint_bearer_for(&mut wedged, 951_101);
+        assert!(bearer_is_live(&wedged, &wedged_bearer));
+        invalidate_resident(&mut wedged);
+        assert!(
+            !bearer_is_live(&wedged, &wedged_bearer),
+            "an invalidated resident's bearer must not survive the kill"
+        );
+
+        let mut hidden = test_inner("claude");
+        let hidden_bearer = mint_bearer_for(&mut hidden, 951_201);
+        let turn_id = mark_hidden_turn_started(&mut hidden);
+        assert!(reset_failed_hidden_turn(&mut hidden, turn_id).is_some());
+        assert!(
+            !bearer_is_live(&hidden, &hidden_bearer),
+            "a rolled-back hidden spawn's bearer must not survive"
+        );
+
+        let mut cancelled = test_inner("codex");
+        let cancelled_bearer = mint_bearer_for(&mut cancelled, 951_301);
+        cancelled.turn.busy = true;
+        cancelled.turn_id = 5;
+        assert!(reset_ignored_cancel_turn(&mut cancelled, 5).is_some());
+        assert!(
+            !bearer_is_live(&cancelled, &cancelled_bearer),
+            "an ignored-cancel recovery's bearer must not survive"
+        );
+    }
+
+    /// The ownership guards protect the bearer, not just the permit. A stale
+    /// caller that no longer owns the turn must leave the CURRENT child's
+    /// bearer alone — revoking it would 401 every computer call from a
+    /// perfectly healthy session, which is louder than the leaked slot the
+    /// same guard was originally written for.
+    #[tokio::test]
+    async fn a_teardown_for_a_turn_it_no_longer_owns_leaves_the_bearer_live() {
+        let mut newer = test_inner("codex");
+        let live_bearer = mint_bearer_for(&mut newer, 951_401);
+        newer.turn.busy = true;
+        newer.turn_id = 6; // advanced past the turn_id=5 being recovered
+
+        assert!(reset_ignored_cancel_turn(&mut newer, 5).is_none());
+
+        assert!(
+            bearer_is_live(&newer, &live_bearer),
+            "the running turn's bearer must outlive a stale recovery attempt"
+        );
+    }
+
+    /// A codex app-server is the one child of this engine whose death the
+    /// `child_permit` teardown list does not cover, and putting its revoke
+    /// inside `cleanup_disconnected_turn` alone would not do: that cleanup
+    /// skips an engine whose turn state is untouched, which is precisely an
+    /// app-server that died BETWEEN turns and is never reconnected. Pin both
+    /// halves — the skip, and that the disconnect revoke still lands on such an
+    /// engine.
+    #[tokio::test]
+    async fn a_codex_disconnect_between_turns_still_kills_the_bearer() {
+        let mut idle = test_inner("codex");
+        let bearer = mint_bearer_for(&mut idle, 951_601);
+        assert!(
+            turn_state_is_untouched(&idle),
+            "an app-server dying between turns leaves nothing for the cleanup to do"
+        );
+
+        revoke_engine_bearer(&mut idle);
+
+        assert!(
+            !bearer_is_live(&idle, &bearer),
+            "the disconnected app-server's bearer must not outlive it"
+        );
+
+        let mut mid_turn = test_inner("codex");
+        mid_turn.turn.busy = true;
+        assert!(
+            !turn_state_is_untouched(&mid_turn),
+            "a disconnect mid-turn still has a turn to tear down"
+        );
+    }
+
+    /// The identity is SHARED, the bearer is not. `(thread, ask_dir,
+    /// worktree_id)` is `(thread, direction, worktree)` for a worker, so a
+    /// second session opened on the same direction and worktree lands on the
+    /// same identity while the first engine's child is still winding down. Its
+    /// teardown must not take the replacement's live bearer with it — no
+    /// per-engine counter can see the collision, because each engine's
+    /// `generation`/`turn_id` agree that its own teardown is legitimate.
+    #[tokio::test]
+    async fn a_stale_engines_teardown_leaves_a_replacements_bearer_alone() {
+        let mut first = test_inner("claude");
+        let first_bearer = mint_bearer_for(&mut first, 951_701);
+
+        // A second engine opens on the SAME identity and mints, which rotates
+        // the shared generation out from under the first.
+        let mut second = test_inner("claude");
+        second.ask_dir = first.ask_dir.clone();
+        let second_bearer = mint_bearer_for(&mut second, 951_701);
+        assert!(!bearer_is_live(&first, &first_bearer), "rotation already killed it");
+        assert!(bearer_is_live(&second, &second_bearer));
+
+        // NOW the first engine's child finally exits.
+        invalidate_resident(&mut first);
+
+        assert!(
+            bearer_is_live(&second, &second_bearer),
+            "the replacement's bearer must survive the predecessor's teardown"
+        );
+    }
+
+    /// A mint whose child never starts is not somebody else's problem. Every
+    /// spawn path re-mints right before launching, so a launch that then fails
+    /// leaves a current, valid bearer — and a written config — belonging to a
+    /// process that does not exist. The guard closes it by DEFAULT: an early
+    /// return anywhere between the mint and a live child drops it.
+    ///
+    /// Written against the drop rather than against a spawn path so it holds
+    /// for every such path, including ones added later.
+    #[tokio::test]
+    async fn a_mint_whose_spawn_fails_is_revoked_at_the_failure() {
+        let inner = test_inner("claude");
+        let minted = crate::bus::computer_srv::rotate_and_mint_computer_session_token(
+            951_801,
+            &inner.ask_dir,
+            None,
+        );
+        let stillborn = minted.token;
+        assert!(crate::bus::computer_srv::computer_session_token(951_801, &inner.ask_dir, None)
+            == stillborn);
+
+        // The spawn failed: nothing committed, so the guard falls out of scope.
+        drop(minted.guard);
+
+        assert!(
+            crate::bus::computer_srv::computer_session_token(951_801, &inner.ask_dir, None)
+                != stillborn,
+            "a bearer minted for a child that never started must not stay valid"
+        );
+    }
+
+    /// The mirror, and the one that catches "just revoke everything": a spawn
+    /// that SUCCEEDS commits, and the bearer must survive — otherwise every
+    /// session would 401 on its first computer call.
+    #[tokio::test]
+    async fn a_successful_spawn_keeps_the_bearer_it_was_minted() {
+        let mut inner = test_inner("claude");
+        inner.thread_id = 951_901;
+        inner.worktree_id = None;
+        let minted = crate::bus::computer_srv::rotate_and_mint_computer_session_token(
+            inner.thread_id,
+            &inner.ask_dir,
+            None,
+        );
+        let live = minted.token;
+
+        commit_computer_mint(&mut inner, Some(minted.guard));
+
+        assert!(bearer_is_live(&inner, &live), "a launched child keeps its bearer");
+        assert!(
+            inner.computer_gen.is_some(),
+            "committing is also what records the generation a teardown will revoke"
+        );
+    }
+
+    /// A LIVE app-server client holds this engine's bearer, and a child
+    /// teardown does not destroy it — the next turn reuses that same client
+    /// WITHOUT refreshing its injection. Revoking on a turn rollback would 401
+    /// an otherwise healthy connection until it is rebuilt.
+    #[tokio::test]
+    async fn a_turn_rollback_spares_the_bearer_of_a_surviving_codex_client() {
+        let mut inner = test_inner("codex");
+        let client_bearer = mint_bearer_for(&mut inner, 952_001);
+        inner.codex_client = Some(crate::codex_app_server::Client::disconnected_for_test());
+        let turn_id = mark_hidden_turn_started(&mut inner);
+
+        assert!(reset_failed_hidden_turn(&mut inner, turn_id).is_some());
+
+        assert!(
+            bearer_is_live(&inner, &client_bearer),
+            "the surviving client's bearer must outlive the rolled-back turn"
+        );
+        assert!(inner.child_permit.is_none(), "the slot still goes back");
+    }
+
+    /// Revoking twice around an unlocked teardown (Stop revokes before
+    /// releasing the lock for the ACP cancel, and again after re-locking) must
+    /// not consume a generation somebody else minted in between. The stamp is
+    /// taken by the first call, so the second is inert.
+    #[tokio::test]
+    async fn a_second_revoke_before_the_next_mint_is_inert() {
+        let mut stopping = test_inner("claude");
+        let doomed = mint_bearer_for(&mut stopping, 952_101);
+        revoke_engine_bearer(&mut stopping);
+        assert!(!bearer_is_live(&stopping, &doomed));
+
+        // Somebody else takes over the identity while Stop is mid-teardown.
+        let mut taker = test_inner("claude");
+        taker.ask_dir = stopping.ask_dir.clone();
+        let takers_bearer = mint_bearer_for(&mut taker, 952_101);
+
+        revoke_engine_bearer(&mut stopping);
+
+        assert!(
+            bearer_is_live(&taker, &takers_bearer),
+            "a repeat revoke must not reach past its own generation"
+        );
+    }
+
+    /// A teardown that names the generation IT owns cannot reach a
+    /// replacement's. `codex_gen`/`computer_gen` describe one connection at a
+    /// time, but two overlap in the wild — a codex consumer draining after its
+    /// client was replaced, an ACP route retired while a new session is
+    /// establishing — and a teardown reading "current" would take the incoming
+    /// connection's bearer with it.
+    #[tokio::test]
+    async fn a_teardown_that_names_its_own_generation_cannot_take_a_replacements() {
+        let mut inner = test_inner("codex");
+        let predecessor = mint_bearer_for(&mut inner, 952_201);
+        let predecessor_gen = inner.computer_gen;
+
+        // The replacement connects and mints; the engine is re-stamped.
+        let replacement = crate::bus::computer_srv::rotate_and_mint_computer_session_token(
+            inner.thread_id,
+            &inner.ask_dir,
+            inner.worktree_id,
+        );
+        let replacement_gen = replacement.guard.commit();
+        inner.computer_gen = Some(replacement_gen);
+        assert!(!bearer_is_live(&inner, &predecessor), "rotation killed it already");
+
+        // The predecessor's consumer only now notices its connection is gone.
+        revoke_engine_generation(&inner, predecessor_gen);
+
+        assert!(
+            bearer_is_live(&inner, &replacement.token),
+            "a predecessor naming its own generation must not reach the replacement's"
+        );
+    }
+
+    /// Detaching the dead codex client before re-minting is what keeps
+    /// `codex_client` and `computer_gen` describing the SAME connection. While
+    /// a dead client stays published its consumer's `ptr_eq` guard still
+    /// passes, so it would prove ownership of the old pointer and then consume
+    /// a stamp that by then belongs to the replacement.
+    #[tokio::test]
+    async fn detaching_the_dead_client_hands_its_generation_back_before_the_remint() {
+        let mut inner = test_inner("codex");
+        let dead_bearer = mint_bearer_for(&mut inner, 952_401);
+        inner.codex_client = Some(crate::codex_app_server::Client::disconnected_for_test());
+
+        // What the connect arm does once `is_alive()` has said no.
+        inner.codex_client = None;
+        revoke_engine_bearer(&mut inner);
+
+        assert!(
+            !bearer_is_live(&inner, &dead_bearer),
+            "the dead client's bearer is revoked as it is detached"
+        );
+        assert!(
+            inner.computer_gen.is_none(),
+            "and its stamp is consumed, so the remint's stamp cannot be mistaken for it"
+        );
+    }
+
+    /// The ACP session's own teardown still has to work: naming the generation
+    /// is a scoping rule, not an excuse to revoke nothing.
+    #[tokio::test]
+    async fn an_acp_session_ending_revokes_the_generation_it_was_established_with() {
+        let mut inner = test_inner("omp");
+        let established = mint_bearer_for(&mut inner, 952_301);
+        let route_generation = inner.computer_gen;
+        assert!(bearer_is_live(&inner, &established));
+
+        revoke_engine_generation(&inner, route_generation);
+
+        assert!(
+            !bearer_is_live(&inner, &established),
+            "a dead ACP backend's bearer must not outlive its session"
+        );
+    }
+
+    /// An ACP route's generation moves under its consumer. `spawn_acp_turn`
+    /// re-mints on EVERY turn, but a consumer is spawned only when the route is
+    /// new — so a consumer holding a turn-1 snapshot would, at exit,
+    /// compare-and-revoke a superseded value and change nothing, leaving the
+    /// LAST injected URL live. The shared cell is what keeps "what this route
+    /// owns" true across resumes.
+    #[tokio::test]
+    async fn an_acp_resume_updates_the_generation_its_consumer_will_revoke() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let mut inner = test_inner("omp");
+        let _turn_one = mint_bearer_for(&mut inner, 952_501);
+        // The route is established: cell created, consumer holds a clone.
+        let cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            inner.computer_gen.unwrap_or(0),
+        ));
+        let held_by_consumer = cell.clone();
+
+        // Turn 2 resumes the SAME route, which re-mints.
+        let turn_two = crate::bus::computer_srv::rotate_and_mint_computer_session_token(
+            inner.thread_id,
+            &inner.ask_dir,
+            inner.worktree_id,
+        );
+        let turn_two_gen = turn_two.guard.commit();
+        inner.computer_gen = Some(turn_two_gen);
+        cell.store(turn_two_gen, SeqCst);
+
+        // The backend dies; the consumer reads its cell and revokes.
+        let owned = Some(held_by_consumer.load(SeqCst)).filter(|g| *g != 0);
+        revoke_engine_generation(&inner, owned);
+
+        assert!(
+            !bearer_is_live(&inner, &turn_two.token),
+            "the consumer must revoke the generation the route owns NOW, not the one it opened with"
+        );
+    }
+
+    /// A brand-new route gets a NEW cell, so a lingering consumer from the old
+    /// route cannot reach the replacement's bearer through the shared one.
+    #[tokio::test]
+    async fn a_new_acp_route_gets_its_own_cell_so_the_old_consumer_cannot_reach_it() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let mut inner = test_inner("omp");
+        let _old = mint_bearer_for(&mut inner, 952_601);
+        let old_cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            inner.computer_gen.unwrap_or(0),
+        ));
+
+        // A genuinely new route: fresh mint, fresh cell.
+        let new_route = crate::bus::computer_srv::rotate_and_mint_computer_session_token(
+            inner.thread_id,
+            &inner.ask_dir,
+            inner.worktree_id,
+        );
+        let new_route_gen = new_route.guard.commit();
+        inner.computer_gen = Some(new_route_gen);
+        let _new_cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            new_route_gen,
+        ));
+
+        // The OLD consumer finally exits, reading its own (untouched) cell.
+        revoke_engine_generation(&inner, Some(old_cell.load(SeqCst)));
+
+        assert!(
+            bearer_is_live(&inner, &new_route.token),
+            "the replacement route's bearer must survive the predecessor's consumer"
+        );
+    }
+
+    /// Revoking an identity that never minted is a no-op, so the uniform
+    /// teardown costs nothing for engines that never had the tool — a
+    /// concierge/curator lead, or a worker with an unresolved worktree. Guards
+    /// the "just call it everywhere" simplification the helper is built on.
+    #[tokio::test]
+    async fn tearing_down_an_engine_that_never_had_the_tool_is_harmless() {
+        let mut inner = test_inner("claude");
+        inner.thread_id = 951_501;
+        inner.worktree_id = None;
+        assert!(inner.computer_args.is_empty() && inner.computer_env.is_empty());
+
+        invalidate_resident(&mut inner);
+
+        assert!(inner.child_permit.is_none());
+    }
+
     /// `invalidate_resident` kills a wedged resident so the next send respawns
     /// clean. A resident whose stdin keeps timing out gets invalidated over and
     /// over — one leaked slot per invalidation would exhaust the gate fastest
@@ -12240,6 +14561,7 @@ mod tests {
             origin_tag: None,
             queue_id: None,
             has_attachments: false,
+            local_image_paths: Vec::new(),
         };
 
         let err = write_user(&mut inner, &out).await.unwrap_err();
@@ -12503,6 +14825,82 @@ mod tests {
         );
     }
 
+    /// The computer injection is assembled onto a spawn from its OWN field,
+    /// not from `extra_args` — so `refresh_computer_injection` can replace it
+    /// before a respawn without argv surgery. It rides LAST, and
+    /// an engine that never had it (concierge/curator lead) contributes
+    /// nothing.
+    #[test]
+    fn build_args_appends_the_computer_injection_from_its_own_field() {
+        let mut inner = test_inner("claude");
+        inner.extra_args = vec!["--settings".into(), "hook.json".into()];
+        inner.computer_args = vec!["--mcp-config".into(), "/weft/computer-L2.mcp.json".into()];
+
+        let args = build_args(&inner);
+        let tail: Vec<&String> = args.iter().rev().take(2).collect();
+        assert_eq!(
+            tail,
+            vec![&"/weft/computer-L2.mcp.json".to_string(), &"--mcp-config".to_string()],
+            "the computer injection must ride last: {args:?}"
+        );
+        assert!(args.windows(2).any(|w| w[0] == "--settings" && w[1] == "hook.json"));
+
+        // Replacing the field alone changes the spawn — no argv surgery.
+        inner.computer_args = vec!["--mcp-config".into(), "/weft/computer-L3.mcp.json".into()];
+        assert!(build_args(&inner).contains(&"/weft/computer-L3.mcp.json".to_string()));
+        assert!(!build_args(&inner).contains(&"/weft/computer-L2.mcp.json".to_string()));
+
+        inner.computer_args = vec![];
+        let none = build_args(&inner);
+        assert!(
+            !none.iter().any(|a| a == "--mcp-config"),
+            "an engine without computer use must spawn without it: {none:?}"
+        );
+    }
+
+    /// `spawn_env` must deep-merge the bus and computer halves of the SHARED
+    /// `OPENCODE_CONFIG_CONTENT` key. Splitting the computer injection into
+    /// its own field moved this merge from construction to spawn assembly; if
+    /// it were dropped, `Command::envs`' last-wins would silently strip the
+    /// bus server from every opencode session that also has computer use.
+    #[test]
+    fn spawn_env_deep_merges_the_shared_opencode_config_key() {
+        let mut inner = test_inner("opencode");
+        inner.extra_env = vec![(
+            "OPENCODE_CONFIG_CONTENT".into(),
+            serde_json::json!({"mcp": {"weft_bus": {"type": "remote", "url": "http://bus"}}})
+                .to_string(),
+        )];
+        inner.computer_env = vec![(
+            "OPENCODE_CONFIG_CONTENT".into(),
+            serde_json::json!({"mcp": {"weft_computer": {"type": "remote", "url": "http://comp"}}})
+                .to_string(),
+        )];
+
+        let pairs = spawn_env(&inner);
+        let merged: Vec<&(String, String)> = pairs
+            .iter()
+            .filter(|(k, _)| k == "OPENCODE_CONFIG_CONTENT")
+            .collect();
+        assert_eq!(merged.len(), 1, "the duplicate key must collapse to one entry: {pairs:?}");
+        let v: serde_json::Value = serde_json::from_str(&merged[0].1).unwrap();
+        assert_eq!(v["mcp"]["weft_bus"]["url"], "http://bus", "the bus server must survive");
+        assert_eq!(v["mcp"]["weft_computer"]["url"], "http://comp", "so must the computer one");
+    }
+
+    /// The codex bearer is a DISTINCT env key, so it passes through
+    /// untouched alongside unrelated entries.
+    #[test]
+    fn spawn_env_passes_the_codex_bearer_through_beside_other_entries() {
+        let mut inner = test_inner("codex");
+        inner.extra_env = vec![("WEFT_ASK_URL".into(), "http://ask".into())];
+        inner.computer_env = vec![("WEFT_COMPUTER_MCP_TOKEN".into(), "deadbeef".into())];
+
+        let pairs = spawn_env(&inner);
+        assert!(pairs.iter().any(|(k, v)| k == "WEFT_ASK_URL" && v == "http://ask"));
+        assert!(pairs.iter().any(|(k, v)| k == "WEFT_COMPUTER_MCP_TOKEN" && v == "deadbeef"));
+    }
+
     #[test]
     fn build_args_fresh_vs_resume() {
         let mut inner = EngineInner {
@@ -12513,6 +14911,10 @@ mod tests {
             cwd: "/tmp".into(),
             extra_args: vec!["--mcp-config".into(), "x".into()],
             extra_env: vec![],
+            computer_args: vec![],
+            computer_env: vec![],
+            computer_gen: None,
+            acp_route_gen: None,
             system_prompt: "be lead".into(),
             native_id: None,
             pending_context_digest: None,
@@ -12543,6 +14945,7 @@ mod tests {
             probe_committed: 0,
             current_origin_tag: None,
             tool_rows: std::collections::HashMap::new(),
+            inline_image_rows: std::collections::VecDeque::new(),
             stopped: false,
             codex_client: None,
             acp_client: None,

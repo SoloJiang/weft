@@ -2,6 +2,16 @@ import { useState, type ComponentType, type ReactNode } from "react";
 import { ChevronRight, type LucideProps } from "lucide-react";
 import { cn } from "../../lib/cn";
 import { FilePathRef } from "../FilePathRef";
+import { Attachment } from "./Attachment";
+
+/** One tool-call screenshot, already labeled by the caller (issue: tool row
+ *  screenshots) — mirrors how `ChatTimeline.tsx` labels a user message's own
+ *  image attachments (`lead.imageAttachment`), so the two grids read the
+ *  same way wherever they appear. */
+export interface ToolImage {
+  readonly src: string;
+  readonly label: string;
+}
 
 export type AiToolStatus = "streaming" | "complete" | "error";
 
@@ -19,6 +29,7 @@ export function Tool({
   removed,
   input,
   output,
+  images,
   inputLabel,
   outputLabel,
   showMoreLabel,
@@ -36,6 +47,11 @@ export function Tool({
   readonly removed?: string;
   readonly input?: string;
   readonly output?: string;
+  /** Screenshots this call produced (e.g. a GUI/computer-use action), already
+   *  labeled by the caller. Renders as an `Attachment` grid below the output
+   *  block, folded into the same expand/collapse toggle — never its own
+   *  affordance. */
+  readonly images?: ToolImage[];
   readonly inputLabel: string;
   readonly outputLabel: string;
   readonly showMoreLabel: (hiddenLineCount: number) => string;
@@ -50,8 +66,9 @@ export function Tool({
   readonly children?: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
+  const hasImages = images != null && images.length > 0;
   const hasDetail =
-    (input && input.length > 0) || (output && output.length > 0) || children != null;
+    (input && input.length > 0) || (output && output.length > 0) || hasImages || children != null;
   const hasInteractiveTarget = Boolean(targetToken);
   const disabled = !hasDetail;
 
@@ -119,6 +136,23 @@ export function Tool({
               showMoreLabel={showMoreLabel}
               showLessLabel={showLessLabel}
             />
+          )}
+          {images && images.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {images.map((image, imageIndex) => (
+                // Key by position only — `image.src` is a data URI that can run
+                // to ~2MB per screenshot, and folding it into the key makes
+                // React scan/escape multi-megabyte strings on every timeline
+                // rerender. The list is append-only per tool result (never
+                // reordered), so the index is a stable identity here.
+                <Attachment
+                  key={imageIndex}
+                  kind="image"
+                  label={image.label}
+                  src={image.src}
+                />
+              ))}
+            </div>
           )}
           {children}
         </div>

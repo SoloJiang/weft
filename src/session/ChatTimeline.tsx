@@ -12,6 +12,7 @@ import {
   Tool,
   ToolActivity,
   type AiToolStatus,
+  type ToolImage,
 } from "../components/ai-elements";
 import { cn } from "../lib/cn";
 import {
@@ -446,6 +447,17 @@ function stringArray(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === "string");
 }
 
+// Tool row screenshots (content.images, data URIs): labeled the same way as a
+// user message's own image attachments (`lead.imageAttachment`) so both
+// grids read identically wherever they appear — shared by the top-level tool
+// row and its `CollabBranchRow` sub-agent-anchor twin below.
+function toolImagesOf(images: string[], t: (key: string, opts?: Record<string, unknown>) => string): ToolImage[] {
+  return images.map((src, imageIndex) => ({
+    src,
+    label: t("tool.screenshot", { count: imageIndex + 1 }),
+  }));
+}
+
 // Read-only history replay: only the most recent assistant row is interactive.
 // Older action_cards stay rendered for context but their buttons are disabled.
 // Tool rows are role:"assistant" too: skip only those from m's OWN turn (a card
@@ -666,6 +678,7 @@ function TimelineRow({
     const name = typeof content.name === "string" ? content.name : "tool";
     const summary = typeof content.summary === "string" ? content.summary : "";
     const output = typeof content.output === "string" ? content.output : "";
+    const images = toolImagesOf(stringArray(content.images), t);
     const inputText = formatToolValue(content.input);
     const status = deriveToolStatus(m, content);
     const Icon = toolIcon(name);
@@ -686,6 +699,7 @@ function TimelineRow({
         removed={removed}
         input={inputText}
         output={output}
+        images={images}
         inputLabel={t("tool.input")}
         outputLabel={t("tool.output")}
         showMoreLabel={(hiddenLineCount) => t("tool.showMore", { n: hiddenLineCount })}
@@ -1290,6 +1304,7 @@ function CollabBranchRow({
   // summary — much more informative once the sub-agent has said anything at
   // all, and freshens live as it keeps streaming.
   const preview = latestTextPreview(branchChildren) ?? target;
+  const images = toolImagesOf(stringArray(content.images), t);
 
   return (
     <Tool
@@ -1300,6 +1315,7 @@ function CollabBranchRow({
       cwd={rest.cwd}
       input={formatToolValue(content.input)}
       output={typeof content.output === "string" ? content.output : ""}
+      images={images}
       inputLabel={t("tool.input")}
       outputLabel={t("tool.output")}
       showMoreLabel={(hiddenLineCount) => t("tool.showMore", { n: hiddenLineCount })}

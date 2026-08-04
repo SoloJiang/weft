@@ -752,7 +752,7 @@ function AutomationSettings() {
   } = useStore();
   const [remoteStandby, setRemoteStandby] = useState(false);
   const [remoteStandbyLoaded, setRemoteStandbyLoaded] = useState(false);
-  // issue #97: auto fail-over to the fallback engine when the current one
+  // auto fail-over to the fallback engine when the current one
   // reports its usage limit exceeded. Own local+effect pair (mirrors
   // remoteStandby just below) rather than the global store — this is a
   // narrow, rarely-touched preference with no other consumer.
@@ -765,6 +765,92 @@ function AutomationSettings() {
   // above) — a narrow, rarely-touched preference with no other consumer.
   const [autoMerge, setAutoMergeState] = useState(false);
   const [autoMergeLoaded, setAutoMergeLoaded] = useState(false);
+  // OS-level computer use (window enumeration + screenshot of a
+  // named app window) for visual verification. Own local+effect pair (mirrors
+  // automaticRouting just above) — a narrow, rarely-touched preference with
+  // no other consumer.
+  const [computerUse, setComputerUseState] = useState(false);
+  const [computerUseLoaded, setComputerUseLoaded] = useState(false);
+  // COUNT of toggle
+  // invokes currently in flight, so the refresh poll below never clobbers an
+  // optimistic set with a stale read racing back. A count, not a boolean:
+  // with two overlapping toggles, the FIRST one's `finally` would clear a
+  // shared boolean while the second still awaits — a poll could then slip
+  // in and apply an intermediate backend read over the second's optimistic
+  // value (its generation already matches, so that guard alone can't reject
+  // it), leaving the switch opposite the state the backend settles on and
+  // making the next click send the wrong operation. The poll stays
+  // suppressed until EVERY in-flight toggle has settled.
+  const computerUseToggleInFlightRef = useRef(0);
+  // generation counter
+  // bumped every time a toggle STARTS. The in-flight flag alone left a
+  // gap: a poll's read could be issued before the toggle began, and by the
+  // time it resolved the toggle had already finished and cleared the flag —
+  // the stale pre-toggle result then overwrote the freshly committed value
+  // until the next poll (making a successful disable look re-enabled, and
+  // the next click send the wrong operation). Each poll captures the
+  // generation before its invoke and applies the result only if no toggle
+  // started since — the same generational guard `ComputerControlBanner`'s
+  // `tickSeqRef` uses for its own reordering hazard.
+  const computerUseGenRef = useRef(0);
+  // single-flight for
+  // the poll itself — the generation guard only orders polls around LOCAL
+  // toggles, so two overlapping polls straddling an EXTERNAL Emergency Stop
+  // could still apply out of order (the older `true` overwriting the newer
+  // `false`, showing the toggle re-enabled until the next tick). At most one
+  // poll in flight rules the reordering out — the same shape as
+  // `ComputerControlBanner`'s `tickInFlightRef`.
+  const computerUsePollInFlightRef = useRef(false);
+
+  // Emergency Stop
+  // (the banner's Stop button or the global Esc shortcut) flips
+  // computer_use_enabled off in the BACKEND while this pane can already be
+  // mounted — a mount-time read alone leaves the toggle showing ON until the
+  // dialog is reopened, telling the human computer use is still armed right
+  // after they killed it. Re-poll while mounted, on the same 3s cadence
+  // `ComputerControlBanner` uses for the same state; a rejected poll keeps
+  // the last known value (never flips the toggle on a transient IPC failure),
+  // and an in-flight toggle wins over any concurrently-resolving poll. The
+  // OTHER toggles in this pane deliberately stay mount-time reads: nothing in
+  // the backend flips them out from under an open dialog the way Emergency
+  // Stop flips this one.
+  useEffect(() => {
+    let alive = true;
+    const tick = () => {
+      if (computerUseToggleInFlightRef.current > 0) return;
+      // Single-flight — skip the tick if the previous poll
+      // hasn't resolved; see `computerUsePollInFlightRef`'s doc.
+      if (computerUsePollInFlightRef.current) return;
+      computerUsePollInFlightRef.current = true;
+      // Capture the toggle generation BEFORE issuing the read —
+      // see `computerUseGenRef`'s doc for the stale-overwrite this closes.
+      const gen = computerUseGenRef.current;
+      api.getComputerUseEnabled().then(
+        (enabled) => {
+          computerUsePollInFlightRef.current = false;
+          if (!alive || computerUseToggleInFlightRef.current > 0) return;
+          if (gen !== computerUseGenRef.current) return;
+          setComputerUseState(enabled);
+          setComputerUseLoaded(true);
+        },
+        () => {
+          computerUsePollInFlightRef.current = false;
+        },
+      );
+    };
+    // The mount-time read is THIS SAME guarded tick, not a separate bare
+    // `getComputerUseEnabled` call in the one-shot effect below: a read
+    // outside the in-flight/generation guards can resolve after the first
+    // interval poll already made the toggle interactive, and then overwrite
+    // a newer Emergency Stop or user toggle with its stale value — neither
+    // guard could reject it because it participated in neither.
+    tick();
+    const h = setInterval(tick, 3000);
+    return () => {
+      alive = false;
+      clearInterval(h);
+    };
+  }, []);
 
   useEffect(() => {
     void api.imGetSettings().then((s) => {
@@ -783,6 +869,8 @@ function AutomationSettings() {
       setAutoMergeState(enabled);
       setAutoMergeLoaded(true);
     });
+    // Computer Use is deliberately absent here: its initial read rides the
+    // guarded poll tick above (see that effect's own comment).
   }, []);
 
   async function toggleRemoteStandby(on: boolean) {
@@ -839,6 +927,50 @@ function AutomationSettings() {
     } catch (err) {
       setAutoMergeState(prev);
       throw err;
+    }
+  }
+
+  async function toggleComputerUse(on: boolean) {
+    const prev = computerUse;
+    // Invalidate every poll read issued BEFORE this toggle —
+    // their results are stale the instant the user acts — and CLAIM this
+    // toggle's generation, so this call can tell later whether it is still
+    // the newest one.
+    const myGen = (computerUseGenRef.current += 1);
+    computerUseToggleInFlightRef.current += 1;
+    setComputerUseState(on);
+    try {
+      await api.setComputerUseEnabled(on);
+    } catch (err) {
+      // a FAILED disable
+      // still trips the backend's in-memory stop latch, so Computer Use stays
+      // disabled even though persistence failed — the requested/`prev` state is
+      // NOT authoritative (restoring `true` would show an "on" toggle that
+      // every call rejects, and clicking it would send another disable). Refresh
+      // the real enabled state from the backend; fall back to `prev` only if
+      // that read also fails.
+      //
+      // Every write below is generation-guarded: with two toggles
+      // overlapping, an OLDER one failing must not clobber a NEWER one's
+      // state. (A failed disable reading `false` while a later enable is
+      // still pending would otherwise leave the switch off while the backend
+      // ends up on, and the next click would send the wrong operation.) The
+      // guard is re-checked AFTER the recovery read too — a newer toggle can
+      // start during that await.
+      if (myGen === computerUseGenRef.current) {
+        let recovered: boolean | null = null;
+        try {
+          recovered = await api.getComputerUseEnabled();
+        } catch {
+          recovered = null;
+        }
+        if (myGen === computerUseGenRef.current) {
+          setComputerUseState(recovered ?? prev);
+        }
+      }
+      throw err;
+    } finally {
+      computerUseToggleInFlightRef.current -= 1;
     }
   }
 
@@ -922,6 +1054,22 @@ function AutomationSettings() {
         <p className="px-3 pb-3 text-[11px] leading-relaxed text-ink-faint">
           {t("settings.autoMergeDisclosure")}
         </p>
+      </SettingsGroup>
+      <SettingsGroup title={t("settings.computerUseGroup")}>
+        <SettingRow label={t("settings.computerUseTitle")} hint={t("settings.computerUseHint")}>
+          {computerUseLoaded ? (
+            <Toggle
+              on={computerUse}
+              onChange={(v) => void toggleComputerUse(v)}
+              label={t("settings.computerUseTitle")}
+            />
+          ) : (
+            <div
+              aria-hidden
+              className="h-[22px] w-[38px] shrink-0 rounded-full bg-border-strong/40"
+            />
+          )}
+        </SettingRow>
       </SettingsGroup>
       <SettingsGroup title={t("settings.reviewGroup")}>
         <SettingRow label={t("settings.reviewSkill")} hint={t("settings.reviewSkillHint")}>

@@ -813,6 +813,9 @@ export interface PermissionAsk {
   dir_name: string;
   /** Owning workspace when backend could resolve the thread. */
   workspace_id?: number | null;
+  /** Latest screenshot for a GUI-input-style ask (data URI), when the engine
+   *  captured one — absent for ordinary command/file asks. */
+  preview?: string;
 }
 
 /** A persisted "full access" grant: every ask from this (thread, dir) auto-allows. */
