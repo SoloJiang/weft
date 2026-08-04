@@ -5,8 +5,8 @@
 
 Weft turns one product goal into an auditable delivery across the repositories
 that make up your product. It orchestrates your own Claude Code, Codex, and
-OpenCode on your machine, keeps every write inside explicit authority boundaries,
-and brings back evidence, decisions, and review-ready changes—not just chat logs.
+OpenCode on your machine and brings back evidence, decisions, and review-ready
+changes—not just chat logs.
 
 <sub>Tauri v2 · React 19 · Rust · SQLite · native coding-agent CLIs</sub>
 
@@ -17,7 +17,7 @@ and brings back evidence, decisions, and review-ready changes—not just chat lo
   <img src="assets/readme/weft-delivery-workbench.jpg" alt="A hand-drawn local delivery workbench: one product goal enters Weft, repository worktrees run on the same machine, and their diffs, checks, PR state, and one exceptional Gate converge into a review surface" width="940" />
 </p>
 
-<p align="center"><sub>One local workbench: repository-scoped Runs stay inside policy and converge into evidence you can review.</sub></p>
+<p align="center"><sub>One local workbench: repository-scoped Runs converge into evidence you can review.</sub></p>
 
 ## The 30-second version
 
@@ -121,8 +121,9 @@ when it cannot establish what happened.
 ### Native tools, native repositories
 
 - **Your agents:** Weft drives the native Claude Code, Codex, and OpenCode CLIs.
-- **Your repositories:** worktrees and branches follow each repository's own
-  layout and naming conventions; Weft does not replace Git hosting.
+- **Your repositories:** Weft stores worktrees under
+  `<repo>/.worktrees/<weft-home>/<branch>`. Branch naming follows the style
+  inferred from existing repository refs; Git hosting remains external.
 - **Your practices:** personal, Project, and repository Skills, plus personal and
   repository Rules, remain inspectable. Versioned sources keep their revisions,
   and the effective set is resolved before a Run starts.
@@ -135,12 +136,12 @@ permission requests when you are away. Encrypted `weft.db` snapshots make the
 orchestration database recoverable; they do not include repository worktrees,
 unpushed branches, or native-agent session stores.
 
-### A project that learns without becoming opaque
+### The R4 project-knowledge target
 
-Verified repository relationships, interface agreements, Skills, failure lessons,
-and delivery patterns can improve later work. Every reusable item keeps provenance,
-revision, validity, and a way to correct, supersede, or revoke it. Chat history does
-not silently become permanent truth.
+R4 will make verified repository relationships, interface agreements, Skills,
+failure lessons, and delivery patterns reusable in later work. Each item will keep
+provenance, revision, validity, and a way to correct, supersede, or revoke it. Chat
+history will not silently become permanent truth.
 
 ## Target authority and safety boundaries
 
@@ -199,8 +200,9 @@ and long-lived agents reuse experience without turning guesses into policy.
   global/Workspace enablement, and per-repository effective Skills/Rules preview.
 - **Long-run safety:** keep-awake, remote standby, and encrypted `weft.db`
   snapshots to a private Git remote with recovery-key export and restore.
-- **Workspace hygiene:** rename and cascade-delete for Workspaces, Issues, and
-  work items, plus English and Chinese UI.
+- **Workspace hygiene:** rename and cascade-delete Workspaces and Issues; rename
+  work items; or remove a materialized worktree while retaining its task record.
+  The UI supports English and Chinese.
 
 Not yet productized are the complete Issue/Lane/Run/Evidence model, automatic PR
 creation, CI/CD and deployment observation beyond tracked-PR readiness,
