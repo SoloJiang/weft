@@ -3,11 +3,11 @@
 
 ### 本地优先的 Coding 交付系统
 
-Weft 把一个产品目标变成跨多个仓库、可审计的一次完整交付。它在你的电脑上编排你自己的
-Claude Code、Codex 和 OpenCode，让每一次写入都受明确权限边界约束，最终交给你的不是
-一堆聊天记录，而是证据、决策和可以 Review 的变更。
+Weft 用来完成会跨多个仓库的一项需求。它在你的电脑上调度 Claude Code、Codex 和
+OpenCode，把每个仓库的改动隔离在独立 Worktree 中，再把 Diff、检查结果、PR 状态和待决事项
+汇总到一个界面。你能直接看到整项交付还差什么，不必重读每个 Agent 的聊天记录。
 
-<sub>Tauri v2 · React 19 · Rust · SQLite · 原生 Coding-Agent CLI</sub>
+<sub>Tauri v2 · React 19 · Rust · SQLite · 原生 Coding Agent CLI</sub>
 
 [English](README.md)
 </div>
@@ -16,172 +16,166 @@ Claude Code、Codex 和 OpenCode，让每一次写入都受明确权限边界约
   <img src="assets/readme/weft-delivery-workbench.jpg" alt="手绘风格的本地交付工作台：一个产品目标进入 Weft，多个仓库在同一台电脑的独立 Worktree 中执行，最后把 Diff、检查、PR 状态和一项异常 Gate 汇合到 Review 界面" width="940" />
 </p>
 
-<p align="center"><sub>一个本地工作台：逐仓 Run 在策略内推进，最后汇合成可以直接 Review 的证据。</sub></p>
+<p align="center"><sub>一个目标进入 Weft 后，多个仓库在独立 Worktree 中推进，最后汇总 Diff、检查结果、PR 状态和例外决策。</sub></p>
 
 ## 30 秒看懂
 
-大多数 Coding Agent 工具在优化一次 Session。Weft 想解决的是更完整的问题：让一项交付
-跨越多个 Session、多个仓库、各种中断和后续重复工作，仍然能持续推进。
+一项需求可能同时修改客户端、服务端和 SDK。几个 Agent Session 可以分别结束，但接口没有
+对齐、某个仓库漏改、CI 还没通过，整项交付依然没有完成。Weft 持续跟踪这层整体进度。
 
 ```text
 产品目标 → Project 上下文 → 动态变更范围 → 逐仓 Lane
          → 原生 Agent Run → Evidence → Review / 合并 / 发布
 ```
 
-在最终产品中，你只描述一次结果。Weft 判断需要修改哪些仓库、为什么修改，以及应该按什么
-顺序推进。Project 权限策略内的工作无需逐仓审批；超出策略、高风险或无法确认的动作，才会
-停在一个具体的 Gate 上等待决策。最终得到的是一组相互隔离、经过验证，并且可以在一个界面
-判断是否已经准备好 Review 的变更。
+在目标形态中，你只需要说清结果。Weft 会判断要改哪些仓库、为什么要改，以及它们之间的执行
+顺序。策略允许的工作可以继续推进；越界、高风险或事实不足的动作会停在具体的 Gate 上，等你
+决定。最后得到的是一组相互隔离、经过验证，并且可以从一个界面 Review 的变更。
 
-**当前已有：** 本地多仓规划、仓库原生 Worktree、原生 Agent Session、可 Review 的 Diff、
-PR 前检查、远程提问与审批、防休眠，以及加密 `weft.db` 快照。
+**现在已经可用：** 本地多仓规划、仓库原生 Worktree、原生 Agent Session、Diff 与 PR 前检查、
+远程提问和审批、防休眠，以及加密 `weft.db` 快照。
 
-**产品方向：** 做成一套可以放心离开、回来立即接手、结果值得信任的交付系统；再逐步形成
-Project 内的长期 Agent 花名册，让稳定岗位、明确职责和经过验证的项目知识跨 Issue 延续。
+**接下来要完成：** 让工作在断网、重启或 Agent 额度触顶后安全恢复；逐步加入 Project 知识和
+长期 Agent 花名册，让稳定岗位与责任跨 Issue 延续。
 
 ## 最终产品体验
 
-1. **只描述一次目标。** 在一个长期 Project 上下文中创建 Issue；当前界面仍使用
-   Workspace 这个名称。
-2. **由 Weft 展开交付范围。** Lead 读取仓库关系、当前代码、权限策略和已验证的交付历史，
-   持续维护动态变更范围，不要求用户预先把工作拆完。
-3. **每个写入仓库都公开可查。** 每个实际写入的仓库都有一条公开 Lane，记录原因、目标、
-   依赖、完成条件，以及允许它执行的策略判定。
-4. **继续使用已经信任的工具。** Claude Code、Codex 和 OpenCode 在仓库原生 Worktree 中
-   执行，保留各自的登录态、Skill、Hook、Sandbox 和可恢复的 Session 身份。
-5. **用事实验证，不接受自报完成。** Diff、Commit、检查结果、接口约定、PR、CI、Review、
-   冲突、决策和风险都会成为带代码版本的 Evidence。模型正常退出，不等于交付已经完成。
-6. **人可以放心离开。** Weft 只在当前策略和本机条件允许时继续推进。中断会进入可恢复状态；
-   Coding Agent 触发额度限制时，系统保存恢复点和上下文，在额度恢复且安全检查通过后自动续跑，
-   不盲目重试，也不丢失已经完成的工作。
-7. **回来先看结果。** Issue 首屏直接说明发生了什么、哪里被阻塞、什么需要你决定，以及距离
-   所有活跃 Lane 可以 Review 还差什么。
-8. **让经验跨工作延续。** Project 知识保留来源和版本；长期 Agent、岗位和任职关系让责任
-   跨 Issue 延续，但不会因此隐式扩大权限。
+1. **说清一个目标。** 你在长期 Project 上下文中创建 Issue。当前界面仍使用 Workspace 这个
+   名称。
+2. **让 Weft 展开范围。** Lead 读取仓库关系、当前代码、权限策略和已验证的交付记录，持续更新
+   变更范围。你不需要先把工作拆成多个仓库任务。
+3. **每次写入都有原因。** 每个需要修改的仓库都有一条公开 Lane，记录目标、依赖、完成条件，
+   以及允许它执行的策略判定。
+4. **继续使用原生 Agent。** Claude Code、Codex 和 OpenCode 在仓库自己的 Worktree 中运行，
+   保留登录态、Skill、Hook、Sandbox 和可恢复的 Session 身份。
+5. **用外部事实判断进度。** Diff、Commit、检查结果、接口约定、PR、CI、Review、冲突和风险都会
+   变成带来源的 Evidence。Agent 正常退出，只说明一次运行结束。
+6. **离开电脑也不会丢进度。** 应用重启、休眠、断网和额度限制都会进入可恢复状态。Agent 额度
+   恢复且安全检查通过后，Weft 从保存的恢复点续跑一次，不重复执行已经完成的工作。
+7. **回来先看结论。** Issue 首屏直接列出完成项、阻塞点、待决事项，以及哪些 Lane 还没有达到
+   Review 条件。
+8. **让责任延续。** Project 知识保留来源和版本。长期 Agent、岗位和任职记录可以跨 Issue 复用，
+   但不会因此获得额外权限。
 
-人负责产品判断、授权和高风险决策；轮询、记录、恢复和日常协调交给 Weft。
+产品判断、授权和高风险决策仍由人负责。轮询、记录、恢复和日常协调交给 Weft。
 
 <p align="center">
   <img src="assets/readme/weft-continuity-roster.jpg" alt="手绘风格的夜晚到早晨连续场景：Coding Agent 额度触顶后保留 Worktree 和 Evidence 安全等待，恢复点到达并通过策略检查后只续跑一次，最终返回简明摘要和长期 Agent 花名册" width="940" />
 </p>
 
-<p align="center"><sub>连续性不是一句承诺，而是可检查的状态：安全等待、只恢复一次、带证据返回，并让责任跨 Issue 延续。</sub></p>
+<p align="center"><sub>额度触顶后保存恢复点；额度恢复且安全检查通过后只续跑一次。第二天直接查看证据、风险和待决事项。</sub></p>
 
 ## 核心产品对象
 
-| 产品对象 | 它代表什么 |
+| 产品对象 | 它记录什么 |
 |---|---|
-| **Project** | 长期代码与交付上下文：仓库集合、仓库/服务关系、策略、Skill、已验证知识、Issue，以及未来的 Agent 花名册。当前界面称为 Workspace。 |
-| **Issue** | 一项用户可以验收的交付目标，包含动态变更范围、关键决策、整体就绪状态和剩余风险。 |
-| **Lane** | 一条公开的写仓单元。每条 Lane 只写一个仓库，并记录原因、目标、依赖、执行要求和权限判定。 |
-| **Run** | 一次有起止边界的执行尝试，记录执行者、原生 Session、结果和可恢复的失败状态。重试不会覆盖历史。 |
-| **Evidence** | 来自 Git、检查、接口、代码托管平台、决策和交接的紧凑证据，始终保留来源。 |
-| **Gate** | 因越界、高风险或事实不足而必须由人完成的一次具体决策；存在安全旁路时，只阻塞受影响的工作。 |
-| **Agent · 岗位 · 任职关系** | 跨 Issue 延续的身份、Project 内稳定职责，以及两者之间可追溯的历史关系。它们本身都不授予权限。 |
+| **Project** | 一份长期的代码与交付上下文，包括仓库集合、仓库或服务关系、策略、Skill、已验证知识、Issue，以及未来的 Agent 花名册。当前界面称为 Workspace。 |
+| **Issue** | 一项可以验收的产品目标，包括动态变更范围、关键决策、整体就绪状态和剩余风险。 |
+| **Lane** | 一个仓库的执行轨道。每条 Lane 只修改一个仓库，并记录原因、目标、依赖、执行要求和权限判定。 |
+| **Run** | 一次有起止边界的执行尝试，记录执行者、原生 Session、结果和可恢复的失败状态。重试会新增 Run，不会覆盖历史。 |
+| **Evidence** | 来自 Git、检查、接口、代码托管平台、决策和交接的证据，每条都保留来源。 |
+| **Gate** | 因越界、高风险或事实不足而需要人完成的一次具体决策。存在安全替代路径时，只阻塞受影响的工作。 |
+| **Agent · 岗位 · 任职记录** | 跨 Issue 延续的 Agent 身份、Project 内的稳定职责，以及两者之间可追溯的历史。它们本身都不授予权限。 |
 
-单仓和多仓工作共用同一套模型。小变更时界面可以保持简洁；只有真实交付跨仓并产生依赖时，
-才展开完整控制信息。
+单仓和多仓工作使用同一套模型。小改动只显示必要信息；确实产生跨仓依赖时，界面再展开完整的
+Lane 和依赖关系。
 
-## 为什么是 Weft
+## Weft 解决什么问题
 
-### 管交付，不只管 Session
+### 围绕交付结果
 
-一个 Session 可以正常结束，但功能仍然没有做完。Weft 跟踪的是用户结果，覆盖规划、实现、
-检查、PR、Review、合并、中断和多次尝试。Session 可以被恢复、替换或重建，交付目标不会
-因此丢失。
+一个 Session 可以正常结束，但需求仍未完成。Weft 跟踪的是从规划到合并的整项结果，包括实现、
+检查、PR、Review、中断和多次尝试。某个 Session 被恢复或替换，不会重置交付状态。
 
-### 有边界的自主推进，而不是让人反复点批准
+### 把自动化关在明确边界内
 
-在目标形态中，每一个实际写入仓库的动作都公开、可追溯。AuthorityPolicy 决定哪些工作可以
-自动推进；角色、Agent 过往表现或 CLI 的一次权限回答，都不能静默扩大边界。目标是只在出现
-真正需要判断的异常时，才来找人。
+目标模型会为每次仓库写入记录 Lane 和 AuthorityPolicy 版本。角色、Agent 的历史表现或某次 CLI
+授权都不能扩大边界。当前版本仍需人工确认后才会创建 Worktree。
 
-### 相信证据，不相信自信的叙述
+### 用事实判断是否完成
 
-在目标形态中，文件系统和 Git 决定代码事实，代码托管平台决定 PR、CI、Review、冲突和合并
-事实。Weft 会在执行后重新对账；无法确认发生了什么时，状态保持 Unknown 并停止后续写入。
+在目标模型中，文件系统和 Git 决定代码事实，代码托管平台决定 PR、CI、Review、冲突和合并
+事实。Weft 会在执行后重新对账；无法确认发生了什么时，状态保持 Unknown，后续写入停止。
 
-### 尊重原有工具和仓库
+### 保留现有工具习惯
 
-- **继续使用你的 Agent：** Weft 驱动原生 Claude Code、Codex 和 OpenCode CLI。
-- **继续遵循仓库习惯：** Worktree 和分支沿用目标仓库自己的目录与命名规则，Weft 不替代
-  Git 托管平台。
-- **继续积累团队经验：** 个人、Project 和仓库级 Skill，以及个人和仓库级 Rule 的实际生效
-  结果都可以检查；能固定版本的来源会保留版本，Run 开始前先解析冲突与优先级。
+- **原生 Agent：** Weft 驱动 Claude Code、Codex 和 OpenCode CLI。
+- **原生仓库：** Worktree 和分支遵循目标仓库自己的目录与命名规则。
+- **可检查的配置：** 个人、Project 和仓库级 Skill，以及个人和仓库级 Rule 都能查看实际生效
+  结果。能固定版本的来源会保留版本，Run 开始前先解析冲突和优先级。
 
-### 本地优先，但人离开后仍然可达
+### 本地执行，远程决策
 
-代码、凭据、Agent 进程、Git Worktree 和编排状态默认留在本机。人不在电脑前时，可以通过
-飞书/Lark 或钉钉处理具体提问和权限请求。加密 `weft.db` 快照可以恢复编排数据库，但不包含
-仓库 Worktree、未推送分支或原生 Agent 的外部 Session 数据。
+代码、凭据、Agent 进程、Git Worktree 和编排状态默认留在本机。你离开电脑后，可以通过
+飞书/Lark 或钉钉处理具体提问和权限请求。加密 `weft.db` 快照可以恢复编排数据库，但不包含仓库
+Worktree、未推送分支或原生 Agent 的外部 Session 数据。
 
-### Project 会积累经验，但不会变成黑盒记忆
+### 积累可追溯的项目知识
 
-经过验证的仓库关系、接口约定、Skill、失败教训和交付方式，可以改善下一次工作。每条可复用
-信息都保留来源、版本、有效状态，并支持纠正、替换和撤销。聊天全文不会静默变成永久事实。
+经过验证的仓库关系、接口约定、Skill、失败记录和交付方式可以用于后续工作。每条可复用信息都
+保留来源、版本和有效状态，并支持纠正、替换或撤销。聊天记录不会自动变成长期知识。
 
 ## 目标权限与安全边界
 
-这是 Weft 正在建设的完整执行模型，不是对当前版本的能力宣称。今天，创建 Worktree 仍需要
-人工确认；完整的 Lane、AuthorityPolicy、Gate 与执行结果对账闭环属于 R1。
+当前版本需要人工确认后才会创建 Worktree。R1 将补齐 Lane、AuthorityPolicy、Gate 和执行结果
+对账，形成下面这套权限模型。
 
-- 每一次写入都能追溯到公开 Lane，以及当时允许它执行的 AuthorityPolicy 版本。
-- 读取仓库和写入仓库是两种不同能力。
-- 策略内的工作可以自动推进；保护分支、凭据、发布、生产、不可逆动作、策略变更和无法确认的
-  Scope 必须进入 Gate 或直接拒绝。
-- Weft 在执行前判断权限，执行后再从文件系统、Git、Push 和 PR 事实中对账。
-- 一旦发现策略漂移或状态无法确认，后续写入停止并 Fail Closed。
-- Agent 身份、岗位、Role Profile、用户反馈和历史成功都不会扩大权限。
-- 生产变更默认不由 Weft 自动执行。
+- 每次写入都必须追溯到公开 Lane 和对应的 AuthorityPolicy 版本。
+- 读取仓库与写入仓库使用不同权限。
+- 策略内的工作可以自动推进。保护分支、凭据、发布、生产、不可逆动作、策略变更和范围不明的
+  工作必须进入 Gate 或直接拒绝。
+- 执行前检查权限，执行后根据文件系统、Git、Push 和 PR 事实对账。
+- 发现策略变化或状态不明时，停止后续写入。
+- Agent 身份、岗位、Role Profile、用户反馈和历史成功记录都不能扩大权限。
+- 生产变更默认不进入自动执行。
 
 ## Roadmap
 
-Roadmap 按用户结果和退出条件排序，不按功能数量或日历日期许诺。当前只承诺正在推进的
-里程碑；后续阶段必须由真实交付证明前置能力可靠后，才会进入实施。
+Roadmap 按用户能得到的结果排序，不绑定日历日期。当前只承诺正在推进的里程碑；后一阶段要等
+前置能力在真实交付中稳定后再开始。
 
 | 顺序 | 里程碑 | 用户得到什么 |
 |---|---|---|
-| **NOW** | **R1 · 跨仓交付闭环** | 描述一次真实需求；Weft 持续维护通过策略判定的逐仓 Lane 及其依赖，直到所有活跃 Lane 都可以 Review。 |
-| **NEXT** | **R2 · 可走开与可信恢复** | 人离开界面后，工作仍能安全推进。应用重启、休眠、断网、Run 卡住、凭据过期和 Agent 额度耗尽都会成为可见、可恢复的状态，只在真正需要决策时进入 Needs-you。 |
-| **THEN** | **R3 · 过程内收** | 调研、重试、Review、试验和 Subagent 收进所属 Lane；主界面只看交付结果、Evidence、风险和决策，完整 Run 历史仍可展开。 |
-| **LATER** | **R4 · Project 知识复利与长期 Agent** | 建立带稳定岗位和任职历史的 Agent 花名册；Agent 跨 Issue 复用经过验证的项目知识、Skill 和交付方式，同时保持记忆与权限透明。 |
-| **EXPLORE** | **R5 · Signal / Ops 扩展** | 告警和外部事件先进入有边界的只读分析；一旦需要修改仓库，必须先转成普通 Issue。 |
+| **NOW** | **R1 · 跨仓交付闭环** | 描述一次真实需求。Weft 持续维护经过策略判定的逐仓 Lane 和依赖关系，直到所有活跃 Lane 都达到 Review 条件。 |
+| **NEXT** | **R2 · 可走开与可信恢复** | 关闭界面后，工作仍能安全推进。应用重启、休眠、断网、Run 卡住、凭据过期和 Agent 额度触顶都会成为可见、可恢复的状态，只在需要决策时进入 Needs-you。 |
+| **THEN** | **R3 · 收起内部过程** | 调研、重试、Review、试验和 Subagent 归入所属 Lane。主界面只显示交付结果、Evidence、风险和决策，完整 Run 历史仍可展开。 |
+| **LATER** | **R4 · Project 知识与长期 Agent** | 建立带稳定岗位和任职历史的 Agent 花名册。Agent 跨 Issue 使用经过验证的项目知识、Skill 和交付方式，记忆与权限仍然公开可查。 |
+| **EXPLORE** | **R5 · Signal / Ops 扩展** | 告警和外部事件先进入有边界的只读分析。确实需要修改仓库时，再转成普通 Issue。 |
 
-这个顺序不能颠倒：可靠交付才能产生可信 Evidence；可信 Evidence 才能安全恢复并折叠内部过程；
-有了这些基础，Project 记忆和长期 Agent 才不会把未经验证的猜测固化成权限或经验。
+R1 先产出可信 Evidence，R2 才能据此恢复工作，R3 才能安全收起内部过程。Project 知识和长期
+Agent 放在 R4，是为了避免把未经验证的猜测复用到下一项工作。
 
 ## 当前已经可用
 
-- **多仓规划：** 添加、克隆或创建 Workspace 仓库；Lead 根据仓库关系提出按仓拆分的工作，
-  并解释为什么需要修改。
-- **原生执行：** 经过确认的工作在目标仓库内创建原生 Worktree 和分支；Claude Code、Codex
-  和 OpenCode 以原生 CLI Session 运行。
+- **多仓规划：** 添加、克隆或创建 Workspace 仓库。Lead 根据仓库关系提出逐仓任务，并说明
+  修改原因。
+- **原生执行：** 你确认后，Weft 在目标仓库创建原生 Worktree 和分支，再启动 Claude Code、
+  Codex 或 OpenCode CLI Session。
 - **受控协作：** Lead/Worker Session、规划工具、本地 Thread Bus、权限请求、排队、打断、
   Resume、Slash Command 和附件都归属同一 Issue。
-- **Review 界面：** 已创建的 Worktree 可以查看 Diff 并运行 PR 前检查；同时观察 Claude JSONL、
-  Codex Rollout JSONL 和 OpenCode SQLite 中的执行事实。
-- **PR 监控与受控合并：** Weft 会轮询已跟踪 GitHub PR 的 CI、Review、未解决讨论、冲突和
-  跨仓上游就绪状态；只有最新代码托管事实通过安全门槛后，可选的自动合并才会执行 Squash。
-- **远程可达：** 飞书/Lark 或钉钉可以把 Agent 提问与权限决策带回同一份本地状态。
-- **团队配置：** 支持 Git 托管的 Skill 源、保留个人 Skill、按全局或 Workspace 启用，并预览
+- **Review 界面：** 查看 Worktree Diff 并运行 PR 前检查，同时观察 Claude JSONL、Codex
+  Rollout JSONL 和 OpenCode SQLite 中的执行事实。
+- **PR 监控与受控合并：** 轮询已跟踪 GitHub PR 的 CI、Review、未解决讨论、冲突和跨仓上游
+  状态。启用自动合并后，也只有最新代码托管事实通过安全门槛才会执行 Squash。
+- **远程处理：** 通过飞书、Lark 或钉钉接收 Agent 提问，并把权限决定写回同一份本地状态。
+- **团队配置：** 接入 Git 托管的 Skill 源，保留个人 Skill，按全局或 Workspace 启用，并预览
   每个仓库最终生效的 Skill 和 Rule。
-- **长任务安全：** 防休眠、远程待命，以及把加密 `weft.db` 快照备份到私有 Git 远端；
-  支持 Recovery Key 导出和恢复。
-- **基础管理：** Workspace、Issue 和工作单元的重命名与级联删除，以及中英双语界面。
+- **长任务保护：** 防止系统休眠、进入远程待命，并把加密 `weft.db` 快照备份到私有 Git 远端；
+  支持导出 Recovery Key 和恢复快照。
+- **基础管理：** 重命名和级联删除 Workspace、Issue 与工作单元，界面支持中文和英文。
 
-尚未产品化的能力包括：完整的 Issue/Lane/Run/Evidence 模型、自动创建 PR、已跟踪 PR 就绪
-状态以外的 CI/CD 与发布观测、额度感知自动续跑、过程内收、Project 知识和长期 Agent 花名册。
-它们是 Roadmap 的目标，不是对当前版本的能力宣称。
+这些能力还在 Roadmap 中：完整的 Issue/Lane/Run/Evidence 模型、自动创建 PR、已跟踪 PR 就绪
+状态以外的 CI/CD 与发布观测、额度感知自动续跑、内部过程收纳、Project 知识和长期 Agent
+花名册。
 
 ## 适合谁
 
-Weft 面向已经在本机使用 Coding Agent CLI 的开发者和技术负责人，尤其适合需要同时协调服务端、
-SDK、前端、基础设施或版本仓库的工作。当一个 Session 不再够用、工作需要跨中断延续，或者你
-希望不重读每段聊天就能判断整项交付是否可以 Review，Weft 才真正体现价值。
+Weft 适合已经在本机使用 Coding Agent CLI，并且经常让一项需求跨服务端、SDK、前端或基础设施
+仓库推进的开发者和技术负责人。它尤其适合两种场景：工作需要跨中断延续，或你需要从一个界面
+判断整项交付是否达到 Review 条件。
 
-如果你的工作基本集中在一个仓库，而且现有的单 Agent、分支和 Review 流程已经足够顺手，
-Weft 可能只会增加额外结构。它不替代 Git 托管平台、通用项目管理工具、Coding Agent 本身，
-也不替代生产操作的权限控制。
+如果工作基本集中在一个仓库，现有的单 Agent、分支和 Review 流程已经够用，Weft 可能会显得
+偏重。Git 托管、项目管理、Coding Agent 本身和生产权限仍由各自系统负责。
 
 ## 当前产品界面
 
@@ -199,12 +193,11 @@ Weft 可能只会增加额外结构。它不替代 Git 托管平台、通用项�
   <img src="assets/diagrams/arch-zh.png" alt="Weft 当前本地优先架构：桌面端和 IM 投影本地控制面，底层连接原生 Coding Agent、仓库 Worktree、本地持久化状态和外部代码托管事实" width="940" />
 </p>
 
-<p align="center"><sub>当前架构：控制与执行留在本地，代码托管平台事实按需查询。</sub></p>
+<p align="center"><sub>桌面端和 IM 负责交互；控制、执行和持久化留在本机，代码托管平台事实按需查询。</sub></p>
 
-Rust 后端负责本地 SQLite 状态库、Git Worktree 生命周期、Headless Agent 进程、权限注册中心、
-本地 Thread Bus、IM 桥、Skill 源、电源管理、加密备份、Computer Use 控制和 Sidecar 观测。
-React 前端负责 Workspace/Issue 看板、Lead/Worker Session、Observe/Diff、Settings 和
-Needs-you 队列。
+Rust 后端管理本地 SQLite 状态库、Git Worktree 生命周期、Headless Agent 进程、权限注册中心、
+Thread Bus、IM 桥、Skill 源、电源管理、加密 `weft.db` 快照、Computer Use 和 Sidecar 观测。React 前端
+提供 Workspace/Issue 看板、Lead/Worker Session、Observe/Diff、Settings 和 Needs-you 队列。
 
 ## 本地开发
 
@@ -243,6 +236,6 @@ assets/
 
 ## 设计约束
 
-Weft 通过结构化 Headless 接口驱动原生 CLI，并渲染自己的产品界面。正常对话界面不嵌入
-Terminal/TUI 依赖；Terminal Takeover 只作为逃生入口。跨仓协作信息只保存在 Weft 管理状态
-或 Worktree 本地配置中，不会作为隐藏改动写进正式仓库。
+Weft 通过结构化 Headless 接口驱动原生 CLI，并使用自己的界面展示对话和执行状态。正常对话
+由 Weft 自己渲染，Terminal Takeover 只用于必须直接接管终端的情况。跨仓协作信息只保存在
+Weft 管理状态或 Worktree 本地配置中，正式仓库不会收到隐藏的协作改动。
