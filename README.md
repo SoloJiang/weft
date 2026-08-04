@@ -1,11 +1,12 @@
 <div align="center">
   <img src="public/weft-logo.svg" alt="Weft" width="220" />
 
-### Local multi-repo delivery orchestration for your coding agents
+### A local-first delivery system for coding agents
 
-Weft is a local multi-repo delivery orchestrator. Give it a requirement, and it
-coordinates your own Claude Code, Codex, and OpenCode across repositories to
-carry the work from intent toward implementation, merge, and release.
+Weft turns one product goal into an auditable delivery across the repositories
+that make up your product. It orchestrates your own Claude Code, Codex, and
+OpenCode on your machine, keeps every write inside explicit authority boundaries,
+and brings back evidence, decisions, and review-ready changes—not just chat logs.
 
 <sub>Tauri v2 · React 19 · Rust · SQLite · native coding-agent CLIs</sub>
 
@@ -13,141 +14,194 @@ carry the work from intent toward implementation, merge, and release.
 </div>
 
 <p align="center">
-  <img src="assets/readme/weft-overview.png" alt="Weft overview: repositories feed a lead workspace, scoped workers produce checked review diffs" width="940" />
+  <img src="assets/readme/weft-overview.png" alt="Weft coordinates repository-scoped agent work into one reviewable delivery" width="940" />
 </p>
 
 ## The 30-second version
 
-Weft is not a terminal grid and not a hosted agent runner. It is the local
-orchestration layer between a product requirement and the native coding agents,
-repositories, branches, checks, and release paths you already use.
+Most coding-agent tools optimize a session. Weft is building the layer that owns
+delivery across sessions, repositories, interruptions, and repeated work.
 
 ```text
-Requirement → repo map → scoped agent work → repo-native branches → implementation → PR / merge / release
+Product goal → project context → dynamic change set → repository lanes
+             → native agent runs → evidence → review / merge / release
 ```
 
-**Today:** local multi-repo planning, repo-native worktrees, native-agent
-sessions, reviewable diffs, pre-PR checks, IM asks, keep-awake, and encrypted
-database backup.
+You describe the outcome once. Weft works out which repositories need to change,
+why they need to change, and in what order. Work inside the project's authority
+policy can continue without per-repository approval; anything outside that policy,
+high-risk, or uncertain stops at a focused gate. The result is a set of isolated,
+verifiable changes whose readiness can be judged from one place.
 
-**North star:** one requirement in; Weft drives your own Claude Code, Codex, and
-OpenCode through PR, merge, and release.
+**Available today:** local multi-repo planning, repo-native worktrees, native agent
+sessions, reviewable diffs, pre-PR checks, remote questions and approvals,
+keep-awake, and encrypted local-state backup.
 
-## When you don't need Weft
+**Product direction:** a delivery system you can walk away from, return to, and
+trust—and, over time, a project roster of long-lived coding agents that retain
+explicit responsibilities and verified project knowledge across issues.
 
-If you mostly work in **one repository** and already have a coding-agent workflow
-you're happy with — a single Claude Code or Codex session, your own branches, your
-own review habit — you probably don't need Weft. It earns its place the moment one
-session stops being enough: work that spans **several repositories**, multiple
-agents that have to stay coordinated under one issue, or long runs you want to keep
-steering from your phone after you've left the desk.
+## The north-star experience
 
-## Why Weft is different
+1. **Describe one outcome.** Start an Issue inside a long-lived Project context
+   (called a Workspace in the current UI).
+2. **Let Weft map the delivery.** The lead reads the repository map, current code,
+   authority policy, and verified delivery history. It maintains a dynamic change
+   set rather than asking you to pre-split the work.
+3. **Make every write explicit.** Each repository that will be changed gets a
+   public Lane with a reason, target, dependencies, completion criteria, and the
+   policy decision that allowed it.
+4. **Run the tools you already trust.** Claude Code, Codex, and OpenCode execute in
+   repo-native worktrees with their own authentication, skills, hooks, sandboxing,
+   and resumable session identity.
+5. **Verify facts, not claims.** Diffs, commits, checks, interface agreements, PRs,
+   CI, reviews, conflicts, decisions, and risks become revision-aware Evidence.
+   A successful model response is never enough to mark the delivery ready.
+6. **Walk away safely.** Weft keeps moving only while the current policy and local
+   conditions allow it. Interruptions become recoverable states. When a coding
+   agent reaches a usage limit, Weft records the recovery point and resumes safely
+   when capacity returns instead of blindly retrying or losing the run.
+7. **Return to the result.** The Issue opens with what changed, what is blocked,
+   what needs you, and what remains before every active Lane is review-ready.
+8. **Build continuity across work.** Project knowledge keeps its source and
+   revision. Long-lived Agent profiles, Positions, and Assignments make ownership
+   visible across Issues without granting implicit authority.
 
-### 1. Orchestrate delivery across repos
+The human owns product judgment, authority, and high-risk decisions. Weft owns
+the polling, bookkeeping, recovery, and routine coordination.
 
-You describe a feature, bugfix, refactor, or spike. The lead agent reads the
-workspace repo map and proposes repo-scoped work: which repository needs
-changes, why, and which worker should own that slice. Reads stay free; only
-writes are approved, materialized, tracked, and reviewed.
+## The product model
 
-### 2. Respect your origins
+| Product object | What it means |
+|---|---|
+| **Project** | The long-lived code and delivery context: repositories, repo/service map, policy, skills, verified knowledge, Issues, and eventually the agent roster. The current UI calls this a Workspace. |
+| **Issue** | One user-verifiable delivery outcome. It owns the dynamic change set, decisions, aggregate readiness, and remaining risk. |
+| **Lane** | One public unit of repository write scope. A Lane writes exactly one repository and records its reason, target, dependencies, mandate, and authority decision. |
+| **Run** | One execution attempt with a start, end, executor, native session, result, and recoverable failure state. Retrying does not erase history. |
+| **Evidence** | Compact, source-linked proof from Git, checks, interfaces, the code host, decisions, and handoffs. |
+| **Gate** | A specific human decision required because work is outside policy, high-risk, or uncertain. It blocks only the affected work when safe alternatives remain. |
+| **Agent · Position · Assignment** | A long-lived identity, a stable project responsibility, and the historical relationship between them. None of these grants permission by itself. |
 
-Weft works with the tools and repositories you already trust.
+Single-repository and multi-repository work use the same model. The UI can stay
+compact for a small change and expose the full dependency graph when the delivery
+actually spans repositories.
 
-- **User origin:** Weft drives your native Claude Code, Codex, and OpenCode. It
-  keeps their auth, hooks, approvals, sandbox rules, skills, and session identity.
-- **Repo origin:** worktrees live under the target repo:
-  `<repo>/.worktrees/weft/<branch-name>`. Branch names follow that repo's style:
-  `feat/*` vs `feature/*`, `fix/*` vs `bugfix/*`.
-- **Team origin:** teams can import git-hosted skill sources, enable each skill
-  globally or per workspace, and still let personal or repo-owned skills win.
-  Effective skills and rules are visible before a session runs.
+## Why Weft
 
-### 3. Stay local, reachable, and recoverable
+### Delivery, not session management
 
-Weft treats long-running desktop automation as a product problem, not an
-afterthought. It can prevent idle sleep while sessions run, keep the machine
-awake for remote IM commands when the bridge is enabled, mirror asks to
-Feishu/Lark or DingTalk, and back up the local SQLite state as encrypted snapshots to a
-private Git remote with a separate Recovery Key.
+A session can exit successfully while the feature is still incomplete. Weft
+tracks the user outcome across planning, implementation, checks, PRs, reviews,
+merges, interruptions, and multiple attempts. Sessions are replaceable execution
+details; the delivery remains stable.
 
-## Similar products
+### Bounded autonomy, not approval fatigue
 
-Most tools in this space answer one question: how to run more agent sessions at
-once. Weft answers a different one: **how to hand a real requirement to your
-agents and trust it gets done.**
+Every actual repository write remains visible and traceable. The authority policy
+decides what can proceed automatically; a role, an agent's past success, or a CLI
+permission answer cannot silently expand that boundary. Weft asks only when a real
+decision is needed.
 
-You give a requirement; Weft works out which repos to touch and why, and waits
-for your go-ahead before it writes. Several agents stay aligned like one small
-team while you follow a single issue. When an agent gets stuck it comes to you —
-and you can keep steering from Feishu/Lark or DingTalk after you close the laptop. Every
-change lands in its own isolated copy, so your main branch stays clean and the
-diff is one glance to review, with encrypted backups you can restore on a new
-machine.
+### Evidence, not confident narration
 
-| Product | What it's good at | How Weft is different |
+The local filesystem and Git are authoritative for code facts. The code host is
+authoritative for PR, CI, review, conflict, and merge facts. Weft reconciles those
+sources after execution and fails closed when it cannot establish what happened.
+
+### Native tools, native repositories
+
+- **Your agents:** Weft drives the native Claude Code, Codex, and OpenCode CLIs.
+- **Your repositories:** worktrees and branches follow each repository's own
+  layout and naming conventions; Weft does not replace Git hosting.
+- **Your practices:** personal, project, and repository Skills and Rules remain
+  inspectable, versioned where possible, and resolved before a Run starts.
+
+### Local-first, but reachable
+
+Code, credentials, agent processes, Git worktrees, and orchestration state stay on
+your machine by default. Feishu/Lark or DingTalk can carry focused questions and
+permission requests when you are away. Encrypted snapshots make the local state
+recoverable without turning Weft into a hosted code runner.
+
+### A project that learns without becoming opaque
+
+Verified repository relationships, interface agreements, Skills, failure lessons,
+and delivery patterns can improve later work. Every reusable item keeps provenance,
+revision, validity, and a way to correct, supersede, or revoke it. Chat history does
+not silently become permanent truth.
+
+## Authority and safety boundaries
+
+- Every write is attributable to a public Lane and the AuthorityPolicy revision
+  that allowed it.
+- Reading a repository and writing a repository are separate capabilities.
+- Policy-compliant work can proceed automatically; protected branches,
+  credentials, releases, production, irreversible actions, policy changes, and
+  uncertain scope require a Gate or are denied.
+- Weft checks the boundary before execution and reconciles the actual filesystem,
+  Git, push, and PR effects afterward.
+- Policy drift or unknown state stops subsequent writes and fails closed.
+- Agent identity, Position, Role profile, feedback, and prior success never grant
+  additional authority.
+- Production changes remain outside automatic execution by default.
+
+## Roadmap
+
+The roadmap is ordered by user outcome and exit criteria, not by feature count or
+calendar promises. Only the current milestone is a commitment; later stages enter
+after their prerequisites are proven in real deliveries.
+
+| Order | Milestone | User outcome |
 |---|---|---|
-| [Multica](https://github.com/multica-ai/multica) / [self-hosting](https://multica.ai/docs/self-host-quickstart) | A team platform that treats agents as first-class teammates: assign issues, track blockers and statuses, reuse skills, and route work to the right member through Squads; runs as a local daemon, cloud, or self-hosted. | You're not running an agent workforce. Hand Weft a requirement and it decides which repos to touch and who does what, then hands you a reviewable diff — more like giving the job to a dependable delivery lead than staffing a board. |
-| [Vibe Kanban](https://github.com/BloopAI/vibe-kanban) / [docs](https://vibekanban.com/docs) | A planning-and-review board for coding agents: issues become prompts, each workspace is a git worktree and branch, with diffs, inline comments, previews, and PR creation in one surface. [Official maintenance stopped in 2026-04](https://www.vibekanban.com/blog/shutdown) (hosted services sunset); now community-maintained, local app still works. | A board starts from cards you've already broken down; Weft steps in before that — it reads across your repos, works out what to change itself, and drives several agents forward while you follow one issue. |
-| [Conductor](https://www.conductor.build/docs) / [Parallel Code](https://github.com/johannesjo/parallel-code) | Local parallel worktree runners. Conductor is a Mac-only closed-source app giving each task a Git-backed isolated workspace (its own branch, working tree, terminal, diff, review) for Claude Code/Codex/Cursor; Parallel Code is open-source (MIT) Electron for Mac+Linux, each task "in its own git worktree," for Claude/Codex/Gemini/Copilot/Antigravity. | They run several agents side by side on one repo; Weft runs one delivery across many — from which repos to touch, to taking over from Feishu after you close the laptop, to restoring on a new machine, all carried by the one job. |
-| [Claude Squad](https://github.com/smtg-ai/claude-squad) | A multi-agent manager that lives in your terminal (TUI): tmux + git worktrees for isolation, a branch per session, for Claude Code/Codex/Gemini/Aider/OpenCode; open-source (AGPL-3.0). | Claude Squad lives in the terminal; Weft gives you a desktop delivery station you can walk away from — a stuck agent comes to you, you clear it from Feishu/Lark, and long runs stay awake and recoverable. |
-| [Nimbalyst](https://nimbalyst.com) (successor to [Crystal](https://github.com/stravu/crystal)) | Parallel experimentation. Crystal pioneered running multiple Claude Code sessions in isolated git worktrees; it's no longer maintained, and Nimbalyst succeeds it with Codex support, a session kanban, visual editors, and an iOS app. | It lets you try several approaches at once; Weft is about walking one delivery all the way through — scope confirmation, answering the agent's questions, diff, checks, and recovery all pinned to the same work item. |
-| [Sculptor](https://github.com/imbue-ai/sculptor) | A native desktop app (Apple Silicon Mac + Linux; Windows via WSL) that isolates each task in a Docker container instead of a worktree, with a Pairing Mode that syncs container changes back to your local IDE; parallel Claude Code; experimental preview. | Sculptor leans on Docker containers and is still experimental; Weft isolates in repo-native copies with no Docker to install, branches follow each repo's own style, and diffs stay reviewable with pre-PR checks. |
-| [Omnara](https://www.omnara.com/) / [repo](https://github.com/omnara-ai/omnara) | A command center for your coding agents: runs Claude Code and Codex in parallel and controls them from desktop/web/phone/watch + voice, with per-repo cloud sync. The older open-source CLI wrapper was archived in 2026-02 in favor of a platform built on the Claude Agent SDK. | Omnara moves the session to the cloud to keep it alive remotely; Weft does the opposite — your code and state stay on your machine, and only the agent's questions and permission asks follow you to Feishu, so you can decide without standing guard. |
+| **NOW** | **R1 · Cross-repository delivery loop** | Describe a real requirement once; Weft maintains policy-checked repository Lanes and their dependencies until every active Lane is review-ready. |
+| **NEXT** | **R2 · Walk-away execution and trustworthy recovery** | Leave the screen while work continues safely. Restarts, sleep, network loss, stalled runs, expired credentials, and agent usage limits become visible, resumable states with quiet, focused Needs-you prompts. |
+| **THEN** | **R3 · Keep internal work inside the delivery** | Research, retries, reviews, experiments, and subagents fold into their Lane. The main view shows outcomes, Evidence, risks, and decisions while the full Run history remains inspectable. |
+| **LATER** | **R4 · Compounding project knowledge and long-lived agents** | Build an agent roster with stable Positions and Assignment history. Agents reuse verified project knowledge, Skills, and delivery patterns across Issues while memory and authority remain explicit. |
+| **EXPLORE** | **R5 · Signals and operations** | Bring alerts and external events into bounded, read-only investigation; promote them into a normal Issue before any repository write. |
 
-> Cloud agents (Devin, OpenAI Codex cloud, Cursor background agents) run your
-> code on a remote sandbox — a different category: they take the work to the
-> cloud, Weft keeps it on your machine.
+The order matters: reliable delivery produces trustworthy Evidence; trustworthy
+Evidence makes recovery and process compression safe; only then can project memory
+and long-lived agents reuse experience without turning guesses into policy.
 
-## What it feels like
+## What works today
 
-<p align="center">
-  <img src="assets/diagrams/flow-en.svg" alt="Task to scoped sub-tasks to verified worktree diffs" width="940" />
-</p>
+- **Multi-repo planning:** add, clone, or create Workspace repositories; the lead
+  reads the repo map and proposes repository-scoped work with reasons.
+- **Native execution:** approved work gets a repo-native worktree and branch;
+  Claude Code, Codex, and OpenCode run as native CLI sessions.
+- **Controlled collaboration:** lead and worker sessions, planner tools, local
+  thread bus, permission asks, queueing, interrupt, resume, slash commands, and
+  attachments stay tied to the same Issue.
+- **Review surface:** materialized worktrees expose diffs and pre-PR checks, with
+  sidecar observation for Claude JSONL, Codex rollout JSONL, and OpenCode SQLite.
+- **Remote reachability:** Feishu/Lark or DingTalk can carry agent questions and
+  permission decisions back to the same local state.
+- **Team configuration:** Git-backed Skill sources, personal Skill preservation,
+  global/Workspace enablement, and per-repository effective Skills/Rules preview.
+- **Long-run safety:** keep-awake, remote standby, and encrypted `weft.db`
+  snapshots to a private Git remote with recovery-key export and restore.
+- **Workspace hygiene:** rename and cascade-delete for Workspaces, Issues, and
+  work items, plus English and Chinese UI.
 
-1. Add existing repositories to a workspace.
-2. Start an issue and describe the goal to the lead agent.
-3. Review the proposed work items: repository, reason, tool, and mandate.
-4. Approve the work items that should become worktrees.
-5. Workers run headless native CLI sessions and stream back into Weft.
-6. You answer real blockers, inspect diffs, and run checks before PR.
+Not yet productized are the complete Issue/Lane/Run/Evidence model, automatic PR
+and protected-branch merge orchestration, CI/CD and deployment observation,
+quota-aware automatic resumption, process compression, Project knowledge, and the
+long-lived agent roster. They are roadmap outcomes, not current-product claims.
 
-The human handles exceptions, not the assembly line.
+## Who it is for
 
-## Operate from chat when you are away
+Weft is for developers and technical leads who already use local coding-agent
+CLIs and regularly coordinate changes across services, SDKs, frontends,
+infrastructure, or release repositories. It becomes useful when one session is no
+longer enough, when work must survive interruptions, or when you need to know the
+whole delivery is ready without reopening every transcript.
 
-<p align="center">
-  <img src="assets/diagrams/im-en.svg" alt="IM remote control mirrors permission asks and agent questions" width="940" />
-</p>
+If you work mainly in one repository and your current single-agent, branch, and
+review workflow already feels complete, Weft may add more structure than value.
+It is not intended to replace Git hosting, general project management, the coding
+agents themselves, or production-operations controls.
 
-Choose Feishu/Lark or DingTalk in Settings; credentials for both stay isolated
-locally while one bridge is active. Permission asks and agent questions resolve
-the same underlying state as the desktop UI. Feishu uses replyable cards and
-issue topics. DingTalk uses Stream Mode with explicit `/allow`, `/deny`,
-`/always`, `/full`, and `/answer` commands, so approvals remain deterministic
-without relying on quote metadata.
-
-For issue rooms, send `/topic <issue-id>` in a Feishu group to create a topic,
-or `/bind <issue-id>` inside an existing Feishu topic. DingTalk topic circles
-expose a stable `openConvThreadId`: create or open a DingTalk thread, then send
-`/bind <issue-id>` while mentioning the bot inside it. Later thread messages that
-mention the bot route into the issue lead, and replies use that inbound message's
-temporary session webhook to return to the same thread. DingTalk's proactive group
-API accepts a parent `openConversationId`, not `openConvThreadId`, so Weft never
-substitutes the parent group ID or misaddresses the thread ID as a group ID.
-
-The bridge currently covers:
-
-- Permission asks and agent questions.
-- Feishu topic routes and DingTalk `openConvThreadId` routes for lead messages.
-- Concierge-style direct chat backed by the `weft_global` MCP tools.
-- Online resync summaries for pending Needs-you items.
-
-Binding is conservative: the first private-chat sender can become owner, group
-messages cannot bind ownership, and DB errors fail closed.
-
-## Product surfaces
+## Product surfaces today
 
 | Workspace board | Issue board |
 |---|---|
@@ -157,77 +211,57 @@ messages cannot bind ownership, and DB errors fail closed.
 |---|---|
 | <img src="assets/screenshots/repo-graph.png" alt="Repository dependency map" /> | <img src="assets/screenshots/lead.png" alt="Lead conversation" /> |
 
-## Architecture
+## Architecture today
 
 <p align="center">
   <img src="assets/diagrams/arch-en.svg" alt="Weft local-first architecture" width="940" />
 </p>
 
-The Rust backend owns the local SQLite store, git worktree lifecycle, headless
-agent processes, Ask Bridge, local MCP Bus, IM bridge, skill sources, power
-guards, encrypted backup, and sidecar observation. The React frontend renders
-the workspace board, issue board, lead conversation, worker sessions,
+The Rust backend owns the local SQLite store, Git worktree lifecycle, headless
+agent processes, permission registry, local thread bus, IM bridge, Skill sources,
+power guards, encrypted backup, computer-use control, and sidecar observation. The
+React frontend renders the Workspace and Issue boards, lead and worker sessions,
 observe/diff views, settings, and Needs-you queue.
-
-<p align="center">
-  <img src="assets/diagrams/model-en.svg" alt="Workspace, issue, sub-task, session model" width="860" />
-</p>
-
-## Current capabilities
-
-- **Multi-repo planning:** add, clone, or create workspace repos; the lead reads the repo map and proposes repo-scoped work with reasons.
-- **Native execution:** each approved work item gets a repo-native worktree and branch; Claude Code, Codex, and OpenCode workers run as native CLI sessions.
-- **Controlled collaboration:** planner MCP, Ask Bridge, local MCP Bus, queueing, interrupt, resume, slash commands, and attachments all stay under one issue.
-- **Remote reachability:** Feishu/Lark or DingTalk handle permission asks and agent questions; Feishu topics and DingTalk threads route issue messages back to the lead.
-- **Review surface:** materialized worktrees expose diffs and pre-PR checks, with sidecar observation for Claude jsonl, Codex rollout jsonl, and OpenCode SQLite.
-- **Team configuration:** git-backed skill sources, personal skill preservation, global/workspace enablement, and per-repo effective skills/rules preview.
-- **Long-run safety:** keep-awake, remote standby, and encrypted `weft.db` backups to a private Git remote with schedule, on-exit backup, restore, and Recovery Key export.
-- **Workspace hygiene:** rename and cascade-delete for workspaces, issues, and sub-tasks, plus English and Chinese UI.
-
-Not yet productized: automatic PR creation, protected-branch merge orchestration,
-CI/CD observation, deployment orchestration, workspace rule packs, team
-marketplace sync, and the long-running semantic Curator.
 
 ## Development
 
 ```bash
-npm install
-npm run dev          # Vite frontend
-npm run build        # TypeScript check + production frontend bundle
-npm run tauri dev    # full desktop app
-npm run tauri build  # release app bundle
+pnpm install
+pnpm dev             # Vite frontend
+pnpm build           # TypeScript check + production frontend bundle
+pnpm tauri dev       # full desktop app
+pnpm tauri build     # release app bundle
 cd src-tauri && cargo test
 git diff --check
 ```
 
-## Project Layout
+## Project layout
 
 ```text
 src/
-  board/                workspace and issue boards
+  board/                Workspace and Issue boards
   session/              chat, observe, diff, permissions
-    blocks/             chat-timeline rich blocks
-    useRepoActions.ts   add / clone / create repo from lead action cards
   components/           shared React UI
   i18n/                 English and Chinese strings
 src-tauri/src/
   lead_chat/            headless agent session engine
-    sentinels.rs        parse <weft:action_card> / <weft:list_repos/> markers
-    repo_state.rs       <repo_state> snapshot injected into the lead prompt
-  im/                   IM bridge (Channel trait + Feishu/DingTalk adapters)
+  im/                   Feishu/Lark and DingTalk bridge
   store/                SQLite/SeaORM entities and migrations
-  bus/                  local MCP/thread bus + human-ask notifier
-  ask.rs                permission Ask registry (desktop + IM mirrored)
+  bus/                  local MCP/thread bus
+  computer/             controlled desktop computer use
+  ask.rs                permission registry shared by desktop and IM
   git.rs                repository and worktree operations
-  materialize.rs
+  materialize.rs        scoped worktree materialization
 assets/
   screenshots/          README screenshots
-  diagrams/             architecture and model diagrams
-  readme/               generated README overview art
+  diagrams/             architecture diagrams
+  readme/               README overview artwork
 ```
 
-## Design Constraints
+## Design constraints
 
 Weft drives native CLIs through structured, headless interfaces and renders its
-own UI. Do not add embedded terminal/TUI dependencies for normal chat surfaces.
-Terminal takeover remains an escape hatch for users who want the original CLI.
+own product UI. Normal chat surfaces do not embed terminal/TUI dependencies;
+terminal takeover remains an escape hatch. Cross-repository wiring lives in
+Weft-managed state or worktree-local configuration, never as hidden changes to
+canonical repositories.

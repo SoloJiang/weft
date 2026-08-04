@@ -1,174 +1,204 @@
 <div align="center">
   <img src="public/weft-logo.svg" alt="Weft" width="220" />
 
-### 本地多仓交付编排器，指挥你自己的 Coding Agents
+### 本地优先的 Coding 交付系统
 
-Weft 是一个本地多仓交付编排器。你给它一个需求，它会指挥你自己的 Claude Code、
-Codex、OpenCode 跨多个仓库推进，把需求从意图一路带向实现、合并和上线。
+Weft 把一个产品目标变成跨多个仓库、可审计的一次完整交付。它在你的电脑上编排你自己的
+Claude Code、Codex 和 OpenCode，让每一次写入都受明确权限边界约束，最终交给你的不是
+一堆聊天记录，而是证据、决策和可以 Review 的变更。
 
-<sub>Tauri v2 · React 19 · Rust · SQLite · Native Coding-Agent CLIs</sub>
+<sub>Tauri v2 · React 19 · Rust · SQLite · 原生 Coding-Agent CLI</sub>
 
 [English](README.md)
 </div>
 
 <p align="center">
-  <img src="assets/readme/weft-overview.png" alt="Weft 概览：仓库进入 Lead 工作区，多个 scoped worker 产出检查后的 review diff" width="940" />
+  <img src="assets/readme/weft-overview.png" alt="Weft 将按仓库拆分的 Agent 工作编排成一次可 Review 的交付" width="940" />
 </p>
 
 ## 30 秒看懂
 
-Weft 不是终端网格，也不是云端 agent runner。它是在你的需求、原生 coding agents、
-仓库、分支、检查和发布流程之间做协调的本地编排层。
+大多数 Coding Agent 工具在优化一次 Session。Weft 想解决的是更完整的问题：让一项交付
+跨越多个 Session、多个仓库、各种中断和后续重复工作，仍然能持续推进。
 
 ```text
-需求 → 仓库地图 → 有边界的 agent 工作拆分 → 仓库原生分支 → 实现 → PR / 合并 / 上线
+产品目标 → Project 上下文 → 动态变更范围 → 逐仓 Lane
+         → 原生 Agent Run → Evidence → Review / 合并 / 发布
 ```
 
-**当前能力：** 本地多仓规划、仓库原生 worktree、原生 agent 会话、可 review 的 diff、
-pre-PR checks、IM 问答、运行中防休眠、加密数据库备份。
+你只描述一次结果。Weft 判断需要修改哪些仓库、为什么修改，以及应该按什么顺序推进。
+Project 权限策略内的工作无需逐仓审批；超出策略、高风险或无法确认的动作，才会停在一个
+具体的 Gate 上等待决策。最终得到的是一组相互隔离、经过验证，并且可以在一个界面判断
+是否已经准备好 Review 的变更。
 
-**最终目标：** 你给一个需求，Weft 指挥你自己的 Claude Code、Codex、OpenCode 一路做到
-PR、合并和上线。
+**当前已有：** 本地多仓规划、仓库原生 Worktree、原生 Agent Session、可 Review 的 Diff、
+PR 前检查、远程提问与审批、防休眠，以及本地状态的加密备份。
 
-## 什么时候你不需要 Weft
+**产品方向：** 做成一套可以放心离开、回来立即接手、结果值得信任的交付系统；再逐步形成
+Project 内的长期 Agent 花名册，让稳定岗位、明确职责和经过验证的项目知识跨 Issue 延续。
 
-如果你基本只在**一个仓库**里开发，而且已经有一套自己用得顺手的 coding-agent 工作流——
-一个 Claude Code 或 Codex 会话、自己的分支、自己的 review 习惯——那你大概率不需要 Weft。
-它的价值出现在「一个会话不够用」的那一刻：需要**跨多个仓库**推进、多个 agent 要在同一个
-issue 下保持协同，或者长任务想在离开电脑后用手机继续指挥。
+## 最终产品体验
 
-## Weft 的不同之处
+1. **只描述一次目标。** 在一个长期 Project 上下文中创建 Issue；当前界面仍使用
+   Workspace 这个名称。
+2. **由 Weft 展开交付范围。** Lead 读取仓库关系、当前代码、权限策略和已验证的交付历史，
+   持续维护动态变更范围，不要求用户预先把工作拆完。
+3. **每个写入仓库都公开可查。** 每个实际写入的仓库都有一条公开 Lane，记录原因、目标、
+   依赖、完成条件，以及允许它执行的策略判定。
+4. **继续使用已经信任的工具。** Claude Code、Codex 和 OpenCode 在仓库原生 Worktree 中
+   执行，保留各自的登录态、Skill、Hook、Sandbox 和可恢复的 Session 身份。
+5. **用事实验证，不接受自报完成。** Diff、Commit、检查结果、接口约定、PR、CI、Review、
+   冲突、决策和风险都会成为带代码版本的 Evidence。模型正常退出，不等于交付已经完成。
+6. **人可以放心离开。** Weft 只在当前策略和本机条件允许时继续推进。中断会进入可恢复状态；
+   Coding Agent 触发额度限制时，系统保存恢复点和上下文，在额度恢复且安全检查通过后自动续跑，
+   不盲目重试，也不丢失已经完成的工作。
+7. **回来先看结果。** Issue 首屏直接说明发生了什么、哪里被阻塞、什么需要你决定，以及距离
+   所有活跃 Lane 可以 Review 还差什么。
+8. **让经验跨工作延续。** Project 知识保留来源和版本；长期 Agent、岗位和任职关系让责任
+   跨 Issue 延续，但不会因此隐式扩大权限。
 
-### 1. 编排跨仓库交付
+人负责产品判断、授权和高风险决策；轮询、记录、恢复和日常协调交给 Weft。
 
-你描述 feature、bugfix、refactor 或 spike。Lead agent 读取 workspace 的 repo map，
-提出按仓库约束的工作拆分：哪个仓库需要改、为什么要改、由哪个 worker 负责。读取仓库是自由的；
-只有写入会被确认、创建工作目录、追踪和 review。
+## 核心产品对象
 
-### 2. 尊重你的原有习惯
+| 产品对象 | 它代表什么 |
+|---|---|
+| **Project** | 长期代码与交付上下文：仓库集合、仓库/服务关系、策略、Skill、已验证知识、Issue，以及未来的 Agent 花名册。当前界面称为 Workspace。 |
+| **Issue** | 一项用户可以验收的交付目标，包含动态变更范围、关键决策、整体就绪状态和剩余风险。 |
+| **Lane** | 一条公开的写仓单元。每条 Lane 只写一个仓库，并记录原因、目标、依赖、执行要求和权限判定。 |
+| **Run** | 一次有起止边界的执行尝试，记录执行者、原生 Session、结果和可恢复的失败状态。重试不会覆盖历史。 |
+| **Evidence** | 来自 Git、检查、接口、代码托管平台、决策和交接的紧凑证据，始终保留来源。 |
+| **Gate** | 因越界、高风险或事实不足而必须由人完成的一次具体决策；存在安全旁路时，只阻塞受影响的工作。 |
+| **Agent · 岗位 · 任职关系** | 跨 Issue 延续的身份、Project 内稳定职责，以及两者之间可追溯的历史关系。它们本身都不授予权限。 |
 
-Weft 和你已经信任的工具、仓库一起工作。
+单仓和多仓工作共用同一套模型。小变更时界面可以保持简洁；只有真实交付跨仓并产生依赖时，
+才展开完整控制信息。
 
-- **尊重用户工具：** Weft 驱动你自己的 Claude Code、Codex、OpenCode，保留它们的登录态、hooks、审批、sandbox、skills 和 session 身份。
-- **尊重仓库习惯：** worktree 创建在目标仓库内：`<repo>/.worktrees/weft/<branch-name>`。分支名跟随该仓库已有风格，例如 `feat/*` vs `feature/*`、`fix/*` vs `bugfix/*`。
-- **尊重团队经验：** 团队可以导入 Git 托管的 Skill 源，按全局或 workspace 选择性启用；个人或仓库自带的同名 Skill 仍可优先。会话开始前可以查看每个仓库最终生效的 Skills 和 Rules。
+## 为什么是 Weft
 
-### 3. 本地运行，远程可达，数据可恢复
+### 管交付，不只管 Session
 
-Agent 交付经常是长时间运行的桌面工作。Weft 可以在 session 运行时阻止系统空闲休眠；
-开启 IM 桥时保持远程待命，让飞书或钉钉指令随时到达；也可以把本地 SQLite 状态库加密备份到
-私有 Git 远端，并单独导出 Recovery Key，方便换机或故障后恢复。
+一个 Session 可以正常结束，但功能仍然没有做完。Weft 跟踪的是用户结果，覆盖规划、实现、
+检查、PR、Review、合并、中断和多次尝试。Session 可以被恢复、替换或重建，交付目标不会
+因此丢失。
 
-## 同类产品对比
+### 有边界的自主推进，而不是让人反复点批准
 
-大多数同类工具在解决同一个问题：怎么同时多开几个 agent 会话。Weft 解决的是另一个
-问题：**怎么把一个真实需求，放心交给 agent 做完。**
+每一个实际写入仓库的动作仍然公开、可追溯。AuthorityPolicy 决定哪些工作可以自动推进；
+角色、Agent 过往表现或 CLI 的一次权限回答，都不能静默扩大边界。只有出现真正需要判断的
+异常时，Weft 才来找人。
 
-你给一个需求，Weft 先替你想清楚要动哪些仓库、为什么动，等你确认才开工；多个 agent
-像一个小组那样彼此对齐，你全程只盯一个 issue；它卡住会主动问你，人离开电脑也能在
-飞书/Lark 或钉钉上继续指挥；每一处改动都在隔离副本里完成，主分支始终干净、diff 一眼可
-review，状态还能加密备份、换机即恢复。
+### 相信证据，不相信自信的叙述
 
-| 产品 | 它擅长什么 | Weft 的不同 |
+文件系统和 Git 决定代码事实；代码托管平台决定 PR、CI、Review、冲突和合并事实。
+Weft 在执行后重新对账；无法确认发生了什么时，状态保持 Unknown 并停止后续写入。
+
+### 尊重原有工具和仓库
+
+- **继续使用你的 Agent：** Weft 驱动原生 Claude Code、Codex 和 OpenCode CLI。
+- **继续遵循仓库习惯：** Worktree 和分支沿用目标仓库自己的目录与命名规则，Weft 不替代
+  Git 托管平台。
+- **继续积累团队经验：** 个人、Project 和仓库级 Skill/Rule 的实际生效结果都可以检查；
+  能固定版本的来源会保留版本，Run 开始前先解析冲突与优先级。
+
+### 本地优先，但人离开后仍然可达
+
+代码、凭据、Agent 进程、Git Worktree 和编排状态默认留在本机。人不在电脑前时，可以通过
+飞书/Lark 或钉钉处理具体提问和权限请求；加密快照让本地状态可以恢复，但不会把 Weft 变成
+托管在云端的代码执行器。
+
+### Project 会积累经验，但不会变成黑盒记忆
+
+经过验证的仓库关系、接口约定、Skill、失败教训和交付方式，可以改善下一次工作。每条可复用
+信息都保留来源、版本、有效状态，并支持纠正、替换和撤销。聊天全文不会静默变成永久事实。
+
+## 权限与安全边界
+
+- 每一次写入都能追溯到公开 Lane，以及当时允许它执行的 AuthorityPolicy 版本。
+- 读取仓库和写入仓库是两种不同能力。
+- 策略内的工作可以自动推进；保护分支、凭据、发布、生产、不可逆动作、策略变更和无法确认的
+  Scope 必须进入 Gate 或直接拒绝。
+- Weft 在执行前判断权限，执行后再从文件系统、Git、Push 和 PR 事实中对账。
+- 一旦发现策略漂移或状态无法确认，后续写入停止并 Fail Closed。
+- Agent 身份、岗位、Role Profile、用户反馈和历史成功都不会扩大权限。
+- 生产变更默认不由 Weft 自动执行。
+
+## Roadmap
+
+Roadmap 按用户结果和退出条件排序，不按功能数量或日历日期许诺。当前只承诺正在推进的
+里程碑；后续阶段必须由真实交付证明前置能力可靠后，才会进入实施。
+
+| 顺序 | 里程碑 | 用户得到什么 |
 |---|---|---|
-| [Multica](https://github.com/multica-ai/multica) / [self-hosting](https://multica.ai/docs/self-host-quickstart) | 把 agent 当一等队友的团队平台：给 agent 分配 issue、跟踪 blocker 和 status、复用 skill，并通过 Squads 把活路由给合适的成员；支持 local daemon、cloud 和 self-hosted 三种 runtime。 | 你不用去经营一支 agent 团队。把一个需求交给 Weft，它替你定好动哪些仓库、谁来做，做完直接给你能 review 的 diff——更像把活交给一个靠谱的交付负责人，而不是给你一块排期看板。 |
-| [Vibe Kanban](https://github.com/BloopAI/vibe-kanban) / [文档](https://vibekanban.com/docs) | 面向 coding agent 的规划与 review 看板：issue 变成 prompt，每个 workspace 一个 git worktree 和分支，diff、行内评论、preview、PR 创建集中在一个界面。已于 [2026-04 停止官方维护](https://www.vibekanban.com/blog/shutdown)（远程服务停服），转社区维护、本地仍可用。 | 看板是从你已经拆好的卡片开始的；Weft 从需求还没拆时就接手——读懂你的多个仓库，自己拆出该动哪里，多个 agent 协同往前推，你只看一个 issue 的推进。 |
-| [Conductor](https://www.conductor.build/docs) / [Parallel Code](https://github.com/johannesjo/parallel-code) | 本地并行 worktree runner。Conductor 是 Mac 专属闭源应用，每个 task 一个 Git 隔离工作区（独立 branch、working tree、终端、diff、review），驱动 Claude Code/Codex/Cursor；Parallel Code 是开源（MIT）Electron 应用，Mac+Linux，每个任务“各自一个 git worktree”，支持 Claude/Codex/Gemini/Copilot/Antigravity。 | 它们在一个仓库里并排跑几个 agent；Weft 管的是跨多个仓库的一整次交付：从该动哪些仓库，到合上电脑用飞书接管，到换机恢复，都跟着这一个任务走。 |
-| [Claude Squad](https://github.com/smtg-ai/claude-squad) | 终端里的多 agent 管理器（TUI）：用 tmux + git worktree 隔离，每个会话独立分支，支持 Claude Code/Codex/Gemini/Aider/OpenCode；开源（AGPL-3.0）。 | Claude Squad 活在终端里；Weft 给你一个能放心走开的桌面交付台——agent 卡住主动找你，飞书/Lark 上随手放行，长任务防休眠、状态可恢复。 |
-| [Nimbalyst](https://nimbalyst.com)（[Crystal](https://github.com/stravu/crystal) 后继） | 并行实验工作区。Crystal 最早把“多个 Claude Code 会话跑在隔离 git worktree 里”做成形，现已停止维护，由 Nimbalyst 接棒，新增 Codex 支持、session 看板、可视化编辑和 iOS app。 | 它让你同时试几条思路；Weft 更想让一条交付真正走完——范围确认、人工答疑、diff、检查到恢复，都钉在同一个工作单元上。 |
-| [Sculptor](https://github.com/imbue-ai/sculptor) | 原生桌面应用（Apple Silicon Mac + Linux，Windows 走 WSL），用 Docker 容器（而非 worktree）隔离每个任务，Pairing Mode 把容器改动同步回本地 IDE；并行跑 Claude Code；实验性预览。 | Sculptor 依赖 Docker 容器、还在实验阶段；Weft 用仓库原生的隔离副本、不装 Docker 也能跑，分支跟随目标仓库风格，diff 可 review、可做 pre-PR 检查。 |
-| [Omnara](https://www.omnara.com/) / [仓库](https://github.com/omnara-ai/omnara) | 你的 coding agent 指挥台：并行跑 Claude Code 与 Codex，从桌面/网页/手机/手表 + 语音随处控制，按仓库做云端续跑。旧的开源 CLI wrapper 已于 2026-02 归档，转向基于 Claude Agent SDK 的新平台。 | Omnara 把会话搬到云端、让它在远端续命；Weft 反过来——代码和状态全程留在你机器上，只把 agent 的提问和权限请求追到飞书，你不用守着也能拍板。 |
+| **NOW** | **R1 · 跨仓交付闭环** | 描述一次真实需求；Weft 持续维护通过策略判定的逐仓 Lane 及其依赖，直到所有活跃 Lane 都可以 Review。 |
+| **NEXT** | **R2 · 可走开与可信恢复** | 人离开界面后，工作仍能安全推进。应用重启、休眠、断网、Run 卡住、凭据过期和 Agent 额度耗尽都会成为可见、可恢复的状态，只在真正需要决策时进入 Needs-you。 |
+| **THEN** | **R3 · 过程内收** | 调研、重试、Review、试验和 Subagent 收进所属 Lane；主界面只看交付结果、Evidence、风险和决策，完整 Run 历史仍可展开。 |
+| **LATER** | **R4 · Project 知识复利与长期 Agent** | 建立带稳定岗位和任职历史的 Agent 花名册；Agent 跨 Issue 复用经过验证的项目知识、Skill 和交付方式，同时保持记忆与权限透明。 |
+| **EXPLORE** | **R5 · Signal / Ops 扩展** | 告警和外部事件先进入有边界的只读分析；一旦需要修改仓库，必须先转成普通 Issue。 |
 
-> 云端 agent（Devin、OpenAI Codex cloud、Cursor background agents）在远端沙箱里跑
-> 你的代码，是另一类形态——它们把活拿到云上，Weft 把活留在你机器上。
+这个顺序不能颠倒：可靠交付才能产生可信 Evidence；可信 Evidence 才能安全恢复并折叠内部过程；
+有了这些基础，Project 记忆和长期 Agent 才不会把未经验证的猜测固化成权限或经验。
 
-## 实际工作流
+## 当前已经可用
 
-<p align="center">
-  <img src="assets/diagrams/flow-zh.svg" alt="从任务到范围确认再到可验证 worktree diff" width="940" />
-</p>
+- **多仓规划：** 添加、克隆或创建 Workspace 仓库；Lead 根据仓库关系提出按仓拆分的工作，
+  并解释为什么需要修改。
+- **原生执行：** 经过确认的工作在目标仓库内创建原生 Worktree 和分支；Claude Code、Codex
+  和 OpenCode 以原生 CLI Session 运行。
+- **受控协作：** Lead/Worker Session、规划工具、本地 Thread Bus、权限请求、排队、打断、
+  Resume、Slash Command 和附件都归属同一 Issue。
+- **Review 界面：** 已创建的 Worktree 可以查看 Diff 并运行 PR 前检查；同时观察 Claude JSONL、
+  Codex Rollout JSONL 和 OpenCode SQLite 中的执行事实。
+- **远程可达：** 飞书/Lark 或钉钉可以把 Agent 提问与权限决策带回同一份本地状态。
+- **团队配置：** 支持 Git 托管的 Skill 源、保留个人 Skill、按全局或 Workspace 启用，并预览
+  每个仓库最终生效的 Skill 和 Rule。
+- **长任务安全：** 防休眠、远程待命，以及把加密 `weft.db` 快照备份到私有 Git 远端；
+  支持 Recovery Key 导出和恢复。
+- **基础管理：** Workspace、Issue 和工作单元的重命名与级联删除，以及中英双语界面。
 
-1. 在 Workspace 中添加已有仓库。
-2. 新建 Issue，并和 Lead agent 讨论目标。
-3. 查看 Lead 提出的工作拆分：仓库、原因、工具和执行授权。
-4. 确认哪些工作单元可以创建 worktree。
-5. Worker 以 headless 原生 CLI 会话运行，并流式进入 Weft。
-6. 你只处理真正的阻塞、查看 diff，并在 PR 前运行检查。
+尚未产品化的能力包括：完整的 Issue/Lane/Run/Evidence 模型、自动创建 PR、保护分支合并编排、
+CI/CD 与发布观测、额度感知自动续跑、过程内收、Project 知识和长期 Agent 花名册。它们是
+Roadmap 的目标，不是对当前版本的能力宣称。
 
-人处理异常，不推动流水线。
+## 适合谁
 
-## 人不在电脑前，也能继续指挥
+Weft 面向已经在本机使用 Coding Agent CLI 的开发者和技术负责人，尤其适合需要同时协调服务端、
+SDK、前端、基础设施或版本仓库的工作。当一个 Session 不再够用、工作需要跨中断延续，或者你
+希望不重读每段聊天就能判断整项交付是否可以 Review，Weft 才真正体现价值。
 
-<p align="center">
-  <img src="assets/diagrams/im-zh.svg" alt="IM 远程指挥：镜像权限请求和 agent 提问" width="940" />
-</p>
+如果你的工作基本集中在一个仓库，而且现有的单 Agent、分支和 Review 流程已经足够顺手，
+Weft 可能只会增加额外结构。它不替代 Git 托管平台、通用项目管理工具、Coding Agent 本身，
+也不替代生产操作的权限控制。
 
-Settings 中可以选择飞书/Lark 或钉钉；两套凭证分别保存在本机，同时只连接一个渠道。
-Worker 的权限请求和 agent 提问与桌面端使用同一份状态。飞书使用可回复卡片；钉钉通过
-Stream 模式接收消息，并使用显式的 `/allow`、`/deny`、`/always`、`/full` 和
-`/answer` 命令，避免依赖不稳定的引用消息元数据。
-
-你也可以把飞书/Lark 的 reply thread（话题）当作 Weft issue 的远程会话：在群里发送
-`/topic <issue-id>` 创建或复用 issue 话题，或在已有 reply thread 里发送
-`/bind <issue-id>` 绑定。之后，这个 reply thread 里的消息会回到对应 issue 的
-Lead 会话。钉钉话题圈会提供稳定的 `openConvThreadId`：先创建或打开一个钉钉 thread，
-再在 thread 内 @机器人发送 `/bind <issue-id>`。之后该 thread 内 @机器人的消息进入
-对应 Lead，回复通过这条入站消息的临时 session webhook 返回同一 thread。钉钉主动群
-消息 API 只接受父群的 `openConversationId`，不接受 `openConvThreadId`；因此 Weft 不会
-把父群 ID 冒充 thread，也不会把 thread ID 错当成群 ID。
-
-当前桥接覆盖：
-
-- 权限请求与 agent 提问。
-- 飞书/Lark 话题绑定与钉钉 `openConvThreadId` 绑定，让消息回到对应 Lead 会话。
-- 基于 `weft_global` MCP 工具的 Concierge 私聊入口。
-- 每次恢复在线时，对待处理 Needs-you 做一次摘要同步。
-
-绑定策略保持保守：首位私聊发送者可以成为 owner，群消息不能触发绑定，DB 错误 fail-closed。
-
-## 产品界面
+## 当前产品界面
 
 | Workspace 看板 | Issue 看板 |
 |---|---|
 | <img src="assets/screenshots/board-workspace.png" alt="Workspace 看板" /> | <img src="assets/screenshots/board-issue.png" alt="Issue 看板" /> |
 
-| 仓库地图 | Lead 对话 |
+| 仓库关系 | Lead 对话 |
 |---|---|
-| <img src="assets/screenshots/repo-graph.png" alt="仓库依赖图" /> | <img src="assets/screenshots/lead.png" alt="Lead 对话" /> |
+| <img src="assets/screenshots/repo-graph.png" alt="仓库依赖关系" /> | <img src="assets/screenshots/lead.png" alt="Lead 对话" /> |
 
-## 架构
+## 当前架构
 
 <p align="center">
   <img src="assets/diagrams/arch-zh.svg" alt="Weft 本地优先架构" width="940" />
 </p>
 
-Rust 后端负责本地 SQLite 状态库、git worktree 生命周期、headless agent 进程、Ask Bridge、本地 MCP Bus、IM 桥、Skill 源、电源管理、加密备份和 sidecar 观测。React 前端负责 Workspace 看板、Issue 看板、Lead 对话、worker session、Observe/Diff、Settings 和 Needs-you 队列。
-
-<p align="center">
-  <img src="assets/diagrams/model-zh.svg" alt="Workspace、Issue、子任务、Session 模型" width="860" />
-</p>
-
-## 当前能力
-
-- **多仓规划：** 添加、克隆或创建 workspace 仓库；Lead 基于 repo map 拆分工作，并解释每个仓库为什么需要改。
-- **原生执行：** 每个确认后的工作单元都会在目标仓库内创建 worktree 和 branch；Claude Code、Codex、OpenCode worker 以原生 CLI 会话运行。
-- **可控协作：** planner MCP、Ask Bridge、本地 MCP Bus、排队、打断、resume、slash commands 和附件都收束到同一个 issue。
-- **远程可达：** 飞书/Lark 或钉钉处理权限请求和 agent 提问；飞书话题与钉钉 thread 可以绑定 issue，并把消息路由回 Lead。
-- **Review 与检查：** 物化 worktree 的 diff、pre-PR checks，以及 Claude jsonl、Codex rollout jsonl、OpenCode SQLite 的 sidecar 观测。
-- **团队配置：** Git 托管 Skill 源、个人本地 Skills 保留、全局或 workspace 启用，以及每个仓库实际生效的 Skills/Rules 预览。
-- **长任务可靠性：** 防休眠、IM 远程待命，以及加密 `weft.db` 备份到私有 Git 远端；支持定时备份、退出时备份、恢复和 Recovery Key 导出。
-- **基础管理：** Workspace、Issue、子任务重命名和级联删除，中英双语 UI。
-
-尚未产品化：自动创建 PR、受保护分支合并编排、CI/CD 观测、部署编排、工作区规则包（workspace rule packs）、团队 marketplace 同步、长期语义 Curator。
+Rust 后端负责本地 SQLite 状态库、Git Worktree 生命周期、Headless Agent 进程、权限注册中心、
+本地 Thread Bus、IM 桥、Skill 源、电源管理、加密备份、Computer Use 控制和 Sidecar 观测。
+React 前端负责 Workspace/Issue 看板、Lead/Worker Session、Observe/Diff、Settings 和
+Needs-you 队列。
 
 ## 本地开发
 
 ```bash
-npm install
-npm run dev          # Vite 前端
-npm run build        # TypeScript 检查 + 生产前端 bundle
-npm run tauri dev    # 完整桌面应用
-npm run tauri build  # release app bundle
+pnpm install
+pnpm dev             # Vite 前端
+pnpm build           # TypeScript 检查 + 生产前端 Bundle
+pnpm tauri dev       # 完整桌面应用
+pnpm tauri build     # Release 应用包
 cd src-tauri && cargo test
 git diff --check
 ```
@@ -178,27 +208,26 @@ git diff --check
 ```text
 src/
   board/                Workspace 和 Issue 看板
-  session/              chat、observe、diff、权限请求
-    blocks/             chat timeline 的富块
-    useRepoActions.ts   Lead action card 触发的添加/克隆/新建仓库
+  session/              对话、观测、Diff、权限请求
   components/           共享 React UI
-  i18n/                 英文和中文文案
+  i18n/                 中英文文案
 src-tauri/src/
-  lead_chat/            headless agent 会话引擎
-    sentinels.rs        解析 <weft:action_card> / <weft:list_repos/> 控制符
-    repo_state.rs       注入到 Lead prompt 的 <repo_state> 快照
-  im/                   IM 桥（Channel trait + 飞书/钉钉适配器）
-  store/                SQLite/SeaORM entities 与 migrations
-  bus/                  本地 MCP/thread bus + human-ask notifier
-  ask.rs                权限 Ask 注册中心（桌面 + IM 同源）
-  git.rs                仓库和 worktree 操作
-  materialize.rs
+  lead_chat/            Headless Agent Session 引擎
+  im/                   飞书/Lark 与钉钉桥接
+  store/                SQLite/SeaORM 实体与迁移
+  bus/                  本地 MCP/Thread Bus
+  computer/             受控的桌面 Computer Use
+  ask.rs                桌面端与 IM 共用的权限注册中心
+  git.rs                仓库和 Worktree 操作
+  materialize.rs        有边界的 Worktree 创建
 assets/
   screenshots/          README 截图
-  diagrams/             架构图和模型图
-  readme/               README 概览生成图
+  diagrams/             架构图
+  readme/               README 概览图
 ```
 
 ## 设计约束
 
-Weft 通过结构化的 headless 接口驱动原生 CLI，并渲染自己的产品 UI。正常 chat surface 不引入嵌入式终端/TUI 依赖；终端接管仍作为需要原生 CLI 时的逃生入口保留。
+Weft 通过结构化 Headless 接口驱动原生 CLI，并渲染自己的产品界面。正常对话界面不嵌入
+Terminal/TUI 依赖；Terminal Takeover 只作为逃生入口。跨仓协作信息只保存在 Weft 管理状态
+或 Worktree 本地配置中，不会作为隐藏改动写进正式仓库。
