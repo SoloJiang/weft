@@ -2312,49 +2312,24 @@ async fn checks_for(
     .await
 }
 
-fn checks_are_preempted(
-    worker_failed: bool,
-    worker_active: bool,
-    direction_status: &str,
-    has_open_ask: bool,
-    policy: PolicyDecision,
-    reconciliation: ExecutionReconciliation,
-    pull_requests: &[PullRequestFacts],
-    open_pr_snapshot_freshness: OpenPrSnapshotFreshness,
-) -> bool {
-    worker_failed
-        || has_open_ask
-        || policy == PolicyDecision::NeedsGate
-        || worker_active_preempts_completion(worker_active, direction_status)
-        || has_all_clear_merged_pull_request(pull_requests, open_pr_snapshot_freshness)
-        || reconciliation == ExecutionReconciliation::Drifted
+fn checks_are_preempted(facts: &LaneFacts) -> bool {
+    facts.worker_failed
+        || facts.has_open_ask
+        || facts.policy == PolicyDecision::NeedsGate
+        || worker_active_preempts_completion(facts.worker_active, facts.direction_status.as_str())
+        || has_all_clear_merged_pull_request(&facts.pull_requests, facts.open_pr_snapshot_freshness)
+        || facts.reconciliation == ExecutionReconciliation::Drifted
 }
 
 async fn checks_after_decisive_gates<F, Fut>(
-    worker_failed: bool,
-    worker_active: bool,
-    direction_status: &str,
-    has_open_ask: bool,
-    policy: PolicyDecision,
-    reconciliation: ExecutionReconciliation,
-    pull_requests: &[PullRequestFacts],
-    open_pr_snapshot_freshness: OpenPrSnapshotFreshness,
+    facts: &LaneFacts,
     collect_checks: F,
 ) -> Result<CheckEvidence>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<CheckEvidence>>,
 {
-    if checks_are_preempted(
-        worker_failed,
-        worker_active,
-        direction_status,
-        has_open_ask,
-        policy,
-        reconciliation,
-        pull_requests,
-        open_pr_snapshot_freshness,
-    ) {
+    if checks_are_preempted(facts) {
         return Ok(CheckEvidence::NotApplicable);
     }
     collect_checks().await
@@ -2446,29 +2421,7 @@ async fn collect_lane(
     }
     let worker = latest_worker_facts(db, direction.id).await?;
     let has_open_ask = open_ask_direction_ids.contains(&direction.id);
-    let mut pull_requests = repo::list_pull_requests_for_direction(db, direction.id).await?;
-    pull_requests.sort_by_key(|row| row.id);
-    let pull_requests: Vec<PullRequestFacts> =
-        pull_requests.iter().map(pull_request_facts).collect();
-    let worktrees = probe_worktrees_for_direction(db, direction.id, git_probe).await?;
-    let reconciliation = reconciliation_for(direction, &worktrees);
-    // Keep collection's cost aligned with `lane_readiness` first-match order.
-    // Once a human-action, active-worker, all-clear terminal merge, or drift
-    // gate decides the outcome, starting a build/test process cannot add useful
-    // delivery evidence or may race a changing checkout.
-    let checks = checks_after_decisive_gates(
-        worker.failed,
-        worker.active,
-        direction.status.as_str(),
-        has_open_ask,
-        policy,
-        reconciliation,
-        &pull_requests,
-        open_pr_snapshot_freshness,
-        || checks_for(direction, &worktrees, check_execution, git_probe),
-    )
-    .await?;
-    Ok(LaneFacts {
+    let mut facts = LaneFacts {
         direction_id: direction.id,
         name: direction.name.clone(),
         active,
@@ -2476,13 +2429,49 @@ async fn collect_lane(
         worker_failed: worker.failed,
         worker_active: worker.active,
         has_open_ask,
-        reconciliation,
-        checks,
-        upstream: upstream_evidence(repo::upstream_merge_state(db, direction.id).await),
+        // Local Git facts are deliberately unknown until the only shared
+        // signature probe has sampled the registered worktrees.
+        reconciliation: ExecutionReconciliation::Unknown,
+        checks: CheckEvidence::NotApplicable,
+        // Any early return below is decided before upstream evidence. Keep
+        // every uncollected fact fail-closed rather than inventing success.
+        upstream: UpstreamEvidence::Unknown,
         open_pr_snapshot_freshness,
-        pull_requests,
+        pull_requests: Vec::new(),
         direction_status: direction.status.clone(),
+    };
+
+    // Match lane_readiness's first-match order before touching local Git. At
+    // this point a positive preemption can only be worker failure, an open
+    // ask, a policy gate, or an occupied claimed-complete worker; no Git fact
+    // can change any of those verdicts.
+    if checks_are_preempted(&facts) {
+        return Ok(facts);
+    }
+
+    let mut pull_requests = repo::list_pull_requests_for_direction(db, direction.id).await?;
+    pull_requests.sort_by_key(|row| row.id);
+    facts.pull_requests = pull_requests.iter().map(pull_request_facts).collect();
+
+    // An all-clear merged PR is the remaining terminal gate that precedes
+    // local reconciliation. It needs stored PR facts, but no local Git probe.
+    if checks_are_preempted(&facts) {
+        return Ok(facts);
+    }
+
+    let worktrees = probe_worktrees_for_direction(db, direction.id, git_probe).await?;
+    facts.reconciliation = reconciliation_for(direction, &worktrees);
+    // Keep collection's cost aligned with `lane_readiness` first-match order.
+    // Once a human-action, active-worker, all-clear terminal merge, or drift
+    // gate decides the outcome, starting a build/test process cannot add useful
+    // delivery evidence or may race a changing checkout.
+    let checks = checks_after_decisive_gates(&facts, || {
+        checks_for(direction, &worktrees, check_execution, git_probe)
     })
+    .await?;
+    facts.checks = checks;
+    facts.upstream = upstream_evidence(repo::upstream_merge_state(db, direction.id).await);
+    Ok(facts)
 }
 
 fn virtual_issue_ask_lane(open_pr_snapshot_freshness: OpenPrSnapshotFreshness) -> LaneFacts {
@@ -3192,16 +3181,7 @@ mod tests {
             (LaneReadiness::Blocked, Some(ReasonCode::PrCiFailing))
         );
         assert!(
-            !checks_are_preempted(
-                false,
-                false,
-                "review",
-                false,
-                PolicyDecision::AllowedByPolicy,
-                ExecutionReconciliation::Matched,
-                &lane.pull_requests,
-                lane.open_pr_snapshot_freshness,
-            ),
+            !checks_are_preempted(&lane),
             "a non-clear sibling PR must not skip applicable checks"
         );
 
@@ -3900,6 +3880,265 @@ mod tests {
             .expect("first post-run sampling task joins")
             .expect("first readiness check result");
         assert_eq!(first, CheckEvidence::Passed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn decisive_gates_return_before_a_stalled_git_probe_starts() {
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let root = tempfile::tempdir().expect("temporary decisive gate fixture");
+        let probe_started = root.path().join("stalled-git-probe-started");
+        let quoted_probe_started = shell_single_quote(&probe_started.to_string_lossy());
+        let git_stub = root.path().join("git-stall.sh");
+        std::fs::write(
+            &git_stub,
+            format!("#!/bin/sh\nprintf 'started\\n' > {quoted_probe_started}\nsleep 30\n"),
+        )
+        .expect("write stalled git stub");
+        let mut permissions = std::fs::metadata(&git_stub)
+            .expect("stalled git stub metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&git_stub, permissions).expect("make stalled git stub executable");
+
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("memory readiness db");
+        let workspace = repo::create_workspace(&db, "decisive gate workspace")
+            .await
+            .expect("workspace");
+        let root_path = root.path().display().to_string();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "decisive-gate-repo",
+            &root_path,
+            "main",
+            "",
+            true,
+        )
+        .await
+        .expect("repo reference");
+        let thread = repo::create_thread(
+            &db,
+            workspace.id,
+            "decisive gate stalled Git probe",
+            "feature",
+            "claude",
+        )
+        .await
+        .expect("thread");
+        let git_probe = GitSignatureProbe {
+            program: git_stub,
+            timeout: Duration::from_secs(1),
+        };
+
+        let cases = [
+            (
+                "worker-failed",
+                PolicyDecision::AllowedByPolicy,
+                Some("idle"),
+                true,
+                false,
+                false,
+                CheckExecution::RunAllowed,
+                LaneReadiness::Failed,
+                Some(ReasonCode::WorkerFailed),
+            ),
+            (
+                "open-ask",
+                PolicyDecision::AllowedByPolicy,
+                None,
+                false,
+                true,
+                false,
+                CheckExecution::CachedOnly,
+                LaneReadiness::NeedsYou,
+                Some(ReasonCode::OpenNeed),
+            ),
+            (
+                "policy-gate",
+                PolicyDecision::NeedsGate,
+                None,
+                false,
+                false,
+                false,
+                CheckExecution::RunAllowed,
+                LaneReadiness::NeedsYou,
+                Some(ReasonCode::PolicyGatePending),
+            ),
+            (
+                "occupied-worker",
+                PolicyDecision::AllowedByPolicy,
+                Some("running"),
+                false,
+                false,
+                false,
+                CheckExecution::CachedOnly,
+                LaneReadiness::Unknown,
+                Some(ReasonCode::InProgress),
+            ),
+            (
+                "merged-pr",
+                PolicyDecision::AllowedByPolicy,
+                None,
+                false,
+                false,
+                true,
+                CheckExecution::RunAllowed,
+                LaneReadiness::ReviewReady,
+                None,
+            ),
+        ];
+
+        for (
+            name,
+            policy,
+            worker_status,
+            worker_failed,
+            has_open_ask,
+            has_all_clear_merged_pr,
+            check_execution,
+            expected_readiness,
+            expected_reason,
+        ) in cases
+        {
+            let worktree_path = root.path().join(format!("{name}-worktree"));
+            std::fs::create_dir(&worktree_path).expect("worktree fixture directory");
+            let worktree_path = worktree_path.display().to_string();
+            let mut direction = repo::create_direction(
+                &db,
+                thread.id,
+                name,
+                "claude",
+                repo_ref.id,
+                "probe preemption fixture",
+                "impl-only",
+                "main",
+            )
+            .await
+            .expect("direction");
+            repo::record_worktree(
+                &db,
+                repo_ref.id,
+                direction.id,
+                &direction.branch,
+                &worktree_path,
+                false,
+                false,
+                "",
+            )
+            .await
+            .expect("worktree row");
+            repo::set_direction_status(&db, direction.id, "review")
+                .await
+                .expect("review status");
+            direction.status = "review".to_string();
+
+            let mut open_asks = HashSet::new();
+            if has_open_ask {
+                open_asks.insert(direction.id);
+            }
+            if let Some(worker_status) = worker_status {
+                let session =
+                    repo::create_session(&db, direction.id, repo_ref.id, "claude", &worktree_path)
+                        .await
+                        .expect("worker session");
+                repo::set_session_status(&db, session.id, worker_status)
+                    .await
+                    .expect("set worker session status");
+                if worker_failed {
+                    repo::insert_lead_message(
+                        &db,
+                        thread.id,
+                        Some(session.id),
+                        1,
+                        "assistant",
+                        "text",
+                        r#"{"text":"worker failed"}"#,
+                        "error",
+                    )
+                    .await
+                    .expect("failed assistant text row");
+                }
+            }
+            if has_all_clear_merged_pr {
+                pull_request::ActiveModel {
+                    thread_id: Set(thread.id),
+                    direction_id: Set(direction.id),
+                    repo_id: Set(repo_ref.id),
+                    host_kind: Set("github".to_string()),
+                    host_base: Set("github.com".to_string()),
+                    host_owner: Set("example".to_string()),
+                    host_repo: Set("decisive-gate".to_string()),
+                    number: Set(direction.id),
+                    url: Set(format!(
+                        "https://github.com/example/decisive-gate/pull/{}",
+                        direction.id
+                    )),
+                    title: Set("terminal decisive gate".to_string()),
+                    head_sha: Set(String::new()),
+                    base_ref: Set("main".to_string()),
+                    lifecycle: Set("merged".to_string()),
+                    ci_status: Set(serde_json::to_string(&CiStatus::Passing).expect("ci json")),
+                    review_status: Set(
+                        serde_json::to_string(&ReviewStatus::Approved).expect("review json")
+                    ),
+                    thread_status: Set(
+                        serde_json::to_string(&ThreadStatus::AllResolved).expect("thread json")
+                    ),
+                    conflict_status: Set(
+                        serde_json::to_string(&ConflictStatus::Clean).expect("conflict json")
+                    ),
+                    merge_readiness: Set(String::new()),
+                    last_checked_at: Set(String::new()),
+                    last_error: Set(String::new()),
+                    probe_fail_count: Set(0),
+                    created_at: Set("0".to_string()),
+                    ..Default::default()
+                }
+                .insert(&db.0)
+                .await
+                .expect("merged pull request");
+            }
+
+            let lane = tokio::time::timeout(
+                Duration::from_millis(250),
+                collect_lane(
+                    &db,
+                    &direction,
+                    policy,
+                    &open_asks,
+                    open_pr_snapshot_freshness(1_000, 60),
+                    check_execution,
+                    &git_probe,
+                ),
+            )
+            .await
+            .expect("decisive readiness must not wait for the stalled Git probe")
+            .expect("decisive readiness collection");
+
+            assert_eq!(
+                verdict(&lane),
+                (expected_readiness, expected_reason),
+                "{name} verdict"
+            );
+            assert_eq!(
+                lane.reconciliation,
+                ExecutionReconciliation::Unknown,
+                "{name} must leave unprobed reconciliation fail-closed"
+            );
+            assert_eq!(
+                lane.checks,
+                CheckEvidence::NotApplicable,
+                "{name} must not collect check evidence"
+            );
+            assert!(
+                !probe_started.exists(),
+                "{name} must return before starting the Git signature probe"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -4805,31 +5044,23 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
         let skipped_flight = Arc::clone(&flight);
         let skipped_runs = Arc::clone(&runs);
-        let evidence = checks_after_decisive_gates(
-            false,
-            false,
-            "review",
-            false,
-            PolicyDecision::AllowedByPolicy,
-            ExecutionReconciliation::Drifted,
-            &[],
-            open_pr_snapshot_freshness(1_000, 60),
-            move || {
-                let flight = Arc::clone(&skipped_flight);
-                let runs = Arc::clone(&skipped_runs);
-                async move {
-                    flight
-                        .get_or_run(83, check_targets("/tmp/check-drift", "head-a"), move |_| {
-                            let runs = Arc::clone(&runs);
-                            async move {
-                                runs.fetch_add(1, Ordering::SeqCst);
-                                Ok(CheckEvidence::Passed)
-                            }
-                        })
-                        .await
-                }
-            },
-        )
+        let mut lane = facts();
+        lane.reconciliation = ExecutionReconciliation::Drifted;
+        let evidence = checks_after_decisive_gates(&lane, move || {
+            let flight = Arc::clone(&skipped_flight);
+            let runs = Arc::clone(&skipped_runs);
+            async move {
+                flight
+                    .get_or_run(83, check_targets("/tmp/check-drift", "head-a"), move |_| {
+                        let runs = Arc::clone(&runs);
+                        async move {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            Ok(CheckEvidence::Passed)
+                        }
+                    })
+                    .await
+            }
+        })
         .await
         .expect("drift check decision");
         assert_eq!(evidence, CheckEvidence::NotApplicable);
@@ -4853,22 +5084,14 @@ mod tests {
     async fn open_ask_short_circuits_a_never_finishing_check_runner() {
         let runs = Arc::new(AtomicUsize::new(0));
         let attempted_runs = Arc::clone(&runs);
+        let mut lane = facts();
+        lane.has_open_ask = true;
         let evidence = tokio::time::timeout(
             Duration::from_millis(100),
-            checks_after_decisive_gates(
-                false,
-                false,
-                "review",
-                true,
-                PolicyDecision::AllowedByPolicy,
-                ExecutionReconciliation::Matched,
-                &[],
-                open_pr_snapshot_freshness(1_000, 60),
-                move || {
-                    attempted_runs.fetch_add(1, Ordering::SeqCst);
-                    async { std::future::pending::<Result<CheckEvidence>>().await }
-                },
-            ),
+            checks_after_decisive_gates(&lane, move || {
+                attempted_runs.fetch_add(1, Ordering::SeqCst);
+                async { std::future::pending::<Result<CheckEvidence>>().await }
+            }),
         )
         .await
         .expect("open ask returns without awaiting the runner")
