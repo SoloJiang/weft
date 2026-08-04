@@ -398,7 +398,12 @@ pub async fn lead_engine(
         extra_env,
         computer_args,
         computer_env,
-        computer_gen: computer_mint.map(|m| m.commit()),
+        // Left uncommitted here on purpose. Struct fields evaluate in source
+        // order, and the `native_id`/`turn_id` fields below AWAIT — committing
+        // in this literal disarms the guard and then waits. Stalled or cancelled
+        // there, the bearer is valid with neither a guard to revoke it nor a
+        // registered engine for a Stop to reach. Committed past insertion below.
+        computer_gen: None,
         acp_route_gen: None,
         system_prompt,
         native_id: repo::lead_native_id(db, thread_id).await.ok().flatten(),
@@ -448,6 +453,14 @@ pub async fn lead_engine(
     engine::apply_persisted_meta(&mut inner, &t.lead_meta);
     let eng: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     let selected = state.get_or_insert(lead_key(thread_id), eng);
+    // Committed only now: `selected` is registered, so this is the first moment
+    // a Stop can reach the generation at all. Into `selected` rather than the
+    // local, because `get_or_insert` may keep an engine that was already there.
+    // Until this line the guard is still armed, so every await above — the whole
+    // literal included — revokes if control never gets here.
+    if let Some(mint) = computer_mint {
+        selected.lock().await.computer_gen = Some(mint.commit());
+    }
     drop(engine_admission);
     // Hydration dispatch acquires the same gate through send_hidden_inner; do
     // not hold the construction gate across that call or it would self-deadlock.
@@ -1728,7 +1741,9 @@ pub(crate) async fn chat_open_worker_impl(
                 extra_env,
                 computer_args,
                 computer_env,
-                computer_gen: computer_mint.map(|m| m.commit()),
+                // Same reason as `lead_engine`: the `turn_id` field below
+                // awaits, so the commit cannot live in this literal.
+                computer_gen: None,
                 acp_route_gen: None,
                 system_prompt: String::new(),
                 native_id: native.clone(),
@@ -1777,7 +1792,11 @@ pub(crate) async fn chat_open_worker_impl(
             // populated right away after an app relaunch (not "after first message").
             engine::apply_persisted_meta(&mut inner, &sess.meta);
             let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
-            state.get_or_insert(key, e)
+            let selected = state.get_or_insert(key, e);
+            if let Some(mint) = computer_mint {
+                selected.lock().await.computer_gen = Some(mint.commit());
+            }
+            selected
         }
     };
     drop(_registry_read);
@@ -1998,14 +2017,17 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
     if admitted_dir.thread_id != dir.thread_id {
         anyhow::bail!("worker direction changed threads before engine registration");
     }
-    // Committed HERE, not in the literal above: both failures between the two
-    // are exits that drop `inner` on the floor without ever registering it, and
-    // a committed generation on an unreachable engine is one nothing can revoke
-    // — no teardown will ever be handed that engine. Uncommitted, the guard
-    // falls out of scope with `inner` on those paths and revokes itself.
-    inner.computer_gen = comp_mint.map(|m| m.commit());
     let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
-    Ok(state.get_or_insert(session_id as i64, e))
+    let selected = state.get_or_insert(session_id as i64, e);
+    // Committed past insertion, like the other two constructors: everything
+    // before it — the awaiting literal fields, `ensure_worker_parent_chain`, the
+    // thread-changed check — is an exit that drops `inner` without ever
+    // registering it, and a committed generation on an unreachable engine is one
+    // nothing can revoke. Armed, the guard revokes itself on every one of them.
+    if let Some(mint) = comp_mint {
+        selected.lock().await.computer_gen = Some(mint.commit());
+    }
+    Ok(selected)
 }
 
 #[tauri::command]

@@ -403,6 +403,18 @@ pub struct MintedBearer {
 /// the hand-off, the guard covers a path that returns with no Stop at all. They
 /// compose because revocation is compare-and-revoke — whichever fires second
 /// changes nothing.
+///
+/// # Commit only where the owner is REACHABLE
+///
+/// `commit` is a one-way door: it disarms the guard, so from then on the only
+/// thing that can revoke is a teardown reaching the generation through the
+/// engine. Committing anywhere the engine is not yet reachable leaves a window
+/// with neither — no guard, and nothing to find.
+///
+/// The trap is a struct literal. Fields evaluate in source order, so a commit
+/// among them runs BEFORE any later field that awaits, and a stall or
+/// cancellation there strands the bearer. The engine constructors therefore
+/// build with `computer_gen: None` and commit after `get_or_insert`.
 #[doc(hidden)]
 #[must_use = "an unheld mint is revoked on drop — commit it once a live child               or connection carries the bearer, or drop it deliberately"]
 pub struct MintGuard {
