@@ -2148,6 +2148,25 @@ pub struct EngineInner {
     /// prevents two sessions sharing one worktree from overwriting each
     /// other's bus URL). See `bus::inject::Injection::env`.
     pub extra_env: Vec<(String, String)>,
+    /// The computer-use injection, held SEPARATELY from `extra_args`/
+    /// `extra_env` rather than flattened into them at construction — see
+    /// [`refresh_computer_injection`] for why it has to be replaceable.
+    ///
+    /// Both halves of one `bus::inject::Injection`: `computer_args` are argv
+    /// entries (claude's `--mcp-config <file>`, codex's two `-c
+    /// mcp_servers.weft_computer.*` flags) and `computer_env` the child-env
+    /// ones (codex's bearer, opencode's inline config). Empty for engines
+    /// that must never receive computer use at all — concierge and curator
+    /// leads — and that emptiness is exactly what
+    /// [`refresh_computer_injection`] keys on to avoid ever GRANTING the
+    /// tool to an engine that was constructed without it.
+    ///
+    /// Assembled onto a spawn by [`build_args`] and [`spawn_env`]; never
+    /// read directly at a spawn site, so a future spawn path can't silently
+    /// omit (or double-apply) it.
+    pub computer_args: Vec<String>,
+    /// The env half of the computer injection — see [`Self::computer_args`].
+    pub computer_env: Vec<(String, String)>,
     pub system_prompt: String,
     pub native_id: Option<String>,
     /// A mechanical digest of the thread's history, staged by an engine/model
@@ -2773,7 +2792,79 @@ fn build_args(inner: &EngineInner) -> Vec<String> {
         a.push(id.clone());
     }
     a.extend(inner.extra_args.iter().cloned());
+    // The computer injection rides LAST and comes from its own field — see
+    // `EngineInner::computer_args`. Appending here (rather than at
+    // construction) is what lets `refresh_computer_injection` replace it
+    // before a respawn without any argv surgery.
+    a.extend(inner.computer_args.iter().cloned());
     a
+}
+
+/// Re-mint this engine's computer-use injection immediately before a child
+/// is spawned, replacing [`EngineInner::computer_args`]/`computer_env`.
+///
+/// Why every respawn needs this: `bus::inject::inject_computer` ROTATES the
+/// identity's bearer generation, and `stop_admitted` now revokes it too
+/// (`computer_srv::revoke_computer_session_tokens`). A resident
+/// engine respawns from the argv/env captured when it was CONSTRUCTED, so
+/// without a refresh the new child would carry a bearer that was already
+/// invalidated — every computer call from a resumed session would 401.
+/// Refreshing here is what makes revoke-on-stop safe.
+///
+/// NEVER grants the tool to an engine that didn't already have it. A
+/// concierge or curator lead is constructed with both fields empty (see
+/// `lead_chat::commands::lead_engine`'s branch), and this returns early on
+/// that emptiness rather than consulting thread kind a second time — so the
+/// "these two lead kinds never receive computer use" rule can't be
+/// re-litigated (or accidentally inverted) here. Same early return when the
+/// original injection produced nothing at all (an unwritable `weft_home`,
+/// an ACP tool, an unresolved worktree): a session that started without the
+/// tool never gains it at a respawn.
+///
+/// Best-effort by construction: `inject_computer` already falls back to an
+/// empty injection rather than erroring. If it does, the fields are left
+/// UNCHANGED rather than cleared — a spawn with a stale (possibly revoked)
+/// config degrades to 401s on computer calls, whereas clearing them would
+/// silently strip a working tool from a session that legitimately had it.
+fn refresh_computer_injection(app: &AppHandle, inner: &mut EngineInner) {
+    if inner.computer_args.is_empty() && inner.computer_env.is_empty() {
+        return;
+    }
+    let Some(base) = app.try_state::<crate::BusBase>().map(|b| b.0.clone()) else {
+        return;
+    };
+    if base.is_empty() {
+        return;
+    }
+    let fresh = crate::bus::inject::inject_computer(
+        &base,
+        inner.thread_id,
+        &inner.ask_dir,
+        &inner.tool,
+        inner.worktree_id,
+    );
+    if fresh.args.is_empty() && fresh.env.is_empty() {
+        return;
+    }
+    inner.computer_args = fresh.args;
+    inner.computer_env = fresh.env;
+}
+
+/// The env pairs for ONE spawn: the engine's own injections plus the
+/// computer injection, deep-merged.
+///
+/// The merge is not cosmetic. An opencode session's bus config AND its
+/// computer config BOTH ride `OPENCODE_CONFIG_CONTENT`, and `Command::envs`
+/// is last-wins per key — so handing the two through unmerged silently drops
+/// the bus server. `coalesce_env` deep-merges the duplicates (see its own
+/// doc). It used to run at construction, when both halves were flattened
+/// into `extra_env` together; now that the computer half is replaceable it
+/// has to run at ASSEMBLY time instead, or a refreshed computer config would
+/// be merged against nothing and clobber the bus entry.
+fn spawn_env(inner: &EngineInner) -> Vec<(String, String)> {
+    let mut pairs = inner.extra_env.clone();
+    pairs.extend(inner.computer_env.iter().cloned());
+    crate::bus::inject::coalesce_env(pairs)
 }
 
 fn merge_init_slash_commands(
@@ -2836,6 +2927,11 @@ async fn ensure_running_locked(
         }
     }
     crate::process_quota::admit_new_work(app)?;
+    // A resident engine respawns from the argv/env it was CONSTRUCTED with,
+    // so the computer bearer in there may already have been revoked by a
+    // Stop. Re-mint it here, immediately before the spawn, so
+    // the new child starts with a live one.
+    refresh_computer_injection(app, inner);
     crate::claude::ensure_trusted(&inner.cwd);
     // Resolve the actual binary: a per-session pin, else the global override for
     // "claude" (e.g. a user-aliased `cc-claude`), else "claude" itself.
@@ -2851,7 +2947,10 @@ async fn ensure_running_locked(
         .env("PATH", crate::detect::tool_path())
         // injection-supplied env (the codex computer
         // bearer travels here, never argv — see `EngineInner::extra_env`).
-        .envs(inner.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        // `spawn_env` (not `extra_env` directly) — it appends the
+        // computer injection and deep-merges the shared
+        // OPENCODE_CONFIG_CONTENT key; see its own doc.
+        .envs(spawn_env(inner).iter().map(|(k, v)| (k.clone(), v.clone())))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -4482,7 +4581,10 @@ async fn spawn_codex_turn(
     out: Outgoing,
     expected_epoch: Option<u64>,
 ) -> anyhow::Result<()> {
-    let (native, cwd, sid, thread_id_i, system_prompt, extra_args, extra_env, existing, program) = {
+    // No `extra_env` in this snapshot: the app-server connection's env is
+    // assembled inside the connect arm below, after the computer injection is
+    // re-minted.
+    let (native, cwd, sid, thread_id_i, system_prompt, extra_args, existing, program) = {
         let i = eng.lock().await;
         // Atomic with the snapshot: don't start a codex turn for a stopped engine
         // (a stop racing the send's Phase-3-to-spawn window, which is widest on the
@@ -4502,7 +4604,6 @@ async fn spawn_codex_turn(
             i.thread_id,
             i.system_prompt.clone(),
             i.extra_args.clone(),
-            i.extra_env.clone(),
             i.codex_client.clone(),
             // Effective codex binary for THIS session: a per-session pin wins over
             // the global override, so a pinned (opt-out) codex session keeps its
@@ -4523,10 +4624,25 @@ async fn spawn_codex_turn(
                 Some(s) => crate::proc_registry::Owner::session(s.to_string()),
                 None => crate::proc_registry::Owner::lead_thread(thread_id_i.to_string()),
             };
+            // Re-mint the computer bearer for the app-server child about to
+            // be spawned — but ONLY on this arm, never on the
+            // reuse arm above: refreshing rotates the identity's generation,
+            // which would 401 the computer tool of a still-live client that
+            // is holding the previous bearer. The outer snapshot's
+            // `extra_args`/`extra_env` deliberately carry no computer entries
+            // (they live in their own fields), so this re-lock is what
+            // assembles the pair the connection actually spawns with.
+            let (spawn_args, spawn_pairs) = {
+                let mut i = eng.lock().await;
+                refresh_computer_injection(&app, &mut i);
+                let mut args = extra_args.clone();
+                args.extend(i.computer_args.iter().cloned());
+                (args, spawn_env(&i))
+            };
             let c = crate::codex_app_server::Client::connect_session(
                 &program,
-                &extra_args,
-                &extra_env,
+                &spawn_args,
+                &spawn_pairs,
                 &cwd,
                 owner,
             )
@@ -6925,10 +7041,18 @@ async fn spawn_turn(
     let adapter = crate::adapters::adapter_for(&inner.tool)
         .ok_or_else(|| anyhow::anyhow!("unknown per-turn lead tool {}", inner.tool))?;
     adapter.prepare(&inner.cwd);
+    // Re-mint the computer bearer before this turn's child — a per-turn tool
+    // spawns from the engine's stored injection just like the resident path,
+    // so a Stop-revoked bearer would otherwise ride into the new process
+    refresh_computer_injection(&app, &mut inner);
+    // The computer injection is appended here rather than living in
+    // `extra_args`, mirroring `build_args` — see `EngineInner::computer_args`.
+    let mut adapter_extra = inner.extra_args.clone();
+    adapter_extra.extend(inner.computer_args.iter().cloned());
     let (_program, args) = adapter.build_argv(&crate::adapters::AdapterContext {
         cwd: &inner.cwd,
         system_prompt: &inner.system_prompt,
-        extra_args: &inner.extra_args,
+        extra_args: &adapter_extra,
         native_id: inner.native_id.as_deref(),
         message: &out.text,
         slash_commands: &inner.slash_commands,
@@ -6947,7 +7071,10 @@ async fn spawn_turn(
         .env("PATH", crate::detect::tool_path())
         // injection-supplied env (the codex computer
         // bearer travels here, never argv — see `EngineInner::extra_env`).
-        .envs(inner.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        // `spawn_env` (not `extra_env` directly) — it appends the
+        // computer injection and deep-merges the shared
+        // OPENCODE_CONFIG_CONTENT key; see its own doc.
+        .envs(spawn_env(&inner).iter().map(|(k, v)| (k.clone(), v.clone())))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         // stderr → app log: a per-turn CLI that dies prints its reason there.
@@ -7933,6 +8060,28 @@ async fn stop_quiet_admitted(eng: &EngineRef) -> StopQuietOutcome {
     let mut inner = eng.lock().await;
     let target = (inner.thread_id, inner.session_id);
     let was_busy = inner.turn.busy;
+    // Kill this session's computer-use bearer here — the ONE chokepoint every
+    // teardown funnels through (hard stop, switch teardown, restart), so the
+    // token dies whenever this engine's child does.
+    //
+    // Rotation otherwise only happens at INJECTION, and a session that is
+    // stopped and never relaunched never injects again: the identity's DB
+    // rows survive, so neither the deletion revocation set nor
+    // `session_is_live` refuses the old token, and its generation never
+    // moves. An orphaned descendant, or any same-uid process that read the
+    // token out of the injected config/env/argv, could otherwise keep driving
+    // the desktop after the human stopped the session — silently so under a
+    // standing Full/Always grant.
+    //
+    // Safe against resume because every respawn path re-mints first
+    // (`refresh_computer_injection`), and safe for engines that never had the
+    // tool (concierge/curator leads, workers with an unresolved worktree):
+    // revoking an identity that never minted is a no-op bump.
+    crate::bus::computer_srv::revoke_computer_session_tokens(
+        inner.thread_id,
+        &inner.ask_dir,
+        inner.worktree_id,
+    );
     // Open text rows: the anonymous slot PLUS the item-keyed app-server rows.
     // Hard stops also shut the codex client down, so the consumer's disconnect
     // cleanup never runs for them — without this drain an item row would stay
@@ -8322,8 +8471,19 @@ async fn rewind_reserved(
             session_id: inner.session_id,
             tool: inner.tool.clone(),
             command: inner.command.clone(),
-            extra_args: inner.extra_args.clone(),
-            extra_env: inner.extra_env.clone(),
+            // The CURRENT injection, deliberately NOT refreshed: this
+            // snapshot spawns a short-lived codex client to fork a thread,
+            // alongside the engine's own still-live one. Re-minting here
+            // would rotate the identity's generation and 401 the live
+            // client's computer tool. A transient fork client
+            // never makes computer calls, so carrying a possibly-stale
+            // bearer costs nothing.
+            extra_args: {
+                let mut a = inner.extra_args.clone();
+                a.extend(inner.computer_args.iter().cloned());
+                a
+            },
+            extra_env: spawn_env(&inner),
             cwd: inner.cwd.clone(),
             native_id: inner.native_id.clone(),
             system_prompt: inner.system_prompt.clone(),
@@ -9795,6 +9955,8 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
         cwd: "/tmp".into(),
         extra_args: vec![],
         extra_env: vec![],
+        computer_args: vec![],
+        computer_env: vec![],
         system_prompt: String::new(),
         native_id: None,
         pending_context_digest: None,
@@ -13532,6 +13694,82 @@ mod tests {
         );
     }
 
+    /// The computer injection is assembled onto a spawn from its OWN field,
+    /// not from `extra_args` — so `refresh_computer_injection` can replace it
+    /// before a respawn without argv surgery. It rides LAST, and
+    /// an engine that never had it (concierge/curator lead) contributes
+    /// nothing.
+    #[test]
+    fn build_args_appends_the_computer_injection_from_its_own_field() {
+        let mut inner = test_inner("claude");
+        inner.extra_args = vec!["--settings".into(), "hook.json".into()];
+        inner.computer_args = vec!["--mcp-config".into(), "/weft/computer-L2.mcp.json".into()];
+
+        let args = build_args(&inner);
+        let tail: Vec<&String> = args.iter().rev().take(2).collect();
+        assert_eq!(
+            tail,
+            vec![&"/weft/computer-L2.mcp.json".to_string(), &"--mcp-config".to_string()],
+            "the computer injection must ride last: {args:?}"
+        );
+        assert!(args.windows(2).any(|w| w[0] == "--settings" && w[1] == "hook.json"));
+
+        // Replacing the field alone changes the spawn — no argv surgery.
+        inner.computer_args = vec!["--mcp-config".into(), "/weft/computer-L3.mcp.json".into()];
+        assert!(build_args(&inner).contains(&"/weft/computer-L3.mcp.json".to_string()));
+        assert!(!build_args(&inner).contains(&"/weft/computer-L2.mcp.json".to_string()));
+
+        inner.computer_args = vec![];
+        let none = build_args(&inner);
+        assert!(
+            !none.iter().any(|a| a == "--mcp-config"),
+            "an engine without computer use must spawn without it: {none:?}"
+        );
+    }
+
+    /// `spawn_env` must deep-merge the bus and computer halves of the SHARED
+    /// `OPENCODE_CONFIG_CONTENT` key. Splitting the computer injection into
+    /// its own field moved this merge from construction to spawn assembly; if
+    /// it were dropped, `Command::envs`' last-wins would silently strip the
+    /// bus server from every opencode session that also has computer use.
+    #[test]
+    fn spawn_env_deep_merges_the_shared_opencode_config_key() {
+        let mut inner = test_inner("opencode");
+        inner.extra_env = vec![(
+            "OPENCODE_CONFIG_CONTENT".into(),
+            serde_json::json!({"mcp": {"weft_bus": {"type": "remote", "url": "http://bus"}}})
+                .to_string(),
+        )];
+        inner.computer_env = vec![(
+            "OPENCODE_CONFIG_CONTENT".into(),
+            serde_json::json!({"mcp": {"weft_computer": {"type": "remote", "url": "http://comp"}}})
+                .to_string(),
+        )];
+
+        let pairs = spawn_env(&inner);
+        let merged: Vec<&(String, String)> = pairs
+            .iter()
+            .filter(|(k, _)| k == "OPENCODE_CONFIG_CONTENT")
+            .collect();
+        assert_eq!(merged.len(), 1, "the duplicate key must collapse to one entry: {pairs:?}");
+        let v: serde_json::Value = serde_json::from_str(&merged[0].1).unwrap();
+        assert_eq!(v["mcp"]["weft_bus"]["url"], "http://bus", "the bus server must survive");
+        assert_eq!(v["mcp"]["weft_computer"]["url"], "http://comp", "so must the computer one");
+    }
+
+    /// The codex bearer is a DISTINCT env key, so it passes through
+    /// untouched alongside unrelated entries.
+    #[test]
+    fn spawn_env_passes_the_codex_bearer_through_beside_other_entries() {
+        let mut inner = test_inner("codex");
+        inner.extra_env = vec![("WEFT_ASK_URL".into(), "http://ask".into())];
+        inner.computer_env = vec![("WEFT_COMPUTER_MCP_TOKEN".into(), "deadbeef".into())];
+
+        let pairs = spawn_env(&inner);
+        assert!(pairs.iter().any(|(k, v)| k == "WEFT_ASK_URL" && v == "http://ask"));
+        assert!(pairs.iter().any(|(k, v)| k == "WEFT_COMPUTER_MCP_TOKEN" && v == "deadbeef"));
+    }
+
     #[test]
     fn build_args_fresh_vs_resume() {
         let mut inner = EngineInner {
@@ -13542,6 +13780,8 @@ mod tests {
             cwd: "/tmp".into(),
             extra_args: vec!["--mcp-config".into(), "x".into()],
             extra_env: vec![],
+            computer_args: vec![],
+            computer_env: vec![],
             system_prompt: "be lead".into(),
             native_id: None,
             pending_context_digest: None,

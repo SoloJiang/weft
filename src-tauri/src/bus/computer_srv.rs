@@ -320,6 +320,38 @@ pub fn rotate_and_mint_computer_session_token(thread: i32, dir: &str, wt: Option
     render_computer_session_token(thread, dir, wt, *slot)
 }
 
+/// Invalidate every previously-minted bearer for `(thread, dir, wt)` WITHOUT
+/// minting a replacement — the teardown counterpart of
+/// [`rotate_and_mint_computer_session_token`].
+///
+/// Rotation alone happens at INJECTION, which covers every case where a
+/// replacement child takes over an identity. It does NOT cover a session
+/// that is simply STOPPED and never relaunched: `engine::stop` kills the
+/// child but leaves the identity's DB rows intact, so neither the deletion
+/// revocation set nor `session_is_live` (which reads rows, not engine
+/// liveness) refuses the old bearer, and with no new injection the
+/// generation never moves. A process that retained the token — an orphaned
+/// descendant, or any same-uid process that read it out of the injected
+/// config/env/argv — could therefore keep driving the desktop after the
+/// human stopped the session, silently so under a standing Full/Always
+/// grant. Bumping the generation here kills that token the instant Stop
+/// lands.
+///
+/// Safe to call for an identity that never had a token: the entry is
+/// created at generation 1 and the next injection simply mints at 2.
+///
+/// A caller that revokes MUST also guarantee a fresh injection before the
+/// same identity's next child starts, or that child inherits a
+/// now-invalid bearer — see `lead_chat::engine::refresh_computer_injection`,
+/// which every respawn path runs for exactly this reason.
+#[doc(hidden)]
+pub fn revoke_computer_session_tokens(thread: i32, dir: &str, wt: Option<i32>) {
+    let mut generations =
+        session_token_generations().lock().unwrap_or_else(|e| e.into_inner());
+    let slot = generations.entry((thread, dir.to_string(), wt)).or_insert(0);
+    *slot = slot.wrapping_add(1);
+}
+
 /// The ONE place this module's HMAC key material gets constructed — shared by
 /// both [`computer_session_token`] (mint) and [`verify_computer_token`]
 /// (verify), so the two can never drift onto two different derivations of
@@ -4937,6 +4969,52 @@ mod tests {
             verify_computer_token(933_001, "70", Some(2), &sibling),
             "a sibling worktree's own bearer must survive the rotation"
         );
+    }
+
+    /// Stopping a session must kill its bearer even though no replacement is
+    /// ever minted: rotation happens at INJECTION, and a
+    /// stopped-but-not-relaunched session never injects again, so without an
+    /// explicit revoke the old token would verify forever. A sibling
+    /// worktree's bearer — a different identity — must be untouched, and the
+    /// next injection for the revoked identity must still produce a working
+    /// token (resume works).
+    #[test]
+    fn revoking_on_stop_kills_the_bearer_without_minting_a_replacement() {
+        let stopped = computer_session_token(933_201, "70", Some(1));
+        let sibling = computer_session_token(933_201, "70", Some(2));
+        assert!(verify_computer_token(933_201, "70", Some(1), &stopped));
+
+        revoke_computer_session_tokens(933_201, "70", Some(1));
+
+        assert!(
+            !verify_computer_token(933_201, "70", Some(1), &stopped),
+            "a stopped session's bearer must stop verifying the instant Stop lands"
+        );
+        assert!(
+            verify_computer_token(933_201, "70", Some(2), &sibling),
+            "revoking one worktree's identity must not disturb its sibling's"
+        );
+
+        // Resume: the respawn path re-injects, which mints under the bumped
+        // generation — so the resumed child gets a working bearer.
+        let resumed = rotate_and_mint_computer_session_token(933_201, "70", Some(1));
+        assert_ne!(resumed, stopped, "resume must not hand back the revoked token");
+        assert!(
+            verify_computer_token(933_201, "70", Some(1), &resumed),
+            "a re-injected session's fresh bearer must verify"
+        );
+    }
+
+    /// Revoking an identity that never had a token is harmless — the entry is
+    /// created at the bumped generation and the first injection mints against
+    /// it. Guards the `stop` path for engines constructed without computer use
+    /// (concierge/curator leads, workers with an unresolved worktree), which
+    /// call the revoke unconditionally.
+    #[test]
+    fn revoking_an_identity_that_never_minted_is_harmless() {
+        revoke_computer_session_tokens(933_301, "lead", None);
+        let minted = rotate_and_mint_computer_session_token(933_301, "lead", None);
+        assert!(verify_computer_token(933_301, "lead", None, &minted));
     }
 
     /// Bump and render share one critical section: each of two back-to-back
