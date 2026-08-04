@@ -118,6 +118,12 @@ export function ThreadBoard() {
     activeDirections,
     worktreesByDirection,
   );
+  // `created_at` is the opaque proposal version. A re-proposal can change its
+  // policy directions and decisions without changing its lifecycle status.
+  let planReadinessSignature: string | null = null;
+  if (proposal) {
+    planReadinessSignature = `${proposal.status}:${proposal.created_at}`;
+  }
   const readinessKey = buildReadinessKey({
     directions: activeDirections,
     attentionIds,
@@ -127,7 +133,7 @@ export function ThreadBoard() {
       sessionId: session.info.session_id,
       status: session.status,
     })),
-    planStatus: proposal?.status ?? null,
+    planStatus: planReadinessSignature,
     prRevision: prReadinessRevision,
   });
   const visibleReadiness = selectVisibleReadiness(

@@ -10,6 +10,7 @@ import ts from "typescript";
 const require = createRequire(import.meta.url);
 const chipPath = new URL("../../src/components/ReadinessChip.tsx", import.meta.url);
 const readinessKeyPath = new URL("../../src/lib/readinessKey.ts", import.meta.url);
+const threadBoardPath = new URL("../../src/board/ThreadBoard.tsx", import.meta.url);
 const workspaceKanbanPath = new URL("../../src/board/WorkspaceKanban.tsx", import.meta.url);
 
 type ReadinessDto = {
@@ -452,6 +453,49 @@ test("plan status change synchronously hides an otherwise ready verdict", async 
     { kind: "loading" },
     "the prior review-ready result is hidden before the refresh effect runs",
   );
+});
+
+test("same-status proposal re-proposal synchronously hides an otherwise ready verdict", async () => {
+  const { buildReadinessKey, selectVisibleReadiness } = await loadReadinessKey();
+  const base = {
+    directions: [{ id: 17, status: "review" }],
+    attentionIds: [],
+    worktrees: [{ directionId: 17, exists: true }],
+    workerSessions: [],
+    prRevision: 0,
+  };
+  const initialKey = buildReadinessKey({
+    ...base,
+    planStatus: "proposed:proposal-version-1",
+  });
+  const reProposedKey = buildReadinessKey({
+    ...base,
+    planStatus: "proposed:proposal-version-2",
+  });
+  const ready = { kind: "ready" as const, dto: { readiness: "review_ready", reasons: [] } };
+  const stored = { threadId: 17, key: initialKey, state: ready };
+
+  assert.notEqual(
+    initialKey,
+    reProposedKey,
+    "the proposal version changes the key even when the lifecycle status is unchanged",
+  );
+  assert.equal(selectVisibleReadiness(stored, 17, initialKey), ready);
+  assert.deepEqual(
+    selectVisibleReadiness(stored, 17, reProposedKey),
+    { kind: "loading" },
+    "the prior verdict is hidden before the re-proposal refresh completes",
+  );
+});
+
+test("ThreadBoard keys readiness with proposal status and its stable version", () => {
+  const source = readFileSync(threadBoardPath, "utf8");
+
+  assert.match(
+    source,
+    /planReadinessSignature = `\$\{proposal\.status\}:\$\{proposal\.created_at\}`/,
+  );
+  assert.match(source, /planStatus:\s*planReadinessSignature,/);
 });
 
 test("worker terminal status changes synchronously hide a prior verdict", async () => {
