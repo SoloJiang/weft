@@ -146,13 +146,14 @@
 //! unbounded output before its deadline. Completed output uses the same
 //! combined-output tail convention as `CheckResult`.
 //! The process-local single-flight cache is valid for at most 10 minutes and
-//! only while its sorted worktree-path, HEAD-SHA, and clean-worktree signatures
-//! match the newly collected values; any HEAD change immediately reruns checks.
+//! only while its sorted worktree-path, branch, HEAD-SHA, and clean-worktree
+//! signatures match the newly collected values; any branch or HEAD change
+//! immediately reruns checks.
 //! A dirty worktree invalidates any prior entry and is intentionally
 //! uncacheable, so uncommitted changes can never inherit a previously passing
 //! result. Run-allowed collection samples every target again after its runner
 //! returns and before it publishes evidence: a failed post-run sample or any
-//! path/HEAD/dirty mismatch invalidates the memo and publishes `NotProduced`
+//! path/branch/HEAD/dirty mismatch invalidates the memo and publishes `NotProduced`
 //! to the leader and matching followers. Requests that observed the same dirty
 //! signature while its one execution is still in flight share that execution
 //! only; its result is discarded as soon as the flight completes. Each
@@ -166,8 +167,9 @@
 //!
 //! The desktop `issue_readiness` command collects with `RunAllowed`. The
 //! read-only global `issue_status` bus tool instead uses `CachedOnly`: it may
-//! consume a matching, unexpired check-flight memo, but it never starts or
-//! waits for a runner. Without that memo its check evidence is `NotProduced`,
+//! consume a matching, unexpired check-flight memo only when it can immediately
+//! hold the same per-direction admission gate. It never starts or waits for a
+//! runner or admission; without that memo its check evidence is `NotProduced`,
 //! so the answer stays fail-closed.
 //!
 //! Upstream evidence is collected from the established
@@ -1235,6 +1237,21 @@ impl CheckFlight {
         })
     }
 
+    /// Cached-only callers have no authority to wait behind a worker start or
+    /// a verification runner. They may read a memo only when they can join the
+    /// same direction admission critical section immediately.
+    fn cached_read_only_if_admitted(
+        &self,
+        direction_id: i32,
+        targets: &[CheckTarget],
+    ) -> Result<Option<VerificationReport>> {
+        let direction_lock = self.direction_lock(direction_id)?;
+        let Ok(_admission) = direction_lock.try_lock_owned() else {
+            return Ok(None);
+        };
+        self.cached_read_only(direction_id, targets)
+    }
+
     fn cache_result(
         &self,
         direction_id: i32,
@@ -1348,9 +1365,6 @@ impl CheckFlight {
         SFut: Future<Output = Result<Vec<CheckTarget>>>,
     {
         Self::sort_targets(&mut targets);
-        if let Some(report) = self.cached(direction_id, &targets)? {
-            return Ok(report);
-        }
         loop {
             match self.claim_inflight(direction_id, &targets)? {
                 CheckFlightClaim::Follower(receiver) => {
@@ -1362,9 +1376,6 @@ impl CheckFlight {
                     // caller, but waiting preserves the per-direction runner
                     // serialization before this caller samples its own result.
                     let _ = Self::wait_for_inflight(receiver).await;
-                    if let Some(report) = self.cached(direction_id, &targets)? {
-                        return Ok(report);
-                    }
                 }
                 CheckFlightClaim::Leader(leader) => {
                     let _admission = self.acquire_admission(direction_id).await?;
@@ -1791,7 +1802,7 @@ where
                 .await
         }
         CheckExecution::CachedOnly => Ok(flight
-            .cached_read_only(direction_id, &targets)?
+            .cached_read_only_if_admitted(direction_id, &targets)?
             .map(|report| report.evidence)
             .unwrap_or(CheckEvidence::NotProduced)),
     }
@@ -2600,7 +2611,7 @@ async fn checks_for(
                 .evidence,
         ),
         CheckExecution::CachedOnly => Ok(check_flight()
-            .cached_read_only(direction.id, &targets)?
+            .cached_read_only_if_admitted(direction.id, &targets)?
             .map(|report| report.evidence)
             .unwrap_or(CheckEvidence::NotProduced)),
     }
@@ -4988,6 +4999,109 @@ mod tests {
             .expect("recovered verification reruns");
         assert_eq!(recovered, CheckEvidence::Passed);
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cached_only_does_not_read_a_memo_while_admission_is_held() {
+        let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
+        let targets = check_targets("/tmp/cached-only-admission", "head-a");
+        let primed = flight
+            .get_or_run(422, targets.clone(), |_| async {
+                Ok(CheckEvidence::Passed)
+            })
+            .await
+            .expect("prime cached evidence");
+        assert_eq!(primed, CheckEvidence::Passed);
+
+        let admission = flight
+            .acquire_admission(422)
+            .await
+            .expect("hold worker-style admission");
+        let runner_calls = Arc::new(AtomicUsize::new(0));
+        let attempted_runner = Arc::clone(&runner_calls);
+        let observed = tokio::time::timeout(
+            Duration::from_millis(100),
+            checks_for_targets_with_runner(
+                &flight,
+                CheckExecution::CachedOnly,
+                422,
+                targets.clone(),
+                move |_| {
+                    let attempted_runner = Arc::clone(&attempted_runner);
+                    async move {
+                        attempted_runner.fetch_add(1, Ordering::SeqCst);
+                        Ok(CheckEvidence::Failing)
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("cached-only must not wait for admission")
+        .expect("cached-only admission result");
+
+        assert_eq!(observed, CheckEvidence::NotProduced);
+        assert_eq!(runner_calls.load(Ordering::SeqCst), 0);
+        flight
+            .invalidate_cached(422)
+            .expect("worker-style memo invalidation");
+        drop(admission);
+        assert_eq!(
+            flight
+                .cached_read_only(422, &targets)
+                .expect("memo lookup after invalidation"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn run_allowed_cached_hit_waits_for_admission_and_rechecks_memo() {
+        let flight = Arc::new(CheckFlight::new(CHECK_EVIDENCE_TTL, 1));
+        let targets = check_targets("/tmp/run-allowed-admission", "head-a");
+        let primed = flight
+            .get_or_run(423, targets.clone(), |_| async {
+                Ok(CheckEvidence::Passed)
+            })
+            .await
+            .expect("prime cached evidence");
+        assert_eq!(primed, CheckEvidence::Passed);
+
+        let admission = flight
+            .acquire_admission(423)
+            .await
+            .expect("hold worker-style admission");
+        let runner_calls = Arc::new(AtomicUsize::new(0));
+        let waiter_flight = Arc::clone(&flight);
+        let waiter_targets = targets.clone();
+        let attempted_runner = Arc::clone(&runner_calls);
+        let mut cached_hit = tokio::spawn(async move {
+            waiter_flight
+                .get_or_run(423, waiter_targets, move |_| {
+                    let attempted_runner = Arc::clone(&attempted_runner);
+                    async move {
+                        attempted_runner.fetch_add(1, Ordering::SeqCst);
+                        Ok(CheckEvidence::Failing)
+                    }
+                })
+                .await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut cached_hit)
+                .await
+                .is_err(),
+            "a RunAllowed cached hit must wait behind the admission gate"
+        );
+        flight
+            .invalidate_cached(423)
+            .expect("worker-style memo invalidation");
+        drop(admission);
+
+        let evidence = cached_hit
+            .await
+            .expect("cached-hit task joins")
+            .expect("RunAllowed result after invalidation");
+        assert_eq!(evidence, CheckEvidence::Failing);
+        assert_eq!(runner_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
