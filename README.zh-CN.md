@@ -193,7 +193,7 @@ Weft 适合已经在本机使用 Coding Agent CLI，并且经常让一项需求�
   <img src="assets/diagrams/arch-zh.png" alt="Weft 当前本地优先架构：桌面端和 IM 投影本地控制面，底层连接原生 Coding Agent、仓库 Worktree、本地持久化状态和外部代码托管事实" width="940" />
 </p>
 
-<p align="center"><sub>桌面端和 IM 负责交互；控制、执行和持久化留在本机，代码托管平台事实按需查询。</sub></p>
+<p align="center"><sub>桌面端和 IM 负责交互；控制、执行和持久化留在本机，代码托管平台事实由后台定期轮询更新。</sub></p>
 
 Rust 后端管理本地 SQLite 状态库、Git Worktree 生命周期、Headless Agent 进程、权限注册中心、
 Thread Bus、IM 桥、Skill 源、电源管理、加密 `weft.db` 快照、Computer Use 和 Sidecar 观测。React 前端

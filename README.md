@@ -236,7 +236,7 @@ agents themselves, or production-operations controls.
   <img src="assets/diagrams/arch-en.png" alt="Weft current local-first architecture: desktop and IM surfaces project a local control plane over native coding agents, repository worktrees, durable state, and external code-host facts" width="940" />
 </p>
 
-<p align="center"><sub>Current architecture: local control and execution, with external code-host facts queried on demand.</sub></p>
+<p align="center"><sub>Current architecture: local control and execution, with external code-host facts refreshed by periodic background polling.</sub></p>
 
 The Rust backend owns the local SQLite store, Git worktree lifecycle, headless
 agent processes, permission registry, local thread bus, IM bridge, Skill sources,
