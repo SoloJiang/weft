@@ -459,8 +459,9 @@ test("plan status change synchronously hides an otherwise ready verdict", async 
   );
 });
 
-test("same-status proposal re-proposal synchronously hides an otherwise ready verdict", async () => {
+test("WorkspaceKanban same-status proposal re-proposal synchronously hides an otherwise ready verdict", async () => {
   const { buildReadinessKey, selectVisibleReadiness } = await loadReadinessKey();
+  const source = readFileSync(workspaceKanbanPath, "utf8");
   const base = {
     directions: [{ id: 17, status: "review" }],
     attentionIds: [],
@@ -479,6 +480,12 @@ test("same-status proposal re-proposal synchronously hides an otherwise ready ve
   const ready = { kind: "ready" as const, dto: { readiness: "review_ready", reasons: [] } };
   const stored = { threadId: 17, key: initialKey, state: ready };
 
+  assert.match(
+    source,
+    /const planReadinessSignature =\s*o\.plan_status === null\s*\?\s*null\s*:\s*`\$\{o\.plan_status\}:\$\{o\.plan_created_at \?\? ""\}`;/,
+    "the workspace card includes a stable empty version fallback for legacy plan payloads",
+  );
+  assert.match(source, /planStatus:\s*planReadinessSignature,/);
   assert.notEqual(
     initialKey,
     reProposedKey,

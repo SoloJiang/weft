@@ -221,6 +221,8 @@ function ThreadCard({
     id,
     status: o.statuses[index] ?? "",
   }));
+  const planReadinessSignature =
+    o.plan_status === null ? null : `${o.plan_status}:${o.plan_created_at ?? ""}`;
   const readinessKey = buildReadinessKey({
     directions: readinessDirections,
     attentionIds: threadAttentionIds(o, attentionItems),
@@ -231,7 +233,7 @@ function ThreadCard({
       sessionId: session.info.session_id,
       status: session.status,
     })),
-    planStatus: o.plan_status,
+    planStatus: planReadinessSignature,
     prRevision: prReadinessRevision,
   });
   const visibleReadiness = selectVisibleReadiness(storedReadiness, o.thread_id, readinessKey);
