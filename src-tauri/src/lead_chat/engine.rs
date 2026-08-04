@@ -2204,11 +2204,27 @@ pub struct EngineInner {
     /// current generation and revokes only on a match — see
     /// `computer_srv::revoke_computer_session_token_generation`.
     ///
+    /// ACP additionally keeps [`Self::acp_route_gen`], because its route
+    /// outlives individual turns while the mint does not.
+    ///
     /// Set for ALL FOUR engine shapes. Three receive it through
     /// `Injection::computer_generation` in [`refresh_computer_injection`]; ACP,
     /// whose bearer never travels through an `Injection` at all, receives it
     /// from `bus::inject::AcpMcpInjection` at session establishment.
     pub computer_gen: Option<u64>,
+    /// The generation the CURRENT ACP route owns, shared with the consumer that
+    /// will revoke it when the backend dies. `0` means "none". `None` on every
+    /// non-ACP engine.
+    ///
+    /// A cell rather than a value because the two move on different clocks:
+    /// `spawn_acp_turn` re-mints on EVERY turn, but a consumer is spawned only
+    /// when the route is new (`need_sub`). A consumer holding a snapshot taken
+    /// at turn 1 would, at exit, compare-and-revoke a long-superseded
+    /// generation — a silent no-op that leaves the LAST injected URL usable.
+    /// Updating the cell in place on each resume keeps "what this route owns"
+    /// true, while still being per-route: a genuinely new route gets a NEW cell,
+    /// so a lingering old consumer can never reach the replacement's bearer.
+    pub acp_route_gen: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     pub system_prompt: String,
     pub native_id: Option<String>,
     /// A mechanical digest of the thread's history, staged by an engine/model
@@ -5277,8 +5293,26 @@ async fn spawn_acp_turn(
     // generation it just minted, or an ACP teardown would have no bearer of its
     // own to revoke — see `EngineInner::computer_gen`.
     let computer_generation = mcp.computer_generation;
-    if computer_generation.is_some() {
-        eng.lock().await.computer_gen = computer_generation;
+    {
+        // Re-check cancellation HERE, not only at the entry gate. Reaching this
+        // point crossed `client()` and a thread lookup, both awaits, so a Stop
+        // can have completed — and revoked — in between. The mint above already
+        // rotated a fresh, VALID bearer for an engine the user just stopped,
+        // undoing that revoke; the codex connect arm re-checks for the identical
+        // reason. Revoke what we minted before failing, because the abort paths
+        // that would otherwise clean up cannot: the caller's rollback no-ops
+        // once Stop has reset the turn, and a resume that fails before
+        // subscription has no consumer to do it either.
+        let mut g = eng.lock().await;
+        let cancelled =
+            g.stopped || g.interrupting || expected_epoch.is_some_and(|e| e != g.reset_epoch);
+        if cancelled {
+            revoke_engine_generation(&g, computer_generation);
+            return Err(anyhow::anyhow!("engine stopped; not starting an ACP turn"));
+        }
+        if computer_generation.is_some() {
+            g.computer_gen = computer_generation;
+        }
     }
     let mcp = mcp.servers;
     let had_native = native.is_some();
@@ -5315,6 +5349,10 @@ async fn spawn_acp_turn(
                         // also pins the pooled client so it can never retire.
                         let _ = client.cancel(&id).await;
                         client.unsubscribe(&id).await;
+                        // Minted above for a session that never opened: no
+                        // consumer exists to revoke it at exit, and the route
+                        // just torn down was never subscribed under it.
+                        revoke_engine_generation_locked(&eng, computer_generation).await;
                         clear_acp_native_never_prompted(&app, &db, &eng, sid, thread_id_i).await;
                         return Err(anyhow::anyhow!("acp_session_open_failed"));
                     }
@@ -5326,6 +5364,9 @@ async fn spawn_acp_turn(
                 Ok(o) => o,
                 Err(e) => {
                     eprintln!("[weft][acp] session/new failed: {e}");
+                    // Same as the resume/load failure above: the mint happened,
+                    // the session did not, and nothing downstream will clean up.
+                    revoke_engine_generation_locked(&eng, computer_generation).await;
                     return Err(anyhow::anyhow!("acp_session_open_failed"));
                 }
             };
@@ -5382,6 +5423,27 @@ async fn spawn_acp_turn(
     // Always resubscribe when the runtime lost the route (child restart /
     // shutdown clears sessions) even if the engine still holds acp_client.
     let need_sub = !client.is_subscribed(&session_id).await;
+    // What THIS route owns, in a cell its consumer shares — see
+    // `EngineInner::acp_route_gen`. A new route gets a new cell (so a lingering
+    // old consumer can never reach the replacement's bearer); a resume of the
+    // live route updates the existing one in place, because the mint above
+    // rotated while that route's consumer kept running.
+    let route_gen_cell = {
+        let mut g = eng.lock().await;
+        if !need_sub {
+            if let (Some(generation), Some(cell)) = (computer_generation, g.acp_route_gen.as_ref())
+            {
+                cell.store(generation, std::sync::atomic::Ordering::SeqCst);
+            }
+            None
+        } else {
+            let cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                computer_generation.unwrap_or(0),
+            ));
+            g.acp_route_gen = Some(cell.clone());
+            Some(cell)
+        }
+    };
     if need_sub {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         client.subscribe(&session_id, tx).await?;
@@ -5392,13 +5454,13 @@ async fn spawn_acp_turn(
         // events from the abandoned session as live, appending or finalizing
         // stale text onto a session that was stopped or switched.
         let route_epoch = eng.lock().await.reset_epoch;
-        // The computer bearer THIS session was established with. Named
-        // explicitly rather than read from `computer_gen` when the consumer
-        // exits: a later session establishment re-stamps the engine, and
-        // revoking the stamp then would kill the replacement's live bearer.
+        // The computer bearer THIS route owns — read from the shared cell at
+        // exit, never from `computer_gen`: a later session establishment
+        // re-stamps the engine, and revoking the stamp then would kill the
+        // replacement's live bearer.
         // `revoke_computer_session_token_generation` no-ops on a superseded
         // generation, so a route that was replaced revokes nothing.
-        let route_generation = computer_generation;
+        let route_generation = route_gen_cell.clone();
         let (a, d, e, c, s) = (
             app.clone(),
             db.clone(),
@@ -5430,6 +5492,13 @@ async fn spawn_acp_turn(
         // next send reuses a stale-epoch consumer that drops every update.
         let _ = client.cancel(&session_id).await;
         client.unsubscribe(&session_id).await;
+        // The unsubscribe above ends this route's consumer, which is what would
+        // otherwise revoke — but it revokes what the CELL holds, and if this
+        // turn resumed a live route that cell is shared with a session the Stop
+        // is tearing down anyway. Revoke what THIS turn minted, by name, so the
+        // path is right whether the route was new or reused. Compare-and-revoke
+        // makes the consumer's own attempt inert rather than double-counting.
+        revoke_engine_generation_locked(&eng, computer_generation).await;
         // First open never got session/prompt — drop native id so the next
         // send re-opens and still prepends the system prompt.
         if prior_native.is_none() {
@@ -6054,9 +6123,10 @@ async fn acp_consumer(
     // caller BEFORE this task was spawned, so it names the session that created
     // the route rather than whatever won a race afterwards.
     start_epoch: u64,
-    // The computer bearer generation this ACP session was established with, for
-    // the same reason and captured at the same moment — see the spawn site.
-    route_generation: Option<u64>,
+    // The generation this ACP route owns, shared with the turn path so a resume
+    // can update it in place — see `EngineInner::acp_route_gen`. Read at exit,
+    // never snapshotted here.
+    route_generation: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 ) {
     use super::proto::ChatEvent;
     use crate::acp::runtime::SessionEvent;
@@ -6496,12 +6566,16 @@ async fn acp_consumer(
     // `session_is_live` true — an orphan holding the URL keeps desktop access
     // under a standing Full/Always grant.
     //
-    // Scoped to the generation THIS route was established with, so a session
+    // Scoped to the generation THIS route owns — read now, so a resume that
+    // re-minted mid-route is accounted for — and compare-and-revoke, so a route
     // that was already replaced revokes nothing (the replacement's own mint
     // rotated ours away long before). A retiring Stop reaches the same
     // generation through `stop_quiet`; both are compare-and-revoke, so whichever
     // lands second is inert.
-    revoke_engine_generation_locked(&eng, route_generation).await;
+    let owned = route_generation
+        .map(|cell| cell.load(std::sync::atomic::Ordering::SeqCst))
+        .filter(|generation| *generation != 0);
+    revoke_engine_generation_locked(&eng, owned).await;
     let _ = client; // keep handle for permission replies while loop runs
 }
 
@@ -10332,6 +10406,7 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
         computer_args: vec![],
         computer_env: vec![],
         computer_gen: None,
+        acp_route_gen: None,
         system_prompt: String::new(),
         native_id: None,
         pending_context_digest: None,
@@ -14016,6 +14091,75 @@ mod tests {
         );
     }
 
+    /// An ACP route's generation moves under its consumer. `spawn_acp_turn`
+    /// re-mints on EVERY turn, but a consumer is spawned only when the route is
+    /// new — so a consumer holding a turn-1 snapshot would, at exit,
+    /// compare-and-revoke a superseded value and change nothing, leaving the
+    /// LAST injected URL live. The shared cell is what keeps "what this route
+    /// owns" true across resumes.
+    #[tokio::test]
+    async fn an_acp_resume_updates_the_generation_its_consumer_will_revoke() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let mut inner = test_inner("omp");
+        let _turn_one = mint_bearer_for(&mut inner, 952_501);
+        // The route is established: cell created, consumer holds a clone.
+        let cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            inner.computer_gen.unwrap_or(0),
+        ));
+        let held_by_consumer = cell.clone();
+
+        // Turn 2 resumes the SAME route, which re-mints.
+        let turn_two = crate::bus::computer_srv::rotate_and_mint_computer_session_token(
+            inner.thread_id,
+            &inner.ask_dir,
+            inner.worktree_id,
+        );
+        inner.computer_gen = Some(turn_two.generation);
+        cell.store(turn_two.generation, SeqCst);
+
+        // The backend dies; the consumer reads its cell and revokes.
+        let owned = Some(held_by_consumer.load(SeqCst)).filter(|g| *g != 0);
+        revoke_engine_generation(&inner, owned);
+
+        assert!(
+            !bearer_is_live(&inner, &turn_two.token),
+            "the consumer must revoke the generation the route owns NOW, not the one it opened with"
+        );
+    }
+
+    /// A brand-new route gets a NEW cell, so a lingering consumer from the old
+    /// route cannot reach the replacement's bearer through the shared one.
+    #[tokio::test]
+    async fn a_new_acp_route_gets_its_own_cell_so_the_old_consumer_cannot_reach_it() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let mut inner = test_inner("omp");
+        let _old = mint_bearer_for(&mut inner, 952_601);
+        let old_cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            inner.computer_gen.unwrap_or(0),
+        ));
+
+        // A genuinely new route: fresh mint, fresh cell.
+        let new_route = crate::bus::computer_srv::rotate_and_mint_computer_session_token(
+            inner.thread_id,
+            &inner.ask_dir,
+            inner.worktree_id,
+        );
+        inner.computer_gen = Some(new_route.generation);
+        let _new_cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            new_route.generation,
+        ));
+
+        // The OLD consumer finally exits, reading its own (untouched) cell.
+        revoke_engine_generation(&inner, Some(old_cell.load(SeqCst)));
+
+        assert!(
+            bearer_is_live(&inner, &new_route.token),
+            "the replacement route's bearer must survive the predecessor's consumer"
+        );
+    }
+
     /// Revoking an identity that never minted is a no-op, so the uniform
     /// teardown costs nothing for engines that never had the tool — a
     /// concierge/curator lead, or a worker with an unresolved worktree. Guards
@@ -14465,6 +14609,7 @@ mod tests {
             computer_args: vec![],
             computer_env: vec![],
             computer_gen: None,
+            acp_route_gen: None,
             system_prompt: "be lead".into(),
             native_id: None,
             pending_context_digest: None,
