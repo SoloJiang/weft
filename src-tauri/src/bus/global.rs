@@ -365,6 +365,7 @@ async fn issue_status(
     let readiness = crate::readiness::collect_with_check_execution(
         db,
         bus,
+        asks,
         tid,
         crate::readiness::CheckExecution::CachedOnly,
     )
@@ -1332,6 +1333,8 @@ mod tests {
             serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["open_asks_count"], 2);
         assert_eq!(parsed["title"], "issue");
+        assert_eq!(parsed["readiness"]["readiness"], "needs_you");
+        assert_eq!(parsed["readiness"]["reasons"][0]["code"], "open_need");
     }
 
     #[test]

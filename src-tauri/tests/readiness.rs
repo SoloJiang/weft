@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use tempfile::TempDir;
+use weft::ask::AskRegistry;
 use weft::bus::BusRegistry;
 use weft::host::{CiStatus, ConflictStatus, ReviewStatus, ThreadStatus, UpstreamStatus};
 use weft::materialize::materialize_direction;
@@ -18,6 +19,7 @@ struct Fixture {
     _temp: TempDir,
     db: Db,
     bus: BusRegistry,
+    asks: AskRegistry,
     thread_id: i32,
     direction_id: i32,
     repo_id: i32,
@@ -202,6 +204,7 @@ async fn fixture_for_repo(temp: TempDir, repo_path: PathBuf, plan_status: Option
         _temp: temp,
         db,
         bus: BusRegistry::new(),
+        asks: AskRegistry::new(),
         thread_id: thread.id,
         direction_id: direction.id,
         repo_id: repo_ref.id,
@@ -456,7 +459,9 @@ async fn zero_lanes_is_unknown_not_review_ready() {
     let thread = repo::create_thread(&db, workspace.id, "empty issue", "feature", "claude")
         .await
         .expect("thread");
-    let result = weft::readiness::collect(&db, &BusRegistry::new(), thread.id)
+    let bus = BusRegistry::new();
+    let asks = AskRegistry::new();
+    let result = weft::readiness::collect(&db, &bus, &asks, thread.id)
         .await
         .expect("readiness");
 
@@ -468,7 +473,7 @@ async fn zero_lanes_is_unknown_not_review_ready() {
 #[tokio::test]
 async fn review_lane_without_inferred_checks_is_unknown() {
     let fixture = fixture(None).await;
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -521,7 +526,7 @@ async fn tool_error_does_not_fail_a_worker_turn_with_completed_assistant_text() 
         .expect("completed worker idle status");
     add_passing_build_script(&fixture).await;
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -569,7 +574,7 @@ async fn assistant_text_error_fails_a_worker_turn_despite_completed_tool_row() {
     .await
     .expect("failed assistant row");
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -588,7 +593,7 @@ async fn working_lane_skips_checks_until_it_claims_completion() {
     // would be ChecksFailing. In-progress lanes must instead skip execution.
     add_failing_build_script(&fixture).await;
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -608,7 +613,7 @@ async fn open_ask_short_circuits_a_hanging_check_runner() {
 
     let result = tokio::time::timeout(
         Duration::from_millis(500),
-        weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id),
+        weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id),
     )
     .await
     .expect("open ask readiness must not wait for the hanging command")
@@ -645,7 +650,7 @@ async fn occupied_review_worker_statuses_skip_hanging_checks_until_idle() {
 
         let occupied = tokio::time::timeout(
             Duration::from_millis(500),
-            weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id),
+            weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id),
         )
         .await
         .expect("occupied-worker readiness must not wait for the hanging command")
@@ -664,7 +669,7 @@ async fn occupied_review_worker_statuses_skip_hanging_checks_until_idle() {
         add_passing_build_script(&fixture).await;
         let idle = tokio::time::timeout(
             Duration::from_secs(3),
-            weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id),
+            weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id),
         )
         .await
         .expect("idle-worker readiness must complete")
@@ -682,7 +687,7 @@ async fn queued_lane_without_worktree_is_vacuously_in_progress() {
         .await
         .expect("queued status");
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -698,7 +703,7 @@ async fn working_lane_without_worktree_is_remote_unknown() {
         .await
         .expect("working status");
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -715,7 +720,7 @@ async fn claimed_completion_failing_checks_remain_blocked() {
             .expect("claimed completion status");
         add_failing_build_script(&fixture).await;
 
-        let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+        let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
             .await
             .expect("readiness");
 
@@ -733,10 +738,10 @@ async fn concurrent_board_collects_share_one_real_check_run() {
     let fixture = fixture(None).await;
     let counter = add_counting_build_script(&fixture).await;
     let (one, two, three, four) = tokio::join!(
-        weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id),
-        weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id),
-        weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id),
-        weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id),
+        weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id),
+        weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id),
+        weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id),
+        weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id),
     );
     for result in [one, two, three, four] {
         assert_eq!(
@@ -771,6 +776,7 @@ async fn cached_only_collection_without_a_memo_never_runs_a_rung() {
         weft::readiness::collect_with_check_execution(
             &fixture.db,
             &fixture.bus,
+            &fixture.asks,
             fixture.thread_id,
             CheckExecution::CachedOnly,
         ),
@@ -813,7 +819,7 @@ async fn mixed_lanes_aggregate_to_the_open_ask_verdict() {
         "choose a release note",
     );
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -830,7 +836,7 @@ async fn lead_scope_open_ask_blocks_an_otherwise_ready_issue() {
         .bus
         .ask_human(fixture.thread_id, weft::bus::LEAD, "confirm issue scope");
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -855,9 +861,74 @@ async fn unmapped_open_ask_scope_is_issue_wide_fail_closed() {
         "recover issue scope",
     );
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
+
+    assert_eq!(result.readiness, IssueReadiness::NeedsYou);
+    assert!(result.lanes.iter().any(|lane| {
+        lane.name == "issue ask"
+            && lane.readiness == LaneReadiness::NeedsYou
+            && lane.reasons.first().is_some_and(|reason| {
+                reason.code == ReasonCode::OpenNeed && reason.direction_id.is_none()
+            })
+    }));
+}
+
+#[tokio::test]
+async fn permission_ask_for_a_current_direction_blocks_that_lane() {
+    let fixture = fixture(None).await;
+    let (_id, _answer) = fixture.asks.request(
+        fixture.thread_id,
+        &fixture.direction_id.to_string(),
+        "shell",
+        "Run: protected command",
+        "protected command",
+        weft::ask::RiskLevel::Unknown,
+        "protected command",
+    );
+
+    let result = weft::readiness::collect(
+        &fixture.db,
+        &fixture.bus,
+        &fixture.asks,
+        fixture.thread_id,
+    )
+    .await
+    .expect("readiness");
+
+    assert_eq!(result.readiness, IssueReadiness::NeedsYou);
+    let lane = result
+        .lanes
+        .iter()
+        .find(|lane| lane.direction_id == fixture.direction_id)
+        .expect("permission ask lane");
+    assert_eq!(lane.readiness, LaneReadiness::NeedsYou);
+    assert_eq!(lane.reasons[0].code, ReasonCode::OpenNeed);
+    assert_eq!(lane.reasons[0].direction_id, Some(fixture.direction_id));
+}
+
+#[tokio::test]
+async fn stale_permission_scope_is_an_issue_wide_open_need() {
+    let fixture = fixture(None).await;
+    let (_id, _answer) = fixture.asks.request(
+        fixture.thread_id,
+        "retired-permission-direction",
+        "shell",
+        "Run: protected command",
+        "protected command",
+        weft::ask::RiskLevel::Unknown,
+        "protected command",
+    );
+
+    let result = weft::readiness::collect(
+        &fixture.db,
+        &fixture.bus,
+        &fixture.asks,
+        fixture.thread_id,
+    )
+    .await
+    .expect("readiness");
 
     assert_eq!(result.readiness, IssueReadiness::NeedsYou);
     assert!(result.lanes.iter().any(|lane| {
@@ -873,7 +944,7 @@ async fn unmapped_open_ask_scope_is_issue_wide_fail_closed() {
 async fn confirmed_policy_allows_readiness() {
     let fixture = fixture(Some("confirmed")).await;
     add_passing_build_script(&fixture).await;
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -883,7 +954,7 @@ async fn confirmed_policy_allows_readiness() {
 #[tokio::test]
 async fn proposed_policy_needs_gate() {
     let fixture = fixture(Some("proposed")).await;
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -892,10 +963,56 @@ async fn proposed_policy_needs_gate() {
 }
 
 #[tokio::test]
+async fn proposed_materialized_reuse_stays_gated_until_the_plan_is_confirmed() {
+    let fixture = fixture(None).await;
+    add_passing_build_script(&fixture).await;
+    let reused_lane = proposed_lane("reused implementation", "", fixture.direction_id);
+    persist_plan(
+        &fixture.db,
+        fixture.thread_id,
+        "proposed",
+        vec![reused_lane],
+    )
+    .await;
+
+    let proposed = weft::readiness::collect(
+        &fixture.db,
+        &fixture.bus,
+        &fixture.asks,
+        fixture.thread_id,
+    )
+    .await
+    .expect("proposed readiness");
+    assert_eq!(proposed.readiness, IssueReadiness::NeedsYou);
+    assert_eq!(proposed.reasons[0].code, ReasonCode::PolicyGatePending);
+
+    persist_plan(
+        &fixture.db,
+        fixture.thread_id,
+        "confirmed",
+        vec![proposed_lane(
+            "reused implementation",
+            "",
+            fixture.direction_id,
+        )],
+    )
+    .await;
+    let confirmed = weft::readiness::collect(
+        &fixture.db,
+        &fixture.bus,
+        &fixture.asks,
+        fixture.thread_id,
+    )
+    .await
+    .expect("confirmed readiness");
+    assert_eq!(confirmed.readiness, IssueReadiness::ReviewReady);
+}
+
+#[tokio::test]
 async fn withdrawn_plan_uses_the_legacy_direction_path() {
     let fixture = fixture(Some("withdrawn")).await;
     add_passing_build_script(&fixture).await;
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -927,7 +1044,7 @@ async fn proposal_decisions_enumerate_materialized_virtual_and_denied_lanes() {
     )
     .await;
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -970,7 +1087,7 @@ async fn unsupported_materialized_proposal_decision_needs_a_policy_gate() {
     )
     .await;
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -1005,7 +1122,9 @@ async fn all_pending_proposal_lanes_are_active_needs_you_lanes() {
     )
     .await;
 
-    let result = weft::readiness::collect(&db, &BusRegistry::new(), thread.id)
+    let bus = BusRegistry::new();
+    let asks = AskRegistry::new();
+    let result = weft::readiness::collect(&db, &bus, &asks, thread.id)
         .await
         .expect("readiness");
 
@@ -1026,7 +1145,7 @@ async fn empty_stored_proposal_fail_closes_existing_directions_to_a_gate() {
     let fixture = fixture(None).await;
     persist_plan(&fixture.db, fixture.thread_id, "proposed", Vec::new()).await;
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -1050,7 +1169,7 @@ async fn malformed_stored_proposal_json_fail_closes_existing_directions_to_a_gat
     .await
     .expect("persist malformed proposal");
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -1073,7 +1192,7 @@ async fn unreferenced_direction_in_a_parseable_proposal_remains_legacy_allowed()
     .await;
     add_passing_build_script(&fixture).await;
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -1102,7 +1221,7 @@ async fn missing_materialized_direction_becomes_a_remote_unknown_virtual_lane() 
     )
     .await;
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -1131,7 +1250,7 @@ async fn duplicate_proposal_reference_with_denial_excludes_the_direction() {
     )
     .await;
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -1155,7 +1274,7 @@ async fn persisted_merged_upstream_releases_the_consumer() {
         repo::upstream_merge_state(&fixture.db, fixture.direction_id).await,
         UpstreamStatus::Merged
     );
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -1184,7 +1303,7 @@ async fn persisted_pending_or_unregistered_upstream_blocks_the_consumer() {
             repo::upstream_merge_state(&fixture.db, fixture.direction_id).await,
             UpstreamStatus::Pending { .. }
         ));
-        let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+        let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
             .await
             .expect("readiness");
 
@@ -1214,7 +1333,7 @@ async fn merged_tracked_pr_outranks_an_unmet_upstream() {
         repo::upstream_merge_state(&fixture.db, fixture.direction_id).await,
         UpstreamStatus::Pending { .. }
     ));
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -1239,7 +1358,7 @@ async fn persisted_dangling_upstream_edge_is_remote_unknown() {
         repo::upstream_merge_state(&fixture.db, fixture.direction_id).await,
         UpstreamStatus::Unknown { .. }
     ));
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -1286,7 +1405,7 @@ async fn never_probed_pr_with_last_error_is_remote_unknown() {
     .await
     .expect("tracked pr");
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -1301,7 +1420,7 @@ async fn unbound_failing_pr_blocks_an_otherwise_ready_issue() {
     let checked_at = unix_secs();
     insert_unbound_pr(&fixture, 801, "open", CiStatus::Failing, &checked_at).await;
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -1328,7 +1447,7 @@ async fn stale_unbound_pr_is_remote_unknown() {
     let fixture = fixture(None).await;
     insert_unbound_pr(&fixture, 802, "open", CiStatus::Passing, "1").await;
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -1349,7 +1468,7 @@ async fn merged_clear_unbound_pr_does_not_change_ready_issue() {
     add_passing_build_script(&fixture).await;
     insert_unbound_pr(&fixture, 803, "merged", CiStatus::Passing, "").await;
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 
@@ -1369,7 +1488,7 @@ async fn merged_tracked_pr_keeps_a_reclaimed_done_lane_review_ready() {
     // is unknown reconciliation evidence, which terminal merge must outrank.
     remove_registered_worktree_directories(&fixture).await;
 
-    let ready = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let ready = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness after worktree reclaim");
     assert_eq!(ready.readiness, IssueReadiness::ReviewReady);
@@ -1379,7 +1498,7 @@ async fn merged_tracked_pr_keeps_a_reclaimed_done_lane_review_ready() {
         &fixture.direction_id.to_string(),
         "acknowledge post-merge follow-up",
     );
-    let needs_you = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let needs_you = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness with post-merge ask");
     assert_eq!(needs_you.readiness, IssueReadiness::NeedsYou);
@@ -1401,7 +1520,7 @@ async fn branch_mismatch_is_execution_drift() {
         .await
         .expect("direction branch update");
 
-    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
         .expect("readiness");
 

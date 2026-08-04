@@ -22,7 +22,9 @@
 //! | parseable proposal, pending (`decision == ""`) lane with `direction_id == 0` | virtual `NeedsGate` lane, so `NeedsYou[PolicyGatePending]` |
 //! | parseable proposal, approved lane with `direction_id == 0` | virtual `AllowedByPolicy` lane with no execution evidence, so `Unknown[InProgress]` |
 //! | parseable proposal, unsupported decision with `direction_id == 0` | virtual `NeedsGate` lane, so `NeedsYou[PolicyGatePending]` |
-//! | parseable proposal, `decision == ""` or `"approved"` with `direction_id != 0` | the materialized direction with `AllowedByPolicy` |
+//! | parseable `confirmed` proposal, `decision == ""` with `direction_id != 0` | the materialized direction with `AllowedByPolicy` for idempotent confirm/re-dispatch |
+//! | parseable `proposed` proposal, `decision == ""` with `direction_id != 0` | the materialized direction with `NeedsGate`, including a reverted automatic reuse approval |
+//! | parseable proposal, `decision == "approved"` with `direction_id != 0` | the materialized direction with `AllowedByPolicy` |
 //! | parseable proposal, unsupported decision with `direction_id != 0` | the materialized direction with `NeedsGate`; it remains visible rather than being denied |
 //! | persisted direction not referenced by any proposal lane | legacy `AllowedByPolicy` lane |
 //! | present plan with an invalid, empty, or unsupported proposal | every persisted direction is conservatively `NeedsGate` |
@@ -42,17 +44,18 @@
 //! When their same deterministic PR reduction is non-clear, collection adds a
 //! virtual `unbound PR` lane to issue aggregation. Its reason carries no
 //! `direction_id`; an all-clear unbound PR adds no lane and cannot make an
-//! issue ready on its own. Likewise, an open bus ask whose scope cannot be
-//! mapped to a persisted direction is collected as one virtual `issue ask`
-//! lane. `lead` and the legacy empty scope are durable issue-level identities;
-//! an unknown non-numeric or dangling numeric scope is treated the same way
-//! fail-closed, rather than being dropped.
+//! issue ready on its own. Likewise, an open durable BusRegistry human ask or
+//! ephemeral AskRegistry permission ask whose scope cannot be mapped to a
+//! persisted direction is collected as one virtual `issue ask` lane. `lead`
+//! and the legacy empty scope are issue-level identities; an unknown
+//! non-numeric or dangling numeric scope is treated the same way fail-closed,
+//! rather than being dropped.
 //!
 //! | Lane facts, evaluated in this exact first-match order | Lane readiness | Reason |
 //! | --- | --- | --- |
 //! | inactive/cancelled, or policy denied | omitted | — |
 //! | most recent worker turn ended `error` | Failed | WorkerFailed |
-//! | answerable bus ask is open for the direction | NeedsYou | OpenNeed |
+//! | answerable BusRegistry or AskRegistry ask is open for the direction | NeedsYou | OpenNeed |
 //! | policy needs a human gate | NeedsYou | PolicyGatePending |
 //! | latest worker session is `running`, `starting`, or `stopped` while direction status is `review` or `done` | Unknown | InProgress |
 //! | at least one tracked PR is `merged`, and the deterministic reduction of every tracked PR is clear | ReviewReady | — |
@@ -147,15 +150,19 @@
 //! match the newly collected values; any HEAD change immediately reruns checks.
 //! A dirty worktree invalidates any prior entry and is intentionally
 //! uncacheable, so uncommitted changes can never inherit a previously passing
-//! result. Requests that observed the same dirty signature while its one
-//! execution is still in flight share that execution only; its result is
-//! discarded as soon as the flight completes. Each worktree's HEAD, branch,
-//! and dirty-state facts come from one bounded Git signature sample with a
-//! 15-second total deadline. It uses the same Tokio-child, process-group, and
-//! kill-on-timeout discipline as check execution, rather than a blocking
-//! `Command::output` call. A failed or timed-out sample is unavailable
-//! evidence: reconciliation is unknown, checks are `NotProduced`, and no old
-//! cache entry may be reused or written as `Passed`.
+//! result. Run-allowed collection samples every target again after its runner
+//! returns and before it publishes evidence: a failed post-run sample or any
+//! path/HEAD/dirty mismatch invalidates the memo and publishes `NotProduced`
+//! to the leader and matching followers. Requests that observed the same dirty
+//! signature while its one execution is still in flight share that execution
+//! only; its result is discarded as soon as the flight completes. Each
+//! worktree's HEAD, branch, and dirty-state facts come from one bounded Git
+//! signature sample with a 15-second total deadline. It uses the same
+//! Tokio-child, process-group, and kill-on-timeout discipline as check
+//! execution, rather than a blocking `Command::output` call. A failed or
+//! timed-out sample is unavailable evidence: reconciliation is unknown,
+//! checks are `NotProduced`, and no old cache entry may be reused or written
+//! as `Passed`. Cache-only callers do not execute or post-sample checks.
 //!
 //! The desktop `issue_readiness` command collects with `RunAllowed`. The
 //! read-only global `issue_status` bus tool instead uses `CachedOnly`: it may
@@ -207,6 +214,7 @@
 //! backend absence is reported by its specific fail-closed code
 //! (`RemoteUnknown` or `ChecksUnknown`) rather than by a lossy generic flag.
 
+use crate::ask::AskRegistry;
 use crate::bus::BusRegistry;
 use crate::host::{
     CiStatus, ConflictStatus, PrLifecycle, ReviewStatus, ThreadStatus, UpstreamStatus,
@@ -732,12 +740,22 @@ pub fn issue_readiness(lane_facts: &[LaneFacts]) -> IssueReadinessDto {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProposalPolicyPhase {
+    Proposed,
+    Confirmed,
+}
+
 enum PlannedLaneSource {
     /// No live plan policy applies: persisted directions retain the established
     /// single-repo/legacy allowed path.
     Legacy,
-    /// A durable proposal whose individual lane decisions are authoritative.
-    Parsed(Vec<crate::planner::ProposedDirection>),
+    /// A durable proposal whose phase and individual lane decisions are
+    /// authoritative.
+    Parsed {
+        phase: ProposalPolicyPhase,
+        lanes: Vec<crate::planner::ProposedDirection>,
+    },
     /// A plan exists but cannot safely be understood as lane policy.
     Unavailable,
 }
@@ -749,14 +767,19 @@ fn planned_lane_source(plan: Option<&plan::Model>) -> PlannedLaneSource {
     if plan.status == "withdrawn" {
         return PlannedLaneSource::Legacy;
     }
-    if !matches!(plan.status.as_str(), "proposed" | "confirmed") {
-        return PlannedLaneSource::Unavailable;
-    }
+    let phase = match plan.status.as_str() {
+        "proposed" => ProposalPolicyPhase::Proposed,
+        "confirmed" => ProposalPolicyPhase::Confirmed,
+        _ => return PlannedLaneSource::Unavailable,
+    };
     let proposal = match serde_json::from_str::<crate::planner::Proposal>(&plan.proposal) {
         Ok(proposal) if !proposal.directions.is_empty() => proposal,
         Ok(_) | Err(_) => return PlannedLaneSource::Unavailable,
     };
-    PlannedLaneSource::Parsed(proposal.directions)
+    PlannedLaneSource::Parsed {
+        phase,
+        lanes: proposal.directions,
+    }
 }
 
 fn direction_is_active(direction: &direction::Model) -> bool {
@@ -771,11 +794,15 @@ fn worker_active_preempts_completion(worker_active: bool, direction_status: &str
     worker_active && direction_claimed_completion(direction_status)
 }
 
-fn proposal_lane_policy(proposed_lane: &crate::planner::ProposedDirection) -> PolicyDecision {
+fn proposal_lane_policy(
+    phase: ProposalPolicyPhase,
+    proposed_lane: &crate::planner::ProposedDirection,
+) -> PolicyDecision {
     match proposed_lane.decision.as_str() {
         "denied" => PolicyDecision::Denied,
         "" if proposed_lane.direction_id == 0 => PolicyDecision::NeedsGate,
-        "" | "approved" => PolicyDecision::AllowedByPolicy,
+        "" if phase == ProposalPolicyPhase::Confirmed => PolicyDecision::AllowedByPolicy,
+        "approved" => PolicyDecision::AllowedByPolicy,
         _ => PolicyDecision::NeedsGate,
     }
 }
@@ -1036,6 +1063,18 @@ impl CheckFlight {
         ))
     }
 
+    /// Drop every memo for a direction after a run no longer matches the
+    /// signature it started from. A later caller must establish fresh evidence
+    /// instead of reviving a result from before the mutation interval.
+    fn invalidate_cached(&self, direction_id: i32) -> Result<()> {
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow!("readiness check cache lock poisoned"))?;
+        cache.remove(&direction_id);
+        Ok(())
+    }
+
     fn claim_inflight(
         &self,
         direction_id: i32,
@@ -1148,15 +1187,40 @@ impl CheckFlight {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn get_or_run<F, Fut>(
         &self,
         direction_id: i32,
-        mut targets: Vec<CheckTarget>,
+        targets: Vec<CheckTarget>,
         runner: F,
     ) -> Result<CheckEvidence>
     where
         F: FnOnce(Vec<String>) -> Fut,
         Fut: Future<Output = Result<CheckEvidence>>,
+    {
+        let stable_targets = targets.clone();
+        self.get_or_run_with_post_targets(direction_id, targets, runner, move |_| async move {
+            Ok(stable_targets)
+        })
+        .await
+    }
+
+    /// Run checks under the direction lock, then validate that every target is
+    /// still the exact path/HEAD/dirty signature the runner observed. The
+    /// runner permit intentionally lives only inside the execution block so
+    /// bounded Git re-sampling cannot consume one of the two execution slots.
+    async fn get_or_run_with_post_targets<F, Fut, S, SFut>(
+        &self,
+        direction_id: i32,
+        mut targets: Vec<CheckTarget>,
+        runner: F,
+        post_targets: S,
+    ) -> Result<CheckEvidence>
+    where
+        F: FnOnce(Vec<String>) -> Fut,
+        Fut: Future<Output = Result<CheckEvidence>>,
+        S: FnOnce(Vec<CheckTarget>) -> SFut,
+        SFut: Future<Output = Result<Vec<CheckTarget>>>,
     {
         Self::sort_targets(&mut targets);
         if let Some(evidence) = self.cached(direction_id, &targets)? {
@@ -1187,16 +1251,35 @@ impl CheckFlight {
                         return Ok(evidence);
                     }
 
-                    let _runner_permit = self
-                        .runner_limit
-                        .acquire()
-                        .await
-                        .map_err(|_| anyhow!("readiness check runner semaphore closed"))?;
-                    let paths = targets.iter().map(|target| target.path.clone()).collect();
-                    let shared_result = match runner(paths).await {
-                        Ok(evidence) => match self.cache_result(direction_id, &targets, evidence) {
-                            Ok(()) => Ok(evidence),
-                            Err(error) => Err(error.to_string()),
+                    let runner_result = {
+                        let _runner_permit = self
+                            .runner_limit
+                            .acquire()
+                            .await
+                            .map_err(|_| anyhow!("readiness check runner semaphore closed"))?;
+                        let paths = targets.iter().map(|target| target.path.clone()).collect();
+                        runner(paths).await
+                    };
+                    let shared_result = match runner_result {
+                        Ok(evidence) => match post_targets(targets.clone()).await {
+                            Ok(mut observed_targets) => {
+                                Self::sort_targets(&mut observed_targets);
+                                if observed_targets == targets {
+                                    match self.cache_result(direction_id, &targets, evidence) {
+                                        Ok(()) => Ok(evidence),
+                                        Err(error) => Err(error.to_string()),
+                                    }
+                                } else {
+                                    match self.invalidate_cached(direction_id) {
+                                        Ok(()) => Ok(CheckEvidence::NotProduced),
+                                        Err(error) => Err(error.to_string()),
+                                    }
+                                }
+                            }
+                            Err(_) => match self.invalidate_cached(direction_id) {
+                                Ok(()) => Ok(CheckEvidence::NotProduced),
+                                Err(error) => Err(error.to_string()),
+                            },
                         },
                         Err(error) => Err(error.to_string()),
                     };
@@ -1392,6 +1475,27 @@ fn check_targets_for_worktrees(worktrees: &[ProbedWorktree]) -> Option<Vec<Check
     Some(targets)
 }
 
+/// Re-sample every path that a readiness runner just touched. The resulting
+/// signature deliberately excludes branch because CheckFlight evidence is
+/// keyed by its path, HEAD, and dirty state; reconciliation owns branch drift.
+async fn resample_check_targets(
+    targets: Vec<CheckTarget>,
+    git_probe: &GitSignatureProbe,
+) -> Result<Vec<CheckTarget>> {
+    let mut observed = Vec::with_capacity(targets.len());
+    for target in targets {
+        let path = target.path;
+        let signature = git_probe.sample(Path::new(&path)).await?;
+        observed.push(CheckTarget {
+            path,
+            head_sha: signature.head_sha,
+            dirty: signature.dirty,
+        });
+    }
+    Ok(observed)
+}
+
+#[cfg(test)]
 async fn checks_for_with_runner<F, Fut>(
     direction: &direction::Model,
     worktrees: &[ProbedWorktree],
@@ -1403,6 +1507,31 @@ where
     F: FnOnce(Vec<String>) -> Fut,
     Fut: Future<Output = Result<CheckEvidence>>,
 {
+    checks_for_with_runner_and_post_targets(
+        direction,
+        worktrees,
+        flight,
+        execution,
+        runner,
+        |targets| async move { Ok(targets) },
+    )
+    .await
+}
+
+async fn checks_for_with_runner_and_post_targets<F, Fut, S, SFut>(
+    direction: &direction::Model,
+    worktrees: &[ProbedWorktree],
+    flight: &CheckFlight,
+    execution: CheckExecution,
+    runner: F,
+    post_targets: S,
+) -> Result<CheckEvidence>
+where
+    F: FnOnce(Vec<String>) -> Fut,
+    Fut: Future<Output = Result<CheckEvidence>>,
+    S: FnOnce(Vec<CheckTarget>) -> SFut,
+    SFut: Future<Output = Result<Vec<CheckTarget>>>,
+{
     if !direction_claimed_completion(direction.status.as_str()) {
         return Ok(CheckEvidence::NotApplicable);
     }
@@ -1410,27 +1539,65 @@ where
     let Some(targets) = check_targets_for_worktrees(worktrees) else {
         return Ok(CheckEvidence::NotProduced);
     };
-    checks_for_targets_with_runner(flight, execution, direction.id, targets, runner).await
+    checks_for_targets_with_runner_and_post_targets(
+        flight,
+        execution,
+        direction.id,
+        targets,
+        runner,
+        post_targets,
+    )
+    .await
 }
 
 /// Apply the caller's authority boundary after the inexpensive target facts
 /// have been gathered. Cached-only callers deliberately do not wait on an
 /// in-flight runner: a pending execution is not persisted verification
 /// evidence for a read-only request.
+#[cfg(test)]
 async fn checks_for_targets_with_runner<F, Fut>(
     flight: &CheckFlight,
     execution: CheckExecution,
     direction_id: i32,
-    mut targets: Vec<CheckTarget>,
+    targets: Vec<CheckTarget>,
     runner: F,
 ) -> Result<CheckEvidence>
 where
     F: FnOnce(Vec<String>) -> Fut,
     Fut: Future<Output = Result<CheckEvidence>>,
 {
+    checks_for_targets_with_runner_and_post_targets(
+        flight,
+        execution,
+        direction_id,
+        targets,
+        runner,
+        |targets| async move { Ok(targets) },
+    )
+    .await
+}
+
+async fn checks_for_targets_with_runner_and_post_targets<F, Fut, S, SFut>(
+    flight: &CheckFlight,
+    execution: CheckExecution,
+    direction_id: i32,
+    mut targets: Vec<CheckTarget>,
+    runner: F,
+    post_targets: S,
+) -> Result<CheckEvidence>
+where
+    F: FnOnce(Vec<String>) -> Fut,
+    Fut: Future<Output = Result<CheckEvidence>>,
+    S: FnOnce(Vec<CheckTarget>) -> SFut,
+    SFut: Future<Output = Result<Vec<CheckTarget>>>,
+{
     CheckFlight::sort_targets(&mut targets);
     match execution {
-        CheckExecution::RunAllowed => flight.get_or_run(direction_id, targets, runner).await,
+        CheckExecution::RunAllowed => {
+            flight
+                .get_or_run_with_post_targets(direction_id, targets, runner, post_targets)
+                .await
+        }
         CheckExecution::CachedOnly => Ok(flight
             .cached_read_only(direction_id, &targets)?
             .unwrap_or(CheckEvidence::NotProduced)),
@@ -2132,13 +2299,15 @@ async fn checks_for(
     direction: &direction::Model,
     worktrees: &[ProbedWorktree],
     execution: CheckExecution,
+    git_probe: &GitSignatureProbe,
 ) -> Result<CheckEvidence> {
-    checks_for_with_runner(
+    checks_for_with_runner_and_post_targets(
         direction,
         worktrees,
         check_flight(),
         execution,
         |paths| async move { run_readiness_checks(paths, READINESS_CHECK_TIMEOUT).await },
+        move |targets| async move { resample_check_targets(targets, git_probe).await },
     )
     .await
 }
@@ -2228,11 +2397,31 @@ fn upstream_evidence(status: UpstreamStatus) -> UpstreamEvidence {
     }
 }
 
+/// Attribute a human or permission ask to one persisted direction only when
+/// its scope is a current numeric direction id for this thread. Everything
+/// else is issue-wide: a stale or unfamiliar ask must not disappear from
+/// delivery readiness just because it cannot be assigned precisely.
+fn collect_open_ask_scope(
+    scope: &str,
+    direction_ids: &HashSet<i32>,
+    open_ask_direction_ids: &mut HashSet<i32>,
+    has_issue_open_ask: &mut bool,
+) {
+    match scope.parse::<i32>() {
+        Ok(direction_id) if direction_ids.contains(&direction_id) => {
+            open_ask_direction_ids.insert(direction_id);
+        }
+        _ => {
+            *has_issue_open_ask = true;
+        }
+    }
+}
+
 async fn collect_lane(
     db: &Db,
     direction: &direction::Model,
     policy: PolicyDecision,
-    open_ask_direction_ids: &[i32],
+    open_ask_direction_ids: &HashSet<i32>,
     open_pr_snapshot_freshness: OpenPrSnapshotFreshness,
     check_execution: CheckExecution,
     git_probe: &GitSignatureProbe,
@@ -2276,7 +2465,7 @@ async fn collect_lane(
         reconciliation,
         &pull_requests,
         open_pr_snapshot_freshness,
-        || checks_for(direction, &worktrees, check_execution),
+        || checks_for(direction, &worktrees, check_execution, git_probe),
     )
     .await?;
     Ok(LaneFacts {
@@ -2337,8 +2526,13 @@ async fn collect_unbound_pr_lane(
 /// Collect live storage/process facts, then run the pure aggregation. This
 /// function performs no writes and deliberately reuses the existing local
 /// check runner and host parsers rather than inventing parallel semantics.
-pub async fn collect(db: &Db, bus: &BusRegistry, thread_id: i32) -> Result<IssueReadinessDto> {
-    collect_with_check_execution(db, bus, thread_id, CheckExecution::RunAllowed).await
+pub async fn collect(
+    db: &Db,
+    bus: &BusRegistry,
+    asks: &AskRegistry,
+    thread_id: i32,
+) -> Result<IssueReadinessDto> {
+    collect_with_check_execution(db, bus, asks, thread_id, CheckExecution::RunAllowed).await
 }
 
 /// Collect one issue with an explicit verification execution boundary. The
@@ -2347,6 +2541,7 @@ pub async fn collect(db: &Db, bus: &BusRegistry, thread_id: i32) -> Result<Issue
 pub async fn collect_with_check_execution(
     db: &Db,
     bus: &BusRegistry,
+    asks: &AskRegistry,
     thread_id: i32,
     check_execution: CheckExecution,
 ) -> Result<IssueReadinessDto> {
@@ -2357,22 +2552,23 @@ pub async fn collect_with_check_execution(
     let mut directions = repo::list_directions(db, thread_id).await?;
     directions.sort_by_key(|direction| direction.id);
     let direction_ids: HashSet<i32> = directions.iter().map(|direction| direction.id).collect();
-    let mut open_ask_direction_ids = Vec::new();
+    let mut open_ask_direction_ids = HashSet::new();
     let mut has_issue_open_ask = false;
     for ask in bus.open_asks(thread_id) {
-        match ask.from.parse::<i32>() {
-            Ok(direction_id) if direction_ids.contains(&direction_id) => {
-                open_ask_direction_ids.push(direction_id);
-            }
-            _ => {
-                // `crate::bus::LEAD` is the durable non-numeric "lead"
-                // identity, while repo::create_human_request also accepts the
-                // legacy empty scope for direction_id 0. An unknown scope (or
-                // a numeric id no longer in this thread) cannot safely be
-                // assigned to a lane, so it remains issue-wide fail-closed.
-                has_issue_open_ask = true;
-            }
-        }
+        collect_open_ask_scope(
+            &ask.from,
+            &direction_ids,
+            &mut open_ask_direction_ids,
+            &mut has_issue_open_ask,
+        );
+    }
+    for ask in asks.open_in(thread_id) {
+        collect_open_ask_scope(
+            &ask.dir,
+            &direction_ids,
+            &mut open_ask_direction_ids,
+            &mut has_issue_open_ask,
+        );
     }
     let open_pr_snapshot_freshness = current_open_pr_snapshot_freshness()?;
     let git_probe = GitSignatureProbe::readiness();
@@ -2411,7 +2607,10 @@ pub async fn collect_with_check_execution(
                 );
             }
         }
-        PlannedLaneSource::Parsed(proposal_lanes) => {
+        PlannedLaneSource::Parsed {
+            phase,
+            lanes: proposal_lanes,
+        } => {
             let referenced_direction_ids: HashSet<i32> = proposal_lanes
                 .iter()
                 .filter_map(|lane| (lane.direction_id != 0).then_some(lane.direction_id))
@@ -2421,7 +2620,7 @@ pub async fn collect_with_check_execution(
                 if proposed_lane.direction_id == 0 {
                     continue;
                 }
-                let policy = proposal_lane_policy(proposed_lane);
+                let policy = proposal_lane_policy(phase, proposed_lane);
                 materialized_policies
                     .entry(proposed_lane.direction_id)
                     .and_modify(|current| {
@@ -2436,7 +2635,7 @@ pub async fn collect_with_check_execution(
             let mut handled_direction_ids = HashSet::new();
 
             for proposed_lane in proposal_lanes {
-                let policy = proposal_lane_policy(&proposed_lane);
+                let policy = proposal_lane_policy(phase, &proposed_lane);
                 if proposed_lane.direction_id == 0 {
                     if policy == PolicyDecision::Denied {
                         continue;
@@ -3248,7 +3447,10 @@ mod tests {
         };
         assert!(matches!(
             planned_lane_source(Some(&confirmed)),
-            PlannedLaneSource::Parsed(lanes) if lanes.len() == 1
+            PlannedLaneSource::Parsed {
+                phase: ProposalPolicyPhase::Confirmed,
+                lanes,
+            } if lanes.len() == 1
         ));
 
         let withdrawn = plan::Model {
@@ -3269,6 +3471,80 @@ mod tests {
             planned_lane_source(Some(&empty)),
             PlannedLaneSource::Unavailable
         ));
+    }
+
+    #[test]
+    fn proposed_materialized_pending_lane_keeps_the_policy_gate_until_confirmed() {
+        let reused_lane = crate::planner::ProposedDirection {
+            name: "reused implementation".to_string(),
+            repo: "repo".to_string(),
+            reason: "reuse rollback fixture".to_string(),
+            mandate: "impl-only".to_string(),
+            base_branch: "main".to_string(),
+            decision: String::new(),
+            direction_id: 7,
+        };
+        assert_eq!(
+            proposal_lane_policy(ProposalPolicyPhase::Proposed, &reused_lane),
+            PolicyDecision::NeedsGate,
+            "a proposed materialized reuse lane must not bypass the human gate"
+        );
+        assert_eq!(
+            proposal_lane_policy(ProposalPolicyPhase::Confirmed, &reused_lane),
+            PolicyDecision::AllowedByPolicy,
+            "confirmed idempotent re-dispatch keeps the established allowed path"
+        );
+
+        let mut approved = reused_lane;
+        approved.decision = "approved".to_string();
+        assert_eq!(
+            proposal_lane_policy(ProposalPolicyPhase::Proposed, &approved),
+            PolicyDecision::AllowedByPolicy
+        );
+    }
+
+    #[test]
+    fn ask_scope_attribution_keeps_unknown_permission_scopes_issue_wide() {
+        let direction_ids = HashSet::from([7]);
+        let mut lane_asks = HashSet::new();
+        let mut has_issue_ask = false;
+
+        collect_open_ask_scope(
+            "7",
+            &direction_ids,
+            &mut lane_asks,
+            &mut has_issue_ask,
+        );
+        collect_open_ask_scope(
+            "",
+            &direction_ids,
+            &mut lane_asks,
+            &mut has_issue_ask,
+        );
+        collect_open_ask_scope(
+            "lead",
+            &direction_ids,
+            &mut lane_asks,
+            &mut has_issue_ask,
+        );
+        collect_open_ask_scope(
+            "999",
+            &direction_ids,
+            &mut lane_asks,
+            &mut has_issue_ask,
+        );
+        collect_open_ask_scope(
+            "permission-session",
+            &direction_ids,
+            &mut lane_asks,
+            &mut has_issue_ask,
+        );
+
+        assert_eq!(lane_asks, HashSet::from([7]));
+        assert!(
+            has_issue_ask,
+            "empty, lead, stale, and non-numeric permission scopes must not be dropped"
+        );
     }
 
     #[test]
@@ -3452,6 +3728,180 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 3);
     }
 
+    #[tokio::test]
+    async fn post_run_mutation_is_not_published_or_cached() {
+        let root = tempfile::tempdir().expect("temporary post-run mutation fixture");
+        std::fs::write(root.path().join("README.md"), "green\n").expect("write initial file");
+        git_in(root.path(), &["init", "--quiet"]);
+        git_in(
+            root.path(),
+            &["config", "user.email", "readiness@example.invalid"],
+        );
+        git_in(root.path(), &["config", "user.name", "Readiness Test"]);
+        git_in(root.path(), &["add", "README.md"]);
+        git_in(root.path(), &["commit", "--quiet", "-m", "fixture"]);
+
+        let stored_path = root.path().display().to_string();
+        let pre_targets = vec![sampled_check_target(root.path(), stored_path).await];
+        let changed_path = root.path().join("README.md");
+        let probe = GitSignatureProbe::readiness();
+        let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
+
+        let evidence = checks_for_targets_with_runner_and_post_targets(
+            &flight,
+            CheckExecution::RunAllowed,
+            88,
+            pre_targets.clone(),
+            move |_| async move {
+                std::fs::write(changed_path, "changed during readiness check\n")
+                    .map_err(|error| anyhow!("mutate check target: {error}"))?;
+                Ok(CheckEvidence::Passed)
+            },
+            move |targets| async move { resample_check_targets(targets, &probe).await },
+        )
+        .await
+        .expect("post-run mutation result");
+
+        assert_eq!(evidence, CheckEvidence::NotProduced);
+        assert_eq!(
+            flight
+                .cached_read_only(88, &pre_targets)
+                .expect("cache lookup after mutation"),
+            None,
+            "mutated checks must not leave a memo under their pre-run signature"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_post_run_probe_invalidates_existing_memo_and_returns_not_produced() {
+        let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
+        let old_targets = check_targets("/tmp/post-run-probe", "old-head");
+        let primed = flight
+            .get_or_run(89, old_targets.clone(), |_| async {
+                Ok(CheckEvidence::Passed)
+            })
+            .await
+            .expect("prime old memo");
+        assert_eq!(primed, CheckEvidence::Passed);
+
+        let pre_targets = check_targets("/tmp/post-run-probe", "new-head");
+        let evidence = flight
+            .get_or_run_with_post_targets(
+                89,
+                pre_targets,
+                |_| async { Ok(CheckEvidence::Failing) },
+                |_| async { Err(anyhow!("post-run Git probe failed")) },
+            )
+            .await
+            .expect("failed post-run probe becomes unavailable evidence");
+
+        assert_eq!(evidence, CheckEvidence::NotProduced);
+        assert_eq!(
+            flight
+                .cached_read_only(89, &old_targets)
+                .expect("old memo lookup"),
+            None,
+            "a failed post-run probe must invalidate every prior direction memo"
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_check_flight_followers_receive_not_produced_publication() {
+        let flight = Arc::new(CheckFlight::new(CHECK_EVIDENCE_TTL, 1));
+        let targets = check_targets("/tmp/post-run-followers", "head-a");
+        let sampling_started = Arc::new(tokio::sync::Notify::new());
+        let allow_sampling = Arc::new(tokio::sync::Notify::new());
+        let leader_flight = Arc::clone(&flight);
+        let leader_targets = targets.clone();
+        let leader_started = Arc::clone(&sampling_started);
+        let leader_allow = Arc::clone(&allow_sampling);
+        let leader = tokio::spawn(async move {
+            leader_flight
+                .get_or_run_with_post_targets(
+                    90,
+                    leader_targets,
+                    |_| async { Ok(CheckEvidence::Passed) },
+                    move |mut post_targets| async move {
+                        leader_started.notify_one();
+                        leader_allow.notified().await;
+                        post_targets[0].dirty = true;
+                        Ok(post_targets)
+                    },
+                )
+                .await
+        });
+
+        sampling_started.notified().await;
+        let follower = match flight
+            .claim_inflight(90, &targets)
+            .expect("claim matching follower")
+        {
+            CheckFlightClaim::Follower(receiver) => receiver,
+            CheckFlightClaim::Leader(_) | CheckFlightClaim::WaitForDifferentTargets(_) => {
+                panic!("matching target must subscribe as a follower")
+            }
+        };
+
+        allow_sampling.notify_one();
+        let leader = leader
+            .await
+            .expect("leader post-run task joins")
+            .expect("leader post-run result");
+        assert_eq!(leader, CheckEvidence::NotProduced);
+        assert_eq!(
+            CheckFlight::wait_for_inflight(follower)
+                .await
+                .expect("follower publication"),
+            CheckEvidence::NotProduced
+        );
+    }
+
+    #[tokio::test]
+    async fn post_run_sampling_does_not_hold_the_global_runner_permit() {
+        let flight = Arc::new(CheckFlight::new(CHECK_EVIDENCE_TTL, 1));
+        let sampling_started = Arc::new(tokio::sync::Notify::new());
+        let allow_sampling = Arc::new(tokio::sync::Notify::new());
+        let first_flight = Arc::clone(&flight);
+        let first_started = Arc::clone(&sampling_started);
+        let first_allow = Arc::clone(&allow_sampling);
+        let first = tokio::spawn(async move {
+            first_flight
+                .get_or_run_with_post_targets(
+                    90,
+                    check_targets("/tmp/post-run-first", "head-a"),
+                    |_| async { Ok(CheckEvidence::Passed) },
+                    move |targets| async move {
+                        first_started.notify_one();
+                        first_allow.notified().await;
+                        Ok(targets)
+                    },
+                )
+                .await
+        });
+
+        sampling_started.notified().await;
+        let second_flight = Arc::clone(&flight);
+        let second = tokio::time::timeout(
+            Duration::from_millis(250),
+            second_flight.get_or_run(
+                91,
+                check_targets("/tmp/post-run-second", "head-a"),
+                |_| async { Ok(CheckEvidence::Passed) },
+            ),
+        )
+        .await
+        .expect("post-run sampling must not retain the only runner permit")
+        .expect("second readiness check result");
+        assert_eq!(second, CheckEvidence::Passed);
+
+        allow_sampling.notify_one();
+        let first = first
+            .await
+            .expect("first post-run sampling task joins")
+            .expect("first readiness check result");
+        assert_eq!(first, CheckEvidence::Passed);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn stalled_git_signature_probe_keeps_collection_bounded_and_fail_closed() {
@@ -3567,13 +4017,14 @@ mod tests {
         // bounded sample so this test measures the injected Git child rather
         // than an unrelated one-time login-shell PATH discovery.
         let _ = crate::detect::tool_path();
+        let no_open_asks = HashSet::new();
         let lane = tokio::time::timeout(
             Duration::from_secs(3),
             collect_lane(
                 &db,
                 &direction,
                 PolicyDecision::AllowedByPolicy,
-                &[],
+                &no_open_asks,
                 open_pr_snapshot_freshness(1_000, 60),
                 CheckExecution::RunAllowed,
                 &git_probe,
@@ -3897,8 +4348,10 @@ mod tests {
     async fn cached_only_checks_never_start_a_runner_and_reuse_a_fresh_memo() {
         let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
         let runs = Arc::new(AtomicUsize::new(0));
+        let post_samples = Arc::new(AtomicUsize::new(0));
         let without_cache_runs = Arc::clone(&runs);
-        let without_cache = checks_for_targets_with_runner(
+        let without_cache_samples = Arc::clone(&post_samples);
+        let without_cache = checks_for_targets_with_runner_and_post_targets(
             &flight,
             CheckExecution::CachedOnly,
             57,
@@ -3907,11 +4360,20 @@ mod tests {
                 without_cache_runs.fetch_add(1, Ordering::SeqCst);
                 async { Ok(CheckEvidence::Failing) }
             },
+            move |targets| {
+                without_cache_samples.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(targets) }
+            },
         )
         .await
         .expect("cached-only check without memo");
         assert_eq!(without_cache, CheckEvidence::NotProduced);
         assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            post_samples.load(Ordering::SeqCst),
+            0,
+            "cached-only must not re-sample targets"
+        );
 
         let initial_runs = Arc::clone(&runs);
         let initial = checks_for_targets_with_runner(

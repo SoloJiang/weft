@@ -2392,20 +2392,31 @@ pub async fn list_directions(
 
 /// One fail-closed, derived delivery verdict for an issue and its active lanes.
 /// It reads current local/host evidence but never writes a readiness snapshot.
-#[tauri::command]
-pub async fn issue_readiness(
-    db: State<'_, Db>,
-    bus: State<'_, crate::bus::BusRegistry>,
+async fn collect_issue_readiness(
+    db: &Db,
+    bus: &crate::bus::BusRegistry,
+    asks: &crate::ask::AskRegistry,
     thread_id: i32,
 ) -> R<crate::readiness::IssueReadinessDto> {
     crate::readiness::collect_with_check_execution(
-        &db,
-        &bus,
+        db,
+        bus,
+        asks,
         thread_id,
         crate::readiness::CheckExecution::RunAllowed,
     )
     .await
     .map_err(e)
+}
+
+#[tauri::command]
+pub async fn issue_readiness(
+    db: State<'_, Db>,
+    bus: State<'_, crate::bus::BusRegistry>,
+    asks: State<'_, crate::ask::AskRegistry>,
+    thread_id: i32,
+) -> R<crate::readiness::IssueReadinessDto> {
+    collect_issue_readiness(&db, &bus, &asks, thread_id).await
 }
 
 /// The lead's proposed decomposition for a thread, resolved against the
@@ -4254,6 +4265,74 @@ mod tests {
             crate::im::DingTalkCopyUpdate::Updated,
             "online"
         ));
+    }
+
+    #[tokio::test]
+    async fn issue_readiness_injects_open_permission_asks() {
+        let db = Db::connect("sqlite::memory:").await.expect("memory db");
+        let workspace = repo::create_workspace(&db, "readiness command workspace")
+            .await
+            .expect("workspace");
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "readiness-command-repo",
+            "/tmp/readiness-command-repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .expect("repo reference");
+        let thread = repo::create_thread(
+            &db,
+            workspace.id,
+            "readiness command issue",
+            "feature",
+            "claude",
+        )
+        .await
+        .expect("thread");
+        let direction = repo::create_direction(
+            &db,
+            thread.id,
+            "implementation",
+            "claude",
+            repo_ref.id,
+            "exercise command injection",
+            "impl-only",
+            "main",
+        )
+        .await
+        .expect("direction");
+        let asks = crate::ask::AskRegistry::new();
+        let bus = crate::bus::BusRegistry::new();
+        let (_ask_id, _answer) = asks.request(
+            thread.id,
+            &direction.id.to_string(),
+            "shell",
+            "Run: protected command",
+            "protected command",
+            crate::ask::RiskLevel::Unknown,
+            "protected command",
+        );
+
+        let readiness = collect_issue_readiness(&db, &bus, &asks, thread.id)
+            .await
+            .expect("readiness command collection");
+
+        assert_eq!(
+            readiness.readiness,
+            crate::readiness::IssueReadiness::NeedsYou
+        );
+        assert!(readiness.lanes.iter().any(|lane| {
+            lane.direction_id == direction.id
+                && lane.readiness == crate::readiness::LaneReadiness::NeedsYou
+                && lane.reasons.first().is_some_and(|reason| {
+                    reason.code == crate::readiness::ReasonCode::OpenNeed
+                        && reason.direction_id == Some(direction.id)
+                })
+        }));
     }
 
     #[tokio::test]
