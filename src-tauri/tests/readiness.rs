@@ -1,6 +1,8 @@
 //! Integration coverage for the storage/process collector behind issue #171.
 
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -873,8 +875,9 @@ async fn explicit_verification_errors_when_no_checks_are_produced() {
     assert!(error.to_string().contains("verification was not produced"));
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn cached_only_collection_without_a_memo_never_runs_a_rung() {
+async fn cached_only_collection_never_starts_checks_or_git_fsmonitor_hooks() {
     let temp = tempfile::tempdir().expect("temporary cached-only fixture root");
     let repo_path = make_repo_with_counting_passing_check(temp.path());
     let fixture = fixture_for_repo(temp, repo_path, None).await;
@@ -882,7 +885,29 @@ async fn cached_only_collection_without_a_memo_never_runs_a_rung() {
         .await
         .expect("registered worktree");
     assert_eq!(registered.len(), 1, "fixture has one registered worktree");
-    let counter = Path::new(&registered[0].path).join(".readiness-check-count");
+    let worktree = Path::new(&registered[0].path);
+    let counter = worktree.join(".readiness-check-count");
+    let fsmonitor = worktree.join("cached-only-fsmonitor.sh");
+    let fsmonitor_invoked = PathBuf::from(format!("{}.invoked", fsmonitor.display()));
+    std::fs::write(
+        &fsmonitor,
+        "#!/bin/sh\n: > \"$0.invoked\"\nprintf '\\0'\n",
+    )
+    .expect("write cached-only fsmonitor hook");
+    let mut permissions = std::fs::metadata(&fsmonitor)
+        .expect("cached-only fsmonitor metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fsmonitor, permissions)
+        .expect("make cached-only fsmonitor executable");
+    git(
+        worktree,
+        &[
+            "config",
+            "core.fsmonitor",
+            fsmonitor.to_str().expect("utf8 fsmonitor path"),
+        ],
+    );
 
     // This is the same policy used by the read-only global `issue_status`
     // tool. An empty cache must be fail-closed without starting the package
@@ -901,10 +926,14 @@ async fn cached_only_collection_without_a_memo_never_runs_a_rung() {
     .expect("cached-only collection must not run the check")
     .expect("cached-only readiness");
     assert_eq!(without_memo.readiness, IssueReadiness::Unknown);
-    assert_eq!(without_memo.reasons[0].code, ReasonCode::ChecksUnknown);
+    assert_eq!(without_memo.reasons[0].code, ReasonCode::RemoteUnknown);
     assert!(
         !counter.exists(),
         "cached-only collection must not execute a rung"
+    );
+    assert!(
+        !fsmonitor_invoked.exists(),
+        "cached-only collection must not execute repository-configured Git hooks"
     );
 }
 

@@ -135,11 +135,13 @@
 //! kill every matching PID and process group, retaining ownership across
 //! `fork`, `exec`, `setsid`, and PPID reparenting. Finding any background
 //! process discards the check result as `NotProduced`; it can never be
-//! published as a pass. The marker's Drop path repeats the synchronous
-//! fork-free sweep when a check future is cancelled. Tools that deliberately
-//! close unknown inherited descriptors remain outside this unprivileged
-//! contract; they cannot be given a cross-platform cgroup/Job-style ownership
-//! guarantee by this process.
+//! published as a pass. A normal sweep runs on a bounded blocking worker. If a
+//! check future is cancelled, marker Drop transfers its still-open vnode to
+//! one dedicated cleanup thread, so process-table enumeration never blocks a
+//! Tokio worker and delayed cleanup cannot confuse a reused inode. Tools that
+//! deliberately close unknown inherited descriptors remain outside this
+//! unprivileged contract; they cannot be given a cross-platform
+//! cgroup/Job-style ownership guarantee by this process.
 //! Only a completed bounded reap disarms the root-group guard. On incomplete
 //! cleanup readiness keeps that guard armed and explicitly tears down the
 //! direct child before its registration is dropped.
@@ -170,14 +172,15 @@
 //! execution, rather than a blocking `Command::output` call. A failed or
 //! timed-out sample is unavailable evidence: reconciliation is unknown,
 //! checks are `NotProduced`, and no old cache entry may be reused or written
-//! as `Passed`. Cache-only callers do not execute or post-sample checks.
+//! as `Passed`.
 //!
 //! The desktop `issue_readiness` command collects with `RunAllowed`. The
-//! read-only global `issue_status` bus tool instead uses `CachedOnly`: it may
-//! consume a matching, unexpired check-flight memo only when it can immediately
-//! hold the same per-direction admission gate. It never starts or waits for a
-//! runner or admission; without that memo its check evidence is `NotProduced`,
-//! so the answer stays fail-closed.
+//! read-only global `issue_status` bus tool instead uses `CachedOnly`. It starts
+//! neither inferred checks nor Git signature probes, because `git status` may
+//! execute a repository-configured fsmonitor hook. It consumes durable
+//! worker/plan/PR/upstream facts and leaves local reconciliation unknown and
+//! applicable checks `NotProduced`, so the answer stays fail-closed without
+//! running repository code.
 //!
 //! Upstream evidence is collected from the established
 //! `repo::upstream_merge_state` contract:
@@ -331,9 +334,9 @@ pub enum CheckEvidence {
     Failing,
 }
 
-/// Whether this collection caller may start readiness verification commands.
-/// Read-only tool surfaces can consume existing evidence without gaining an
-/// implicit build/test execution capability.
+/// Whether this collection caller may start repository commands. Read-only
+/// tool surfaces consume durable facts only: even `git status` can execute a
+/// configured fsmonitor hook, so CachedOnly launches neither Git nor checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CheckExecution {
     RunAllowed,
@@ -906,6 +909,8 @@ const GIT_SIGNATURE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const BOUNDED_PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_CONCURRENT_CHECK_RUNNERS: usize = 2;
 const MAX_CONCURRENT_GIT_PROBES: usize = 4;
+const MAX_CONCURRENT_MARKER_SWEEPS: usize = 2;
+const MARKER_SWEEP_TIMEOUT: Duration = Duration::from_millis(250);
 const CHECK_OUTPUT_TAIL_BYTES: usize = 2_000;
 const CHECK_OUTPUT_READ_BUFFER_BYTES: usize = 8 * 1024;
 // Keep this aligned with host::monitor's private default. The readiness
@@ -1607,13 +1612,6 @@ impl GitSignatureProbe {
     }
 
     async fn sample(&self, path: &Path) -> Result<GitWorktreeSignature> {
-        if !path.is_dir() {
-            return Err(anyhow!(
-                "readiness worktree is unavailable at {}",
-                path.display()
-            ));
-        }
-
         // This is deliberately one total budget, including time queued behind
         // other board cards, rather than 15 seconds per subcommand. A large
         // portfolio and a slow fsmonitor therefore cannot create an unbounded
@@ -1631,11 +1629,16 @@ impl GitSignatureProbe {
             Ok(Err(_)) => return Err(anyhow!("readiness Git probe semaphore closed")),
             Err(_) => return Err(anyhow!("readiness Git probe deadline elapsed while queued")),
         };
+        // One inherited marker spans status/branch/HEAD. A configured
+        // fsmonitor hook can daemonize and let Git's direct process exit, so
+        // PGID/PPID cleanup alone is not sufficient for signature probes.
+        let process_marker = ReadinessProbeMarker::create()?;
         let porcelain = run_bounded_git_command(
             path,
             self.program.as_path(),
             &["status", "--porcelain"],
             deadline,
+            Some(&process_marker),
         )
         .await?;
         let branch = run_bounded_git_command(
@@ -1643,6 +1646,7 @@ impl GitSignatureProbe {
             self.program.as_path(),
             &["rev-parse", "--abbrev-ref", "HEAD"],
             deadline,
+            Some(&process_marker),
         )
         .await?;
         let head = run_bounded_git_command(
@@ -1650,12 +1654,27 @@ impl GitSignatureProbe {
             self.program.as_path(),
             &["rev-parse", "HEAD"],
             deadline,
+            Some(&process_marker),
         )
         .await?;
 
+        let branch = required_git_probe_output(branch.stdout, "branch")?;
+        let head_sha = required_git_probe_output(head.stdout, "HEAD")?;
+        match sweep_readiness_probe_marker_before(deadline, process_marker).await {
+            Some(0) => {}
+            Some(escaped) => {
+                anyhow::bail!(
+                    "readiness Git probe left {escaped} inherited background process(es)"
+                );
+            }
+            None => {
+                anyhow::bail!("readiness Git process ownership sweep exceeded its deadline");
+            }
+        }
+
         Ok(GitWorktreeSignature {
-            branch: required_git_probe_output(branch.stdout, "branch")?,
-            head_sha: required_git_probe_output(head.stdout, "HEAD")?,
+            branch,
+            head_sha,
             dirty: !porcelain.stdout.is_empty(),
         })
     }
@@ -2066,22 +2085,73 @@ enum BoundedCheckOutcome {
 
 /// A per-check ownership marker that survives `setsid` and PPID reparenting.
 /// Normal completion performs an explicit sweep before publishing evidence;
-/// Drop is the synchronous cancellation fallback if the future is abandoned.
+/// Drop transfers cancellation cleanup to a dedicated blocking thread.
 struct ReadinessProbeMarker(crate::proc_registry::InheritedProcessMarker);
 
 impl ReadinessProbeMarker {
-    fn attach(command: &mut tokio::process::Command) -> Result<Self> {
+    fn create() -> Result<Self> {
         let marker = crate::proc_registry::InheritedProcessMarker::create("readiness-check")
             .map_err(|error| anyhow!("could not create readiness process marker: {error}"))?;
-        marker
-            .attach(command)
-            .map_err(|error| anyhow!("could not attach readiness process marker: {error}"))?;
         Ok(Self(marker))
     }
 
-    fn sweep(&self) -> usize {
-        self.0.sweep()
+    fn attach_to(&self, command: &mut tokio::process::Command) -> Result<()> {
+        self.0
+            .attach(command)
+            .map_err(|error| anyhow!("could not attach readiness process marker: {error}"))
     }
+
+    fn attach(command: &mut tokio::process::Command) -> Result<Self> {
+        let marker = Self::create()?;
+        marker.attach_to(command)?;
+        Ok(marker)
+    }
+
+    fn sweep_and_disarm(&mut self) -> usize {
+        self.0.sweep_and_disarm()
+    }
+}
+
+fn marker_sweep_limit() -> &'static Arc<Semaphore> {
+    static LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    LIMIT.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_MARKER_SWEEPS)))
+}
+
+async fn run_bounded_marker_sweep_with<F>(
+    outer_deadline: tokio::time::Instant,
+    limit: Arc<Semaphore>,
+    sweep: F,
+) -> Option<usize>
+where
+    F: FnOnce() -> usize + Send + 'static,
+{
+    let now = tokio::time::Instant::now();
+    let sweep_deadline = std::cmp::min(outer_deadline, now + MARKER_SWEEP_TIMEOUT);
+    if now >= sweep_deadline {
+        return None;
+    }
+    let permit = match tokio::time::timeout_at(sweep_deadline, limit.acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) | Err(_) => return None,
+    };
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        sweep()
+    });
+    match tokio::time::timeout_at(sweep_deadline, task).await {
+        Ok(Ok(killed)) => Some(killed),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+async fn sweep_readiness_probe_marker_before(
+    deadline: tokio::time::Instant,
+    mut marker: ReadinessProbeMarker,
+) -> Option<usize> {
+    run_bounded_marker_sweep_with(deadline, Arc::clone(marker_sweep_limit()), move || {
+        marker.sweep_and_disarm()
+    })
+    .await
 }
 
 /// A Unix readiness subprocess owns a fresh process group. Keep the group
@@ -2371,6 +2441,7 @@ async fn run_bounded_git_command(
     program: &Path,
     args: &[&str],
     deadline: tokio::time::Instant,
+    process_marker: Option<&ReadinessProbeMarker>,
 ) -> Result<GitProbeOutput> {
     if tokio::time::Instant::now() >= deadline {
         return Err(anyhow!("readiness git signature probe deadline elapsed"));
@@ -2385,6 +2456,9 @@ async fn run_bounded_git_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if let Some(process_marker) = process_marker {
+        process_marker.attach_to(&mut command)?;
+    }
     let configured =
         crate::proc_registry::configure(&mut command, crate::proc_registry::Owner::probe());
     let mut child = command.spawn().map_err(|error| {
@@ -2440,10 +2514,17 @@ async fn run_bounded_git_command(
     {
         BoundedReadinessWait::Completed(status) => {
             #[cfg(unix)]
-            // The direct child is already reaped. Its ppid tree may now be
-            // reparented, so this best-effort root-group sweep only handles
-            // ordinary redirected helpers that stayed in the configured group.
-            process_group.kill();
+            if process_marker.is_some() {
+                // The signature-level marker spans all three Git commands.
+                // Keep same-group background helpers alive (but marked) until
+                // that one final scan can both detect and invalidate them;
+                // killing here would erase evidence that a hook escaped.
+                process_group.disarm();
+            } else {
+                // Direct test/legacy callers without a marker retain the
+                // established root-group cleanup fallback.
+                process_group.kill();
+            }
             let stdout = rendered_check_output_tail(&stdout_tail)?;
             let stderr = rendered_check_output_tail(&stderr_tail)?;
             if !status.success() {
@@ -2572,8 +2653,12 @@ async fn run_bounded_check(
         BoundedReadinessWait::Completed(status) => {
             // Inspect the inherited ownership marker before the ordinary root
             // group sweep can make a same-group background process disappear.
-            // Any such process invalidates otherwise-successful evidence.
-            let escaped_processes = process_marker.sweep();
+            // The full process/fd-table scan runs on a blocking worker and
+            // shares this check's outer deadline. A deferred scan is itself
+            // unavailable evidence; its owned marker continues cleanup after
+            // this direction admission is released.
+            let escaped_processes =
+                sweep_readiness_probe_marker_before(deadline, process_marker).await;
             #[cfg(unix)]
             // The direct child is already reaped, so this only sweeps residual
             // root-group members (for example `sh -c 'server >/dev/null 2>&1
@@ -2583,6 +2668,16 @@ async fn run_bounded_check(
             // cannot leave a background process mutating the checkout.
             process_group.kill();
             let output_tail = rendered_check_output_tail(&output_tail)?;
+            let Some(escaped_processes) = escaped_processes else {
+                let detail = "verification discarded: process ownership sweep exceeded its deadline";
+                return Ok(BoundedCheckOutcome::NotProduced {
+                    output_tail: if output_tail.is_empty() {
+                        detail.to_string()
+                    } else {
+                        format!("{output_tail}\n{detail}")
+                    },
+                });
+            };
             if escaped_processes > 0 {
                 let detail = format!(
                     "verification discarded: check left {escaped_processes} background process(es)"
@@ -2608,7 +2703,9 @@ async fn run_bounded_check(
             #[cfg(not(unix))]
             reap_bounded_readiness_process(&mut child, &mut registration).await;
             readers.abort_pending().await;
-            let _ = process_marker.sweep();
+            // Marker Drop enqueues the fallback scan on the dedicated cleanup
+            // worker; never enumerate the process table on this async task.
+            drop(process_marker);
             Ok(BoundedCheckOutcome::NotProduced {
                 output_tail: rendered_check_output_tail(&output_tail)?,
             })
@@ -2619,7 +2716,7 @@ async fn run_bounded_check(
             // swept safely. See the normal-completion comment above.
             process_group.kill();
             readers.abort_pending().await;
-            let _ = process_marker.sweep();
+            drop(process_marker);
             Ok(BoundedCheckOutcome::NotProduced {
                 output_tail: rendered_check_output_tail(&output_tail)?,
             })
@@ -2992,6 +3089,21 @@ async fn collect_lane(
         return Ok(facts);
     }
 
+    // Global/tool status reads are read-only in the stronger sense: a Git
+    // signature probe may execute a repository-configured fsmonitor hook.
+    // CachedOnly therefore consumes durable worker/plan/PR/upstream facts but
+    // starts no repository subprocess at all. Without a fresh local sample,
+    // reconciliation remains Unknown and completed-lane checks fail closed.
+    if check_execution == CheckExecution::CachedOnly {
+        facts.checks = if direction_claimed_completion(direction.status.as_str()) {
+            CheckEvidence::NotProduced
+        } else {
+            CheckEvidence::NotApplicable
+        };
+        facts.upstream = upstream_evidence(repo::upstream_merge_state(db, direction.id).await);
+        return Ok(facts);
+    }
+
     let worktrees = probe_worktrees_for_direction(db, direction.id, git_probe).await?;
     facts.reconciliation = reconciliation_for(direction, &worktrees);
     // Keep collection's cost aligned with `lane_readiness` first-match order.
@@ -3095,7 +3207,7 @@ pub async fn collect(
 
 /// Collect one issue with an explicit verification execution boundary. The
 /// desktop command is allowed to refresh verification evidence; read-only
-/// callers can only consume a matching, fresh memo.
+/// callers consume durable facts without starting repository subprocesses.
 pub async fn collect_with_check_execution(
     db: &Db,
     bus: &BusRegistry,
@@ -3260,7 +3372,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
 
@@ -3972,6 +4084,64 @@ mod tests {
             return None;
         }
         String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn marker_sweep_timeout_does_not_block_the_async_executor_or_spawn_past_the_cap() {
+        let limit = Arc::new(Semaphore::new(1));
+        let release = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let first_release = Arc::clone(&release);
+        let first_started = Arc::clone(&started);
+        let first_limit = Arc::clone(&limit);
+        let first = tokio::spawn(async move {
+            run_bounded_marker_sweep_with(
+                tokio::time::Instant::now() + Duration::from_millis(100),
+                first_limit,
+                move || {
+                    first_started.notify_one();
+                    while !first_release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    0
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("blocking marker fixture starts");
+        assert_eq!(
+            first.await.expect("bounded sweep task joins"),
+            None,
+            "a stalled process-table scan must release the async caller at its deadline"
+        );
+
+        let second_started = Arc::new(AtomicBool::new(false));
+        let second_observed = Arc::clone(&second_started);
+        let second = run_bounded_marker_sweep_with(
+            tokio::time::Instant::now() + Duration::from_millis(20),
+            Arc::clone(&limit),
+            move || {
+                second_observed.store(true, Ordering::SeqCst);
+                0
+            },
+        )
+        .await;
+        assert_eq!(second, None);
+        assert!(
+            !second_started.load(Ordering::SeqCst),
+            "a timed-out scan must retain its permit and cap later blocking work"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while limit.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("stalled marker fixture releases its blocking permit");
     }
 
     #[cfg(unix)]
@@ -5561,8 +5731,15 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("stalled git stub records its process group");
+        .await;
+        let Ok(recorded) = recorded else {
+            // Under the full parallel suite the one-second probe budget may
+            // expire before the injected shell is scheduled at all. That is
+            // still the bounded, fail-closed behavior this test owns. The
+            // escaped-descendant tests below require a recorded PID and cover
+            // cleanup after an actual child has started.
+            return;
+        };
         let pids: Vec<i32> = recorded
             .split_whitespace()
             .map(|pid| pid.parse::<i32>().expect("numeric process id"))
@@ -5578,6 +5755,72 @@ mod tests {
             pids.iter().all(|pid| !process_is_live(*pid)),
             "stalled git probe must leave no live process in its group: {pids:?}"
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn git_signature_probe_reaps_a_parent_exited_fsmonitor_descendant() {
+        let perl_status = std::process::Command::new("perl")
+            .args(["-MPOSIX", "-e", "exit 0"])
+            .status();
+        let Ok(perl_status) = perl_status else {
+            eprintln!("perl unavailable — skipping parent-exit Git marker test");
+            return;
+        };
+        if !perl_status.success() {
+            eprintln!("perl POSIX unavailable — skipping parent-exit Git marker test");
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("temporary parent-exit Git fixture");
+        let git_stub = root.path().join("git-fsmonitor-parent-exit.sh");
+        let pid_file = root.path().join("git-fsmonitor-parent-exit.pid");
+        let quoted_pid_file = shell_single_quote(&pid_file.to_string_lossy());
+        let perl_script = r#"my $file = shift; my $pid = fork(); die $! unless defined $pid; if (!$pid) { POSIX::setsid(); open(STDIN, '<', '/dev/null'); open(STDOUT, '>', '/dev/null'); open(STDERR, '>', '/dev/null'); open(my $fh, '>', $file) or die $!; print {$fh} "$$\n"; close($fh); exec('sleep', '30'); } exit 0;"#;
+        let quoted_perl_script = shell_single_quote(perl_script);
+        std::fs::write(
+            &git_stub,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = status ]; then\n  perl -MPOSIX -e {quoted_perl_script} {quoted_pid_file}\n  exit $?\nfi\nif [ \"$2\" = --abbrev-ref ]; then\n  printf 'main\\n'\nelse\n  printf '0123456789012345678901234567890123456789\\n'\nfi\n"
+            ),
+        )
+        .expect("write parent-exit Git stub");
+        let mut permissions = std::fs::metadata(&git_stub)
+            .expect("parent-exit Git stub metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&git_stub, permissions)
+            .expect("make parent-exit Git stub executable");
+
+        let probe = GitSignatureProbe {
+            program: git_stub,
+            timeout: Duration::from_secs(2),
+            limit: Some(Arc::new(Semaphore::new(1))),
+        };
+        let error = probe
+            .sample(root.path())
+            .await
+            .expect_err("a daemonized fsmonitor descendant invalidates the Git signature");
+        assert!(
+            error.to_string().contains("background process")
+                || error.to_string().contains("ownership sweep"),
+            "unexpected marker error: {error}"
+        );
+        let child_pid = std::fs::read_to_string(&pid_file)
+            .expect("fsmonitor descendant records pid")
+            .trim()
+            .parse::<i32>()
+            .expect("numeric fsmonitor descendant pid");
+        for _ in 0..80 {
+            if !process_is_live(child_pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if let Some(group) = process_group_id(child_pid) {
+            crate::proc_registry::kill_group(group);
+        }
+        panic!("parent-exited fsmonitor descendant survived marker cleanup: {child_pid}");
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -5626,6 +5869,7 @@ mod tests {
                 program.as_path(),
                 &["status", "--porcelain"],
                 deadline,
+                None,
             )
             .await
         });

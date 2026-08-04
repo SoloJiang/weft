@@ -2535,6 +2535,60 @@ pub struct ThreadOverview {
     pub write_repos: Vec<RepoLite>,
 }
 
+const WORKSPACE_OVERVIEW_PATH_PROBE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(1);
+const MAX_CONCURRENT_WORKSPACE_PATH_PROBES: usize = 4;
+
+fn workspace_path_probe_limit() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static LIMIT: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    LIMIT.get_or_init(|| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_WORKSPACE_PATH_PROBES,
+        ))
+    })
+}
+
+async fn bounded_path_probe_with<F>(
+    path: std::path::PathBuf,
+    timeout: std::time::Duration,
+    limit: std::sync::Arc<tokio::sync::Semaphore>,
+    probe: F,
+) -> bool
+where
+    F: FnOnce(&std::path::Path) -> bool + Send + 'static,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let permit = match tokio::time::timeout_at(deadline, limit.acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) | Err(_) => return false,
+    };
+    let task = tokio::task::spawn_blocking(move || {
+        // A timed-out filesystem call keeps its permit in the detached
+        // blocking task. At most four stalled mounts can accumulate; later
+        // overviews fail closed without spawning more blocking work.
+        let _permit = permit;
+        probe(&path)
+    });
+    match tokio::time::timeout_at(deadline, task).await {
+        Ok(Ok(exists)) => exists,
+        Ok(Err(_)) | Err(_) => false,
+    }
+}
+
+async fn bounded_workspace_path_exists(path: std::path::PathBuf) -> bool {
+    bounded_path_probe_with(
+        path,
+        WORKSPACE_OVERVIEW_PATH_PROBE_TIMEOUT,
+        std::sync::Arc::clone(workspace_path_probe_limit()),
+        |path| match path.try_exists() {
+            Ok(exists) => exists,
+            Err(_) => false,
+        },
+    )
+    .await
+}
+
 /// Portfolio view of a workspace: every thread with its directions + write set,
 /// so the board can show roll-ups and the repositories each task writes.
 #[tauri::command]
@@ -2549,20 +2603,45 @@ async fn workspace_overview_inner(db: &Db, workspace_id: i32) -> R<Vec<ThreadOve
         .into_iter()
         .filter(|t| t.kind != "curator") // hidden curator-chat thread is not a board issue
         .collect();
+    let mut directions_by_thread =
+        std::collections::HashMap::<i32, Vec<entities::direction::Model>>::new();
+    let mut workspace_direction_ids = std::collections::HashSet::<i32>::new();
+    for thread in &threads {
+        let directions = repo::list_directions(db, thread.id).await.map_err(e)?;
+        workspace_direction_ids.extend(directions.iter().map(|direction| direction.id));
+        directions_by_thread.insert(thread.id, directions);
+    }
     // One portfolio snapshot, grouped in memory. Querying worktrees inside the
     // thread/direction loop makes a board refresh add one DB round trip per
     // lane and scales poorly precisely when the portfolio view is most useful.
-    let mut worktrees_by_direction =
-        std::collections::HashMap::<i32, Vec<entities::worktree::Model>>::new();
-    for worktree in repo::list_worktrees(db, None).await.map_err(e)? {
+    // Filter before touching the filesystem so a slow mount owned by another
+    // workspace cannot consume this workspace's bounded probe slots.
+    let worktree_probes = repo::list_worktrees(db, None)
+        .await
+        .map_err(e)?
+        .into_iter()
+        .filter(|worktree| workspace_direction_ids.contains(&worktree.direction_id))
+        .map(|worktree| async move {
+            let exists =
+                bounded_workspace_path_exists(std::path::PathBuf::from(&worktree.path)).await;
+            (worktree, exists)
+        });
+    let mut worktrees_by_direction = std::collections::HashMap::<
+        i32,
+        Vec<(entities::worktree::Model, bool)>,
+    >::new();
+    for (worktree, exists) in futures::future::join_all(worktree_probes).await {
         worktrees_by_direction
             .entry(worktree.direction_id)
             .or_default()
-            .push(worktree);
+            .push((worktree, exists));
     }
     let mut out = Vec::new();
     for t in threads {
-        let dirs = repo::list_directions(db, t.id).await.map_err(e)?;
+        let dirs = match directions_by_thread.remove(&t.id) {
+            Some(directions) => directions,
+            None => Vec::new(),
+        };
         let (plan_status, plan_created_at) = match repo::get_plan(db, t.id).await.map_err(e)? {
             Some(plan) => (Some(plan.status), Some(plan.created_at)),
             None => (None, None),
@@ -2574,11 +2653,11 @@ async fn workspace_overview_inner(db: &Db, workspace_id: i32) -> R<Vec<ThreadOve
                 seen.entry(r.id).or_insert(r.name);
             }
             if let Some(worktrees) = worktrees_by_direction.get(&d.id) {
-                for worktree in worktrees {
+                for (worktree, exists) in worktrees {
                     readiness_worktrees.push(ReadinessWorktreeSignature {
                         direction_id: d.id,
                         worktree_id: worktree.id,
-                        exists: std::path::Path::new(&worktree.path).exists(),
+                        exists: *exists,
                     });
                 }
             }
@@ -4687,7 +4766,7 @@ pub async fn db_change_password(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[test]
     fn waiting_dingtalk_bridge_retries_after_copy_was_already_initialized() {
@@ -4771,6 +4850,65 @@ mod tests {
                         && reason.direction_id == Some(direction.id)
                 })
         }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_path_probe_is_deadline_bounded_and_caps_stalled_mounts() {
+        let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let release = std::sync::Arc::new(AtomicBool::new(false));
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let first_limit = std::sync::Arc::clone(&limit);
+        let first_release = std::sync::Arc::clone(&release);
+        let first_started = std::sync::Arc::clone(&started);
+        let first = tokio::spawn(async move {
+            bounded_path_probe_with(
+                std::path::PathBuf::from("/stalled-overview-path"),
+                std::time::Duration::from_millis(100),
+                first_limit,
+                move |_| {
+                    first_started.notify_one();
+                    while !first_release.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    true
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("stalled overview path probe starts");
+        assert!(
+            !first.await.expect("bounded path probe joins"),
+            "a stalled mount must fail closed at the async deadline"
+        );
+
+        let second_started = std::sync::Arc::new(AtomicBool::new(false));
+        let second_observed = std::sync::Arc::clone(&second_started);
+        let second = bounded_path_probe_with(
+            std::path::PathBuf::from("/second-overview-path"),
+            std::time::Duration::from_millis(20),
+            std::sync::Arc::clone(&limit),
+            move |_| {
+                second_observed.store(true, Ordering::SeqCst);
+                true
+            },
+        )
+        .await;
+        assert!(!second);
+        assert!(
+            !second_started.load(Ordering::SeqCst),
+            "a detached stalled mount must retain the only permit"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while limit.available_permits() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("stalled overview path fixture releases its permit");
     }
 
     #[tokio::test]

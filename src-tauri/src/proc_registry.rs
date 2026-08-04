@@ -641,11 +641,13 @@ fn own_pgid() -> i32 {
 /// out of this ownership channel and cannot be recovered by this fallback.
 pub struct InheritedProcessMarker {
     #[cfg(unix)]
-    file: std::fs::File,
+    file: Option<std::fs::File>,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    armed: bool,
 }
 
 impl InheritedProcessMarker {
@@ -721,9 +723,10 @@ impl InheritedProcessMarker {
                     return Err(error);
                 }
                 return Ok(Self {
-                    file,
+                    file: Some(file),
                     device: metadata.dev(),
                     inode: metadata.ino(),
+                    armed: true,
                 });
             }
             Err(std::io::Error::new(
@@ -743,7 +746,13 @@ impl InheritedProcessMarker {
         {
             use std::os::fd::AsRawFd;
 
-            let fd = self.file.as_raw_fd();
+            let Some(file) = self.file.as_ref() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "process marker is no longer armed",
+                ));
+            };
+            let fd = file.as_raw_fd();
             // SAFETY: the closure runs after fork and before exec. It performs
             // only `fcntl` plus construction of an OS error on failure.
             unsafe {
@@ -771,47 +780,126 @@ impl InheritedProcessMarker {
     pub fn sweep(&self) -> usize {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            let own_pid = std::process::id() as i32;
-            let marked: Vec<i32> = all_pids()
-                .into_iter()
-                .filter(|pid| {
-                    *pid != own_pid && process_has_open_file(*pid, self.device, self.inode)
-                })
-                .collect();
-            let mut groups = HashSet::new();
-            let mut killed = 0;
-            for pid in marked {
-                // Revalidate immediately before signalling to narrow the PID
-                // reuse race between enumeration and kill.
-                if !process_has_open_file(pid, self.device, self.inode) {
-                    continue;
-                }
-                if let Some((_, pgid)) = proc_ppid_pgid(pid) {
-                    groups.insert(pgid);
-                }
-                // SAFETY: signalling a numeric PID has no memory-safety
-                // precondition. The marker recheck above establishes ownership.
-                unsafe {
-                    let _ = libc::kill(pid, libc::SIGKILL);
-                }
-                killed += 1;
-            }
-            for group in groups {
-                kill_group(group);
-            }
-            killed
+            sweep_open_file_identity(OpenFileIdentity {
+                device: self.device,
+                inode: self.inode,
+            })
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             0
         }
     }
+
+    /// Perform the final ownership sweep and suppress the Drop fallback.
+    /// Readiness runs this on a bounded blocking worker; disarming prevents a
+    /// second full process-table scan when the marker then leaves scope.
+    pub fn sweep_and_disarm(&mut self) -> usize {
+        let killed = self.sweep();
+        #[cfg(unix)]
+        {
+            self.armed = false;
+        }
+        killed
+    }
 }
 
 impl Drop for InheritedProcessMarker {
     fn drop(&mut self) {
-        let _ = self.sweep();
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            if self.armed {
+                self.armed = false;
+                if let Some(file) = self.file.take() {
+                    enqueue_open_file_cleanup(OpenFileCleanup {
+                        // Keep the unlinked vnode allocated until the queued
+                        // scan finishes. Closing the last descriptor here
+                        // could let the inode be reused and make a delayed
+                        // identity-only scan target an unrelated process.
+                        _file: file,
+                        identity: OpenFileIdentity {
+                            device: self.device,
+                            inode: self.inode,
+                        },
+                    });
+                }
+            }
+        }
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Clone, Copy)]
+struct OpenFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct OpenFileCleanup {
+    _file: std::fs::File,
+    identity: OpenFileIdentity,
+}
+
+/// Drop may run on a Tokio worker when a readiness future is cancelled. Queue
+/// the fallback scan onto one dedicated process-cleanup thread instead of
+/// synchronously enumerating every PID/file descriptor on the async executor.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn enqueue_open_file_cleanup(cleanup: OpenFileCleanup) {
+    const MAX_QUEUED_MARKER_CLEANUPS: usize = 64;
+    static SENDER: OnceLock<std::sync::mpsc::SyncSender<OpenFileCleanup>> = OnceLock::new();
+    let sender = SENDER.get_or_init(|| {
+        // The queue owns live file descriptors so delayed scans cannot match a
+        // reused inode. Bound it to keep repeated cancellation from turning a
+        // stalled platform scan into unbounded descriptor retention. When the
+        // queue is saturated, evidence is already fail-closed; relinquishing
+        // this best-effort fallback is safer than blocking a runtime worker or
+        // retaining an unbounded number of live descriptors.
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<OpenFileCleanup>(MAX_QUEUED_MARKER_CLEANUPS);
+        let _ = std::thread::Builder::new()
+            .name("weft-process-marker-cleanup".to_string())
+            .spawn(move || {
+                for cleanup in receiver {
+                    let _ = sweep_open_file_identity(cleanup.identity);
+                }
+            });
+        sender
+    });
+    let _ = sender.try_send(cleanup);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sweep_open_file_identity(identity: OpenFileIdentity) -> usize {
+    let own_pid = std::process::id() as i32;
+    let marked: Vec<i32> = all_pids()
+        .into_iter()
+        .filter(|pid| {
+            *pid != own_pid && process_has_open_file(*pid, identity.device, identity.inode)
+        })
+        .collect();
+    let mut groups = HashSet::new();
+    let mut killed = 0;
+    for pid in marked {
+        // Revalidate immediately before signalling to narrow the PID reuse
+        // race between enumeration and kill.
+        if !process_has_open_file(pid, identity.device, identity.inode) {
+            continue;
+        }
+        if let Some((_, pgid)) = proc_ppid_pgid(pid) {
+            groups.insert(pgid);
+        }
+        // SAFETY: signalling a numeric PID has no memory-safety precondition.
+        // The marker recheck above establishes ownership.
+        unsafe {
+            let _ = libc::kill(pid, libc::SIGKILL);
+        }
+        killed += 1;
+    }
+    for group in groups {
+        kill_group(group);
+    }
+    killed
 }
 
 #[cfg(target_os = "linux")]
@@ -1477,6 +1565,51 @@ mod tests {
         }
         assert!(!still_alive, "the marked background process must be gone");
         drop(registration);
+    }
+
+    #[tokio::test]
+    async fn dropping_inherited_fd_marker_queues_reparented_child_cleanup() {
+        let _g = test_guard();
+        let marker = InheritedProcessMarker::create("proc-registry-drop-test")
+            .expect("create Drop cleanup marker");
+        let root = tempfile::tempdir().expect("Drop cleanup fixture directory");
+        let pid_file = root.path().join("drop-background.pid");
+        let mut command = null_cmd("sh");
+        command
+            .env("WEFT_PROC_REGISTRY_TEST_PID_FILE", &pid_file)
+            .arg("-c")
+            .arg("sleep 30 >/dev/null 2>&1 & printf '%s\\n' \"$!\" > \"$WEFT_PROC_REGISTRY_TEST_PID_FILE\"");
+        marker
+            .attach(&mut command)
+            .expect("attach Drop cleanup marker");
+        let configured = configure(&mut command, Owner::other("marker-drop-parent-exit"));
+        let mut child = command.spawn().expect("spawn Drop cleanup fixture");
+        let registration = configured.register(&child);
+        child.wait().await.expect("wait Drop cleanup shell");
+
+        let background_pid = std::fs::read_to_string(&pid_file)
+            .expect("Drop cleanup child records pid")
+            .trim()
+            .parse::<i32>()
+            .expect("numeric Drop cleanup pid");
+        assert!(
+            process_has_open_file(background_pid, marker.device, marker.inode),
+            "the Drop fixture must inherit the ownership marker"
+        );
+
+        drop(marker);
+        for _ in 0..80 {
+            if proc_ppid_pgid(background_pid).is_none() {
+                drop(registration);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if let Some((_, group)) = proc_ppid_pgid(background_pid) {
+            kill_group(group);
+        }
+        drop(registration);
+        panic!("Drop cleanup did not reap marked child {background_pid}");
     }
 
     #[test]
