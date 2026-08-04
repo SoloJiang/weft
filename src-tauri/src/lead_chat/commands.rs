@@ -302,7 +302,7 @@ pub async fn lead_engine(
     // never receive computer use (see `EngineInner::computer_args`).
     let mut computer_args: Vec<String> = vec![];
     let mut computer_env: Vec<(String, String)> = vec![];
-    let mut computer_gen: Option<u64> = None;
+    let mut computer_mint: Option<crate::bus::computer_srv::MintGuard> = None;
     if is_concierge {
         // Concierge is the IM-scoped global helper, not a thread participant: it
         // gets weft_global, never the per-thread bus.
@@ -364,9 +364,12 @@ pub async fn lead_engine(
         );
         computer_args = comp.args;
         computer_env = comp.env;
-        // The ownership stamp over a shared identity — see
-        // `EngineInner::computer_gen` for why a teardown needs it.
-        computer_gen = comp.computer_generation;
+        // The mint's ownership receipt. Committed at the engine literal below,
+        // where the engine that will spawn with this bearer finally exists; if
+        // anything between here and there returned, dropping it would revoke.
+        // Nothing does — see the system-prompt block's own note — and this is
+        // what keeps that true if someone adds a `?`.
+        computer_mint = comp.computer_guard;
     }
     // The computer halves stay in their OWN fields rather than being folded
     // in here — they have to be replaceable at respawn (see
@@ -395,7 +398,12 @@ pub async fn lead_engine(
         extra_env,
         computer_args,
         computer_env,
-        computer_gen,
+        // Left uncommitted here on purpose. Struct fields evaluate in source
+        // order, and the `native_id`/`turn_id` fields below AWAIT — committing
+        // in this literal disarms the guard and then waits. Stalled or cancelled
+        // there, the bearer is valid with neither a guard to revoke it nor a
+        // registered engine for a Stop to reach. Committed past insertion below.
+        computer_gen: None,
         acp_route_gen: None,
         system_prompt,
         native_id: repo::lead_native_id(db, thread_id).await.ok().flatten(),
@@ -445,6 +453,14 @@ pub async fn lead_engine(
     engine::apply_persisted_meta(&mut inner, &t.lead_meta);
     let eng: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
     let selected = state.get_or_insert(lead_key(thread_id), eng);
+    // Committed only now: `selected` is registered, so this is the first moment
+    // a Stop can reach the generation at all. Into `selected` rather than the
+    // local, because `get_or_insert` may keep an engine that was already there.
+    // Until this line the guard is still armed, so every await above — the whole
+    // literal included — revokes if control never gets here.
+    if let Some(mint) = computer_mint {
+        selected.lock().await.computer_gen = Some(mint.commit());
+    }
     drop(engine_admission);
     // Hydration dispatch acquires the same gate through send_hidden_inner; do
     // not hold the construction gate across that call or it would self-deadlock.
@@ -1713,7 +1729,7 @@ pub(crate) async fn chat_open_worker_impl(
             // entry to clobber the bus one via `Command::envs`' last-wins.
             let computer_args = comp.args;
             let computer_env = comp.env;
-            let computer_gen = comp.computer_generation;
+            let computer_mint = comp.computer_guard;
             let extra_env = crate::bus::inject::coalesce_env(extra_env);
             let mut inner = engine::EngineInner {
                 thread_id: dir.thread_id,
@@ -1725,7 +1741,9 @@ pub(crate) async fn chat_open_worker_impl(
                 extra_env,
                 computer_args,
                 computer_env,
-                computer_gen,
+                // Same reason as `lead_engine`: the `turn_id` field below
+                // awaits, so the commit cannot live in this literal.
+                computer_gen: None,
                 acp_route_gen: None,
                 system_prompt: String::new(),
                 native_id: native.clone(),
@@ -1774,7 +1792,11 @@ pub(crate) async fn chat_open_worker_impl(
             // populated right away after an app relaunch (not "after first message").
             engine::apply_persisted_meta(&mut inner, &sess.meta);
             let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
-            state.get_or_insert(key, e)
+            let selected = state.get_or_insert(key, e);
+            if let Some(mint) = computer_mint {
+                selected.lock().await.computer_gen = Some(mint.commit());
+            }
+            selected
         }
     };
     drop(_registry_read);
@@ -1901,7 +1923,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
     // must fail closed: skip the computer injection entirely — this session
     // simply has no computer tool until a rebuild resolves its worktree —
     // rather than gambling on whichever worktree happens to sort first.
-    let (comp_args, comp_env, comp_gen) = match worktree_id {
+    let (comp_args, comp_env, comp_mint) = match worktree_id {
         Some(_) => {
             let comp = crate::bus::inject::inject_computer(
                 &base,
@@ -1910,7 +1932,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
                 &sess.tool,
                 worktree_id,
             );
-            (comp.args, comp.env, comp.computer_generation)
+            (comp.args, comp.env, comp.computer_guard)
         }
         None => (Vec::new(), Vec::new(), None),
     };
@@ -1935,7 +1957,9 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         extra_env,
         computer_args,
         computer_env,
-        computer_gen: comp_gen,
+        // Left uncommitted until this engine is actually about to be
+        // registered — see the commit below.
+        computer_gen: None,
         acp_route_gen: None,
         system_prompt: String::new(),
         native_id: sess.native_session_id.clone(),
@@ -1994,7 +2018,16 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         anyhow::bail!("worker direction changed threads before engine registration");
     }
     let e: EngineRef = std::sync::Arc::new(tokio::sync::Mutex::new(inner));
-    Ok(state.get_or_insert(session_id as i64, e))
+    let selected = state.get_or_insert(session_id as i64, e);
+    // Committed past insertion, like the other two constructors: everything
+    // before it — the awaiting literal fields, `ensure_worker_parent_chain`, the
+    // thread-changed check — is an exit that drops `inner` without ever
+    // registering it, and a committed generation on an unreachable engine is one
+    // nothing can revoke. Armed, the guard revokes itself on every one of them.
+    if let Some(mint) = comp_mint {
+        selected.lock().await.computer_gen = Some(mint.commit());
+    }
+    Ok(selected)
 }
 
 #[tauri::command]
