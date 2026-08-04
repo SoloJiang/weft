@@ -54,7 +54,7 @@
 //! | most recent worker turn ended `error` | Failed | WorkerFailed |
 //! | answerable bus ask is open for the direction | NeedsYou | OpenNeed |
 //! | policy needs a human gate | NeedsYou | PolicyGatePending |
-//! | any tracked PR lifecycle is `merged` | ReviewReady | — |
+//! | at least one tracked PR is `merged`, and the deterministic reduction of every tracked PR is clear | ReviewReady | — |
 //! | worktree/branch reconciliation drifted | Blocked | ExecutionDrifted |
 //! | an inferred check failed for a claimed-complete lane | Blocked | ChecksFailing |
 //! | upstream evidence is Unmet (including a pending or unregistered upstream PR) | Blocked | UpstreamUnmet |
@@ -80,21 +80,24 @@
 //! A CLI-reported `review`/`done` state is intentionally last: it cannot
 //! override drift, remote uncertainty, or missing checks. A lane without a PR
 //! skips the PR rows entirely; a PR is not a prerequisite for single-repo
-//! review readiness. A merged tracked PR is different: after the three human
-//! gates above, merge is terminal delivery evidence and makes the lane
-//! `ReviewReady` even when its old worktree has been reclaimed or a predecessor
-//! remains pending. An unresolved worker failure, open ask, or policy gate is
-//! still reported first because it needs a human response.
+//! review readiness. A merged tracked PR is different only when every tracked
+//! PR row is clear: after the three human gates above, that all-clear merge set
+//! is terminal delivery evidence and makes the lane `ReviewReady` even when its
+//! old worktree has been reclaimed or a predecessor remains pending. A failing,
+//! conflicting, closed-unmerged, or unknown sibling PR remains in the normal
+//! deterministic reduction and cannot be bypassed. An unresolved worker
+//! failure, open ask, or policy gate is still reported first because it needs a
+//! human response.
 //!
 //! Check collection is intentionally gated by claimed completion: only
 //! `review` and `done` lanes invoke inferred checks. The collector records
 //! `NotApplicable` for `queued`, `planning`, and `working` lanes; that evidence
 //! skips both check-failing and check-unknown verdict rows. Before it invokes a
 //! check runner, collection also short-circuits every decisive first-match gate:
-//! worker failure, an open direction ask, a policy gate, a merged PR, or
-//! reconciliation drift. It records `NotApplicable` for those lanes, because
-//! the winner is already known and a mismatched checkout is not a safe target
-//! for build/test work. This retains check.rs's
+//! worker failure, an open direction ask, a policy gate, an all-clear merged PR
+//! set, or reconciliation drift. It records `NotApplicable` for those lanes,
+//! because the winner is already known and a mismatched checkout is not a safe
+//! target for build/test work. This retains check.rs's
 //! worker-done-means-checks-green contract without turning ordinary in-progress
 //! work into automatic build/test execution.
 //!
@@ -128,7 +131,8 @@
 //! | Unknown (dangling, unresolved, or unreadable edge) | Unknown | Unknown[RemoteUnknown] |
 //!
 //! A lane can have multiple tracked PR rows. Every row must be clear for the
-//! PR gate to continue. Otherwise their row verdicts are reduced
+//! PR gate to continue. A merged row is clear for its own terminal axes, but
+//! never clears a sibling row. Otherwise their row verdicts are reduced
 //! deterministically: Blocked outranks Unknown, and a same-severity tie uses
 //! the smaller persisted PR id.
 //!
@@ -379,10 +383,11 @@ fn one_pull_request_verdict(
     pr: &PullRequestFacts,
     open_pr_snapshot_freshness: OpenPrSnapshotFreshness,
 ) -> Option<(LaneReadiness, ReasonCode)> {
-    // A merged lifecycle is terminal, stronger evidence than every live axis.
-    // GitHub's real merged fixture has `mergeable: "UNKNOWN"` and an empty
-    // review decision after GitHub stops computing them, so applying the open
-    // PR axes here would turn a completed delivery back into RemoteUnknown.
+    // A merged lifecycle clears this row's terminal evidence, stronger than
+    // every live axis. GitHub's real merged fixture has `mergeable: "UNKNOWN"`
+    // and an empty review decision after GitHub stops computing them, so
+    // applying the open PR axes here would turn a completed delivery back into
+    // RemoteUnknown. Sibling rows are still reduced independently below.
     if pr.lifecycle == Some(PrLifecycle::Merged) {
         return None;
     }
@@ -478,6 +483,14 @@ fn has_merged_pull_request(pull_requests: &[PullRequestFacts]) -> bool {
         .any(|pr| pr.lifecycle == Some(PrLifecycle::Merged))
 }
 
+fn has_all_clear_merged_pull_request(
+    pull_requests: &[PullRequestFacts],
+    open_pr_snapshot_freshness: OpenPrSnapshotFreshness,
+) -> bool {
+    has_merged_pull_request(pull_requests)
+        && pull_request_verdict(pull_requests, open_pr_snapshot_freshness).is_none()
+}
+
 /// Decide one active lane. A policy-denied or inactive lane returns `None` so
 /// aggregation cannot accidentally make a cancelled/denied lane block or
 /// satisfy an issue.
@@ -506,11 +519,11 @@ pub fn lane_readiness(facts: &LaneFacts) -> Option<LaneReadinessDto> {
             Some(ReasonCode::PolicyGatePending),
         ));
     }
-    // Merge is terminal delivery evidence. It intentionally comes after the
-    // human-action gates above, but before local execution, predecessor, and
-    // live-host evidence that may disappear after an official Done card has
-    // reclaimed its worktree.
-    if has_merged_pull_request(&facts.pull_requests) {
+    // Merge is terminal delivery evidence only when every tracked row is clear.
+    // It intentionally comes after the human-action gates above, but before
+    // local execution, predecessor, and live-host evidence that may disappear
+    // after an official Done card has reclaimed its worktree.
+    if has_all_clear_merged_pull_request(&facts.pull_requests, facts.open_pr_snapshot_freshness) {
         return Some(lane_verdict(facts, LaneReadiness::ReviewReady, None));
     }
     if facts.reconciliation == ExecutionReconciliation::Drifted {
@@ -1533,11 +1546,12 @@ fn checks_are_preempted(
     policy: PolicyDecision,
     reconciliation: ExecutionReconciliation,
     pull_requests: &[PullRequestFacts],
+    open_pr_snapshot_freshness: OpenPrSnapshotFreshness,
 ) -> bool {
     worker_failed
         || has_open_ask
         || policy == PolicyDecision::NeedsGate
-        || has_merged_pull_request(pull_requests)
+        || has_all_clear_merged_pull_request(pull_requests, open_pr_snapshot_freshness)
         || reconciliation == ExecutionReconciliation::Drifted
 }
 
@@ -1547,6 +1561,7 @@ async fn checks_after_decisive_gates<F, Fut>(
     policy: PolicyDecision,
     reconciliation: ExecutionReconciliation,
     pull_requests: &[PullRequestFacts],
+    open_pr_snapshot_freshness: OpenPrSnapshotFreshness,
     collect_checks: F,
 ) -> Result<CheckEvidence>
 where
@@ -1559,6 +1574,7 @@ where
         policy,
         reconciliation,
         pull_requests,
+        open_pr_snapshot_freshness,
     ) {
         return Ok(CheckEvidence::NotApplicable);
     }
@@ -1634,14 +1650,16 @@ async fn collect_lane(
         pull_requests.iter().map(pull_request_facts).collect();
     let reconciliation = reconciliation_for(db, direction).await?;
     // Keep collection's cost aligned with `lane_readiness` first-match order.
-    // Once a human-action, terminal merge, or drift gate decides the outcome,
-    // starting a build/test process cannot add useful delivery evidence.
+    // Once a human-action, all-clear terminal merge, or drift gate decides the
+    // outcome, starting a build/test process cannot add useful delivery
+    // evidence.
     let checks = checks_after_decisive_gates(
         worker_failed,
         has_open_ask,
         policy,
         reconciliation,
         &pull_requests,
+        open_pr_snapshot_freshness,
         || checks_for(db, direction),
     )
     .await?;
@@ -2169,7 +2187,7 @@ mod tests {
     }
 
     #[test]
-    fn merged_pr_is_terminal_after_human_gates() {
+    fn all_clear_merged_pr_is_terminal_after_human_gates() {
         let mut lane = facts();
         let mut merged = pr();
         merged.lifecycle = Some(PrLifecycle::Merged);
@@ -2183,6 +2201,51 @@ mod tests {
         assert_eq!(
             verdict(&lane),
             (LaneReadiness::NeedsYou, Some(ReasonCode::OpenNeed))
+        );
+    }
+
+    #[test]
+    fn merged_pr_requires_every_tracked_row_to_be_clear() {
+        let mut lane = facts();
+        let mut merged = pr();
+        merged.lifecycle = Some(PrLifecycle::Merged);
+
+        let mut ci_failing = pr();
+        ci_failing.id = 2;
+        ci_failing.ci = CiStatus::Failing;
+        lane.pull_requests = vec![merged.clone(), ci_failing];
+        assert_eq!(
+            verdict(&lane),
+            (LaneReadiness::Blocked, Some(ReasonCode::PrCiFailing))
+        );
+        assert!(
+            !checks_are_preempted(
+                false,
+                false,
+                PolicyDecision::AllowedByPolicy,
+                ExecutionReconciliation::Matched,
+                &lane.pull_requests,
+                lane.open_pr_snapshot_freshness,
+            ),
+            "a non-clear sibling PR must not skip applicable checks"
+        );
+
+        let mut closed_unmerged = pr();
+        closed_unmerged.id = 3;
+        closed_unmerged.lifecycle = Some(PrLifecycle::Closed);
+        lane.pull_requests = vec![merged.clone(), closed_unmerged];
+        assert_eq!(
+            verdict(&lane),
+            (LaneReadiness::Blocked, Some(ReasonCode::PrClosedUnmerged))
+        );
+
+        let mut conflicting = pr();
+        conflicting.id = 4;
+        conflicting.conflict = ConflictStatus::Conflicting;
+        lane.pull_requests = vec![merged, conflicting];
+        assert_eq!(
+            verdict(&lane),
+            (LaneReadiness::Blocked, Some(ReasonCode::PrConflict))
         );
     }
 
@@ -2828,6 +2891,7 @@ mod tests {
             PolicyDecision::AllowedByPolicy,
             ExecutionReconciliation::Drifted,
             &[],
+            open_pr_snapshot_freshness(1_000, 60),
             move || {
                 let flight = Arc::clone(&skipped_flight);
                 let runs = Arc::clone(&skipped_runs);
@@ -2875,6 +2939,7 @@ mod tests {
                 PolicyDecision::AllowedByPolicy,
                 ExecutionReconciliation::Matched,
                 &[],
+                open_pr_snapshot_freshness(1_000, 60),
                 move || {
                     attempted_runs.fetch_add(1, Ordering::SeqCst);
                     async { std::future::pending::<Result<CheckEvidence>>().await }
