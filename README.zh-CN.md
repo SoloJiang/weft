@@ -13,8 +13,10 @@ Claude Code、Codex 和 OpenCode，让每一次写入都受明确权限边界约
 </div>
 
 <p align="center">
-  <img src="assets/readme/weft-overview.png" alt="Weft 将按仓库拆分的 Agent 工作编排成一次可 Review 的交付" width="940" />
+  <img src="assets/readme/weft-delivery-workbench.jpg" alt="手绘风格的本地交付工作台：一个产品目标进入 Weft，多个仓库在同一台电脑的独立 Worktree 中执行，最后把 Diff、检查、PR 状态和一项异常 Gate 汇合到 Review 界面" width="940" />
 </p>
+
+<p align="center"><sub>一个本地工作台：逐仓 Run 在策略内推进，最后汇合成可以直接 Review 的证据。</sub></p>
 
 ## 30 秒看懂
 
@@ -58,6 +60,12 @@ Project 内的长期 Agent 花名册，让稳定岗位、明确职责和经过�
    跨 Issue 延续，但不会因此隐式扩大权限。
 
 人负责产品判断、授权和高风险决策；轮询、记录、恢复和日常协调交给 Weft。
+
+<p align="center">
+  <img src="assets/readme/weft-continuity-roster.jpg" alt="手绘风格的夜晚到早晨连续场景：Coding Agent 额度触顶后保留 Worktree 和 Evidence 安全等待，恢复点到达并通过策略检查后只续跑一次，最终返回简明摘要和长期 Agent 花名册" width="940" />
+</p>
+
+<p align="center"><sub>连续性不是一句承诺，而是可检查的状态：安全等待、只恢复一次、带证据返回，并让责任跨 Issue 延续。</sub></p>
 
 ## 核心产品对象
 
@@ -183,8 +191,10 @@ Weft 可能只会增加额外结构。它不替代 Git 托管平台、通用项�
 ## 当前架构
 
 <p align="center">
-  <img src="assets/diagrams/arch-zh.svg" alt="Weft 本地优先架构" width="940" />
+  <img src="assets/diagrams/arch-zh.png" alt="Weft 当前本地优先架构：桌面端和 IM 投影本地控制面，底层连接原生 Coding Agent、仓库 Worktree、本地持久化状态和外部代码托管事实" width="940" />
 </p>
+
+<p align="center"><sub>当前架构：控制与执行留在本地，代码托管平台事实按需查询。</sub></p>
 
 Rust 后端负责本地 SQLite 状态库、Git Worktree 生命周期、Headless Agent 进程、权限注册中心、
 本地 Thread Bus、IM 桥、Skill 源、电源管理、加密备份、Computer Use 控制和 Sidecar 观测。

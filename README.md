@@ -14,8 +14,10 @@ and brings back evidence, decisions, and review-ready changes—not just chat lo
 </div>
 
 <p align="center">
-  <img src="assets/readme/weft-overview.png" alt="Weft coordinates repository-scoped agent work into one reviewable delivery" width="940" />
+  <img src="assets/readme/weft-delivery-workbench.jpg" alt="A hand-drawn local delivery workbench: one product goal enters Weft, repository worktrees run on the same machine, and their diffs, checks, PR state, and one exceptional Gate converge into a review surface" width="940" />
 </p>
+
+<p align="center"><sub>One local workbench: repository-scoped Runs stay inside policy and converge into evidence you can review.</sub></p>
 
 ## The 30-second version
 
@@ -69,6 +71,12 @@ explicit responsibilities and verified project knowledge across issues.
 
 The human owns product judgment, authority, and high-risk decisions. Weft owns
 the polling, bookkeeping, recovery, and routine coordination.
+
+<p align="center">
+  <img src="assets/readme/weft-continuity-roster.jpg" alt="A hand-drawn evening-to-morning sequence: a coding-agent usage limit pauses safely with its worktree and evidence intact, resumes once after the reset and policy check, then returns a concise summary beside a long-lived agent roster" width="940" />
+</p>
+
+<p align="center"><sub>Continuity is a product state: wait safely, resume once, return with evidence, and carry verified responsibility across Issues.</sub></p>
 
 ## The product model
 
@@ -214,8 +222,10 @@ agents themselves, or production-operations controls.
 ## Architecture today
 
 <p align="center">
-  <img src="assets/diagrams/arch-en.svg" alt="Weft local-first architecture" width="940" />
+  <img src="assets/diagrams/arch-en.png" alt="Weft current local-first architecture: desktop and IM surfaces project a local control plane over native coding agents, repository worktrees, durable state, and external code-host facts" width="940" />
 </p>
+
+<p align="center"><sub>Current architecture: local control and execution, with external code-host facts queried on demand.</sub></p>
 
 The Rust backend owns the local SQLite store, Git worktree lifecycle, headless
 agent processes, permission registry, local thread bus, IM bridge, Skill sources,
