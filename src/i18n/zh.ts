@@ -1038,6 +1038,7 @@ export const zh = {
       needs_you: "需要你处理",
       unknown: "证据未知",
       failed: "已失败",
+      unavailable: "就绪状态不可用",
     },
     reason: {
       no_active_lanes: "没有活跃 Lane",

@@ -1,38 +1,60 @@
+import { CircleAlert } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import type { IssueReadiness, ReadinessReason, ReadinessReasonCode } from "../lib/types";
+import type { ReadinessFetchState } from "../lib/readinessKey";
+import type {
+  IssueReadiness,
+  IssueReadinessDto,
+  ReadinessReason,
+  ReadinessReasonCode,
+} from "../lib/types";
 
 interface ReadinessPresentation {
   color: string;
   dot: string;
   labelKey: string;
+  glyph: "dot" | "alert";
 }
 
+type ReadinessChipVariant = IssueReadiness | "unavailable";
+type ReadinessChipDto = Pick<IssueReadinessDto, "readiness" | "reasons">;
+
 /** The one frontend mapping from backend readiness discriminators to UI. */
-const PRESENTATION: Record<IssueReadiness, ReadinessPresentation> = {
+const PRESENTATION: Record<ReadinessChipVariant, ReadinessPresentation> = {
   review_ready: {
     color: "text-accent ring-accent/25",
     dot: "bg-accent",
     labelKey: "readiness.status.review_ready",
+    glyph: "dot",
   },
   blocked: {
     color: "text-danger ring-danger/25",
     dot: "bg-danger",
     labelKey: "readiness.status.blocked",
+    glyph: "dot",
   },
   needs_you: {
     color: "text-waiting ring-waiting/30",
     dot: "bg-waiting",
     labelKey: "readiness.status.needs_you",
+    glyph: "dot",
   },
   unknown: {
     color: "text-ink-muted ring-border",
     dot: "bg-ink-faint",
     labelKey: "readiness.status.unknown",
+    glyph: "dot",
   },
   failed: {
     color: "text-danger ring-danger/35",
     dot: "bg-danger",
     labelKey: "readiness.status.failed",
+    glyph: "dot",
+  },
+  unavailable: {
+    color: "text-danger ring-danger/35",
+    dot: "bg-danger",
+    labelKey: "readiness.status.unavailable",
+    glyph: "alert",
   },
 };
 
@@ -61,23 +83,40 @@ const LOADING_REASON: ReadinessReason = {
   direction_id: null,
 };
 
+interface ChipView {
+  variant: ReadinessChipVariant;
+  reasons: ReadinessReason[];
+}
+
+function chipView(state: ReadinessFetchState<ReadinessChipDto>): ChipView {
+  switch (state.kind) {
+    case "loading":
+      return { variant: "unknown", reasons: [LOADING_REASON] };
+    case "failed":
+      return { variant: "unavailable", reasons: [] };
+    case "ready":
+      return { variant: state.dto.readiness, reasons: state.dto.reasons };
+  }
+}
+
+function ReadinessGlyph({ presentation }: { presentation: ReadinessPresentation }) {
+  if (presentation.glyph === "alert") {
+    return <CircleAlert size={12} aria-hidden="true" />;
+  }
+  return <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${presentation.dot}`} />;
+}
+
 export function ReadinessChip({
-  readiness,
-  reasons,
+  state,
   className,
 }: {
-  readiness?: IssueReadiness;
-  reasons?: ReadinessReason[];
+  state: ReadinessFetchState<ReadinessChipDto>;
   className?: string;
 }) {
   const { t } = useTranslation();
-  const resolvedReadiness = readiness ?? "unknown";
-  const presentation = PRESENTATION[resolvedReadiness];
-  let displayedReasons = reasons ?? [];
-  if (readiness == null && displayedReasons.length === 0) {
-    displayedReasons = [LOADING_REASON];
-  }
-  const reasonText = displayedReasons.map((reason) => t(REASON_KEYS[reason.code])).join(" · ");
+  const view = chipView(state);
+  const presentation = PRESENTATION[view.variant];
+  const reasonText = view.reasons.map((reason) => t(REASON_KEYS[reason.code])).join(" · ");
   const classNames = [
     "inline-flex min-w-0 items-center gap-1.5 rounded-full bg-raised px-2 py-0.5 text-[10.5px] font-medium ring-1 ring-inset",
     presentation.color,
@@ -88,7 +127,7 @@ export function ReadinessChip({
 
   return (
     <span className={classNames.join(" ")} title={reasonText}>
-      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${presentation.dot}`} />
+      <ReadinessGlyph presentation={presentation} />
       <span className="shrink-0">{t(presentation.labelKey)}</span>
       {reasonText && <span className="min-w-0 truncate text-ink-faint">{reasonText}</span>}
     </span>

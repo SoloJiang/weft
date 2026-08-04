@@ -1053,6 +1053,7 @@ async fn merged_clear_unbound_pr_does_not_change_ready_issue() {
 #[tokio::test]
 async fn branch_mismatch_is_execution_drift() {
     let fixture = fixture(None).await;
+    let counter = add_counting_build_script(&fixture).await;
     let direction = repo::get_direction(&fixture.db, fixture.direction_id)
         .await
         .expect("direction query")
@@ -1070,4 +1071,8 @@ async fn branch_mismatch_is_execution_drift() {
 
     assert_eq!(result.readiness, IssueReadiness::Blocked);
     assert_eq!(result.reasons[0].code, ReasonCode::ExecutionDrifted);
+    assert!(
+        !counter.exists(),
+        "a drifted checkout must not start the readiness check process"
+    );
 }

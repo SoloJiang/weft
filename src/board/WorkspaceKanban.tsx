@@ -18,8 +18,11 @@ import { cn } from "../lib/cn";
 import {
   beginReadinessRefresh,
   buildReadinessKey,
+  completeReadinessRefresh,
+  failReadinessRefresh,
   isReadinessResponseApplicable,
   selectVisibleReadiness,
+  type ReadinessFetchState,
   type StoredReadiness,
 } from "../lib/readinessKey";
 
@@ -221,10 +224,15 @@ function ThreadCard({
       directionId,
       exists: (worktreesByDirection[directionId] ?? []).some((worktree) => worktree.exists),
     })),
+    workerSessions: Object.values(sessions).map((session) => ({
+      directionId: session.directionId,
+      sessionId: session.info.session_id,
+      status: session.status,
+    })),
     planStatus: o.plan_status,
     prRevision: prReadinessRevision,
   });
-  const readiness = selectVisibleReadiness(storedReadiness, o.thread_id, readinessKey);
+  const visibleReadiness = selectVisibleReadiness(storedReadiness, o.thread_id, readinessKey);
 
   useEffect(() => {
     const request = {
@@ -236,10 +244,10 @@ function ThreadCard({
     setStoredReadiness({
       threadId: request.threadId,
       key: requestKey,
-      dto: beginReadinessRefresh(),
+      state: beginReadinessRefresh(),
     });
     let cancelled = false;
-    const storeResponse = (dto: IssueReadinessDto | null) => {
+    const storeResponse = (state: ReadinessFetchState<IssueReadinessDto>) => {
       setStoredReadiness((current) => {
         if (
           !isReadinessResponseApplicable(
@@ -250,7 +258,7 @@ function ThreadCard({
         ) {
           return current;
         }
-        return { threadId: request.threadId, key: requestKey, dto };
+        return { threadId: request.threadId, key: requestKey, state };
       });
     };
     void api
@@ -259,13 +267,13 @@ function ThreadCard({
         if (cancelled) {
           return;
         }
-        storeResponse(next);
+        storeResponse(completeReadinessRefresh(next));
       })
       .catch(() => {
         if (cancelled) {
           return;
         }
-        storeResponse(null);
+        storeResponse(failReadinessRefresh());
       });
     return () => {
       cancelled = true;
@@ -363,8 +371,7 @@ function ThreadCard({
           </span>
         )}
         <ReadinessChip
-          readiness={readiness?.readiness}
-          reasons={readiness?.reasons}
+          state={visibleReadiness}
           className="max-w-full"
         />
         {inherited && <InheritedAccessChip threadId={o.thread_id} />}

@@ -43,9 +43,12 @@ import { cn } from "../lib/cn";
 import {
   beginReadinessRefresh,
   buildReadinessKey,
+  completeReadinessRefresh,
+  failReadinessRefresh,
   isDirectionUrgent,
   isReadinessResponseApplicable,
   selectVisibleReadiness,
+  type ReadinessFetchState,
   type StoredReadiness,
 } from "../lib/readinessKey";
 
@@ -90,6 +93,7 @@ export function ThreadBoard() {
     attentionItems,
     checksByDirection,
     worktreesByDirection,
+    sessions,
   } = useStore();
   const { t } = useTranslation();
   const thread = threads.find((th) => th.id === activeThreadId);
@@ -114,14 +118,23 @@ export function ThreadBoard() {
     directions: activeDirections,
     attentionIds,
     worktrees: worktreeSignatures,
+    workerSessions: Object.values(sessions).map((session) => ({
+      directionId: session.directionId,
+      sessionId: session.info.session_id,
+      status: session.status,
+    })),
     planStatus: proposal?.status ?? null,
     prRevision: prReadinessRevision,
   });
-  const issueReadiness = selectVisibleReadiness(
+  const visibleReadiness = selectVisibleReadiness(
     storedIssueReadiness,
     activeThreadId,
     readinessKey,
   );
+  let issueReadiness: IssueReadinessDto | null = null;
+  if (visibleReadiness.kind === "ready") {
+    issueReadiness = visibleReadiness.dto;
+  }
 
   useEffect(() => {
     if (activeThreadId == null) {
@@ -138,10 +151,10 @@ export function ThreadBoard() {
     setStoredIssueReadiness({
       threadId: request.threadId,
       key: requestKey,
-      dto: beginReadinessRefresh(),
+      state: beginReadinessRefresh(),
     });
     let cancelled = false;
-    const storeResponse = (dto: IssueReadinessDto | null) => {
+    const storeResponse = (state: ReadinessFetchState<IssueReadinessDto>) => {
       setStoredIssueReadiness((current) => {
         if (
           !isReadinessResponseApplicable(
@@ -152,7 +165,7 @@ export function ThreadBoard() {
         ) {
           return current;
         }
-        return { threadId: request.threadId, key: requestKey, dto };
+        return { threadId: request.threadId, key: requestKey, state };
       });
     };
     void api
@@ -161,13 +174,13 @@ export function ThreadBoard() {
         if (cancelled) {
           return;
         }
-        storeResponse(readiness);
+        storeResponse(completeReadinessRefresh(readiness));
       })
       .catch(() => {
         if (cancelled) {
           return;
         }
-        storeResponse(null);
+        storeResponse(failReadinessRefresh());
       });
     return () => {
       cancelled = true;
@@ -291,8 +304,7 @@ export function ThreadBoard() {
       <header className="flex shrink-0 items-center gap-2 border-b border-border px-5 py-2.5">
         <h1 className="min-w-0 flex-1 truncate text-[13px] font-semibold text-ink">{thread.title}</h1>
         <ReadinessChip
-          readiness={issueReadiness?.readiness}
-          reasons={issueReadiness?.reasons}
+          state={visibleReadiness}
           className="max-w-[min(60%,28rem)]"
         />
       </header>

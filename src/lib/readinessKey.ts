@@ -10,10 +10,18 @@ export interface ReadinessWorktreeSignature {
   exists: boolean;
 }
 
+/** A live worker session whose terminal transition can invalidate readiness. */
+export interface ReadinessWorkerSessionSignature {
+  directionId: number;
+  sessionId: number;
+  status: string;
+}
+
 export interface ReadinessKeyInput {
   directions: ReadinessDirectionSignature[];
   attentionIds: string[];
   worktrees: ReadinessWorktreeSignature[];
+  workerSessions: ReadinessWorkerSessionSignature[];
   planStatus: string | null;
   prRevision: number;
 }
@@ -23,11 +31,17 @@ export interface ReadinessRequest {
   revision: number;
 }
 
-/** A response and the exact refresh input that produced it. */
+/** The client-visible lifecycle of one readiness read. */
+export type ReadinessFetchState<T> =
+  | { kind: "loading" }
+  | { kind: "failed" }
+  | { kind: "ready"; dto: T };
+
+/** A response state and the exact refresh input that produced it. */
 export interface StoredReadiness<T> {
   threadId: number;
   key: string;
-  dto: T | null;
+  state: ReadinessFetchState<T>;
 }
 
 export interface DirectionUrgencyInput {
@@ -44,6 +58,27 @@ const URGENT_LANE_READINESS: Record<LaneReadiness, boolean> = {
   failed: true,
 };
 
+/** The newest known session per relevant direction, in deterministic order. */
+export function latestWorkerSessionSignatures(
+  directionIds: number[],
+  sessions: ReadinessWorkerSessionSignature[],
+): ReadinessWorkerSessionSignature[] {
+  const relevantDirections = new Set(directionIds);
+  const latestByDirection = new Map<number, ReadinessWorkerSessionSignature>();
+  for (const session of sessions) {
+    if (!relevantDirections.has(session.directionId)) {
+      continue;
+    }
+    const current = latestByDirection.get(session.directionId);
+    if (!current || session.sessionId > current.sessionId) {
+      latestByDirection.set(session.directionId, session);
+    }
+  }
+  return [...latestByDirection.values()].sort(
+    (left, right) => left.directionId - right.directionId,
+  );
+}
+
 /** Stable refresh input for one backend readiness read. */
 export function buildReadinessKey(input: ReadinessKeyInput): string {
   const directions = [...input.directions]
@@ -55,11 +90,18 @@ export function buildReadinessKey(input: ReadinessKeyInput): string {
     .sort((left, right) => left.directionId - right.directionId)
     .map((worktree) => `${worktree.directionId}:${worktree.exists}`)
     .join(",");
+  const workerSessions = latestWorkerSessionSignatures(
+    input.directions.map((direction) => direction.id),
+    input.workerSessions,
+  )
+    .map((session) => `${session.directionId}:${session.sessionId}:${session.status}`)
+    .join(",");
   const planStatus = input.planStatus ?? "";
   return [
     `directions:${directions}`,
     `attention:${attentionIds}`,
     `worktrees:${worktrees}`,
+    `workers:${workerSessions}`,
     `plan:${planStatus}`,
     `pr:${input.prRevision}`,
   ].join("|");
@@ -85,19 +127,29 @@ export function selectVisibleReadiness<T>(
   stored: StoredReadiness<T> | null,
   threadId: number | null,
   key: string,
-): T | null {
+): ReadinessFetchState<T> {
   if (!stored || stored.threadId !== threadId) {
-    return null;
+    return beginReadinessRefresh();
   }
   if (stored.key !== key) {
-    return null;
+    return beginReadinessRefresh();
   }
-  return stored.dto;
+  return stored.state;
 }
 
 /** A refresh never presents a prior verdict as current evidence. */
-export function beginReadinessRefresh(): null {
-  return null;
+export function beginReadinessRefresh<T>(): ReadinessFetchState<T> {
+  return { kind: "loading" };
+}
+
+/** A successful response becomes the only current delivery evidence. */
+export function completeReadinessRefresh<T>(dto: T): ReadinessFetchState<T> {
+  return { kind: "ready", dto };
+}
+
+/** A rejected request is unavailable until the next refresh starts. */
+export function failReadinessRefresh<T>(): ReadinessFetchState<T> {
+  return { kind: "failed" };
 }
 
 /** A response belongs only to the thread that was current when it was requested. */
@@ -122,12 +174,12 @@ export function isReadinessResponseApplicable(
 
 /** Apply a fetch result only when the refresh that produced it is still live. */
 export function applyReadinessResponse<T>(
-  current: T | null,
+  current: ReadinessFetchState<T>,
   request: ReadinessRequest,
   currentThreadId: number | null,
   currentRevision: number,
-  result: T | null,
-): T | null {
+  result: ReadinessFetchState<T>,
+): ReadinessFetchState<T> {
   if (!isReadinessResponseApplicable(request, currentThreadId, currentRevision)) {
     return current;
   }

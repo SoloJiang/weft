@@ -1076,6 +1076,7 @@ export const en = {
       needs_you: "Needs you",
       unknown: "Evidence unknown",
       failed: "Failed",
+      unavailable: "Readiness unavailable",
     },
     reason: {
       no_active_lanes: "No active lanes",

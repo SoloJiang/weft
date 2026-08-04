@@ -54,6 +54,7 @@
 //! | an inferred check failed for a claimed-complete lane | Blocked | ChecksFailing |
 //! | upstream evidence is Unmet (including a pending or unregistered upstream PR) | Blocked | UpstreamUnmet |
 //! | upstream evidence is Unknown | Unknown | RemoteUnknown |
+//! | tracked PR lifecycle is `merged` | continue; terminal merge evidence clears every PR axis | — |
 //! | tracked PR probe failed or lifecycle is unknown | Unknown | RemoteUnknown |
 //! | tracked open PR has no valid successful timestamp, its snapshot is older than its TTL, or PR sweeping is disabled | Unknown | RemoteUnknown |
 //! | tracked PR is closed without merge | Blocked | PrClosedUnmerged |
@@ -78,11 +79,23 @@
 //! review readiness.
 //!
 //! Check collection is intentionally gated by claimed completion: only
-//! `review` and `done` lanes invoke the existing check runner. The collector
-//! records `NotApplicable` for `queued`, `planning`, and `working` lanes;
-//! that evidence skips both check-failing and check-unknown verdict rows.
-//! This retains check.rs's worker-done-means-checks-green contract without
-//! turning ordinary in-progress work into automatic build/test execution.
+//! `review` and `done` lanes invoke inferred checks. The collector records
+//! `NotApplicable` for `queued`, `planning`, and `working` lanes; that evidence
+//! skips both check-failing and check-unknown verdict rows. A reconciliation
+//! drift also records `NotApplicable` and never starts checks: its
+//! `ExecutionDrifted` verdict has already won, and a mismatched checkout is not
+//! a safe target for build/test work. This retains check.rs's
+//! worker-done-means-checks-green contract without turning ordinary in-progress
+//! work into automatic build/test execution.
+//!
+//! Readiness checks reuse `check::infer_checks`, but run each inferred rung in
+//! a kill-on-drop Tokio child with a 120-second per-rung deadline. A timeout or
+//! child-wait failure is `NotProduced`, so the result remains fail-closed while
+//! the direction lock and global runner permit are released. Completed output
+//! uses the same combined-output, 2000-byte tail convention as `CheckResult`.
+//! The process-local single-flight cache is valid for at most 10 minutes and
+//! only while its sorted worktree-path signature and every worktree HEAD SHA
+//! match the newly collected values; any HEAD change immediately reruns checks.
 //!
 //! Upstream evidence is collected from the established
 //! `repo::upstream_merge_state` contract:
@@ -142,6 +155,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     path::Path,
+    process::Stdio,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -343,6 +357,14 @@ fn one_pull_request_verdict(
     pr: &PullRequestFacts,
     open_pr_snapshot_freshness: OpenPrSnapshotFreshness,
 ) -> Option<(LaneReadiness, ReasonCode)> {
+    // A merged lifecycle is terminal, stronger evidence than every live axis.
+    // GitHub's real merged fixture has `mergeable: "UNKNOWN"` and an empty
+    // review decision after GitHub stops computing them, so applying the open
+    // PR axes here would turn a completed delivery back into RemoteUnknown.
+    if pr.lifecycle == Some(PrLifecycle::Merged) {
+        return None;
+    }
+
     // A failed probe means any prior snapshot is stale. This includes the
     // first-probe case (error + all four stored axes empty) and later
     // failures, which must not silently reuse an old all-clear.
@@ -681,7 +703,8 @@ fn virtual_lane_facts(
     }
 }
 
-const CHECK_EVIDENCE_TTL: Duration = Duration::from_secs(60);
+const CHECK_EVIDENCE_TTL: Duration = Duration::from_secs(10 * 60);
+const READINESS_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_CONCURRENT_CHECK_RUNNERS: usize = 2;
 // Keep this aligned with host::monitor's private default. The readiness
 // collector uses commands::env_secs too, so malformed values resolve exactly
@@ -718,13 +741,21 @@ fn current_open_pr_snapshot_freshness() -> Result<OpenPrSnapshotFreshness> {
 #[derive(Clone)]
 struct CachedCheckEvidence {
     collected_at: Instant,
-    paths: Vec<String>,
+    path_signature: Vec<String>,
+    head_signature: Vec<String>,
     evidence: CheckEvidence,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CheckTarget {
+    path: String,
+    head_sha: String,
+}
+
 /// Process-local coordination for readiness-triggered verification. The cache
-/// is keyed by direction id, but also records the worktree paths that produced
-/// it so a recreated worktree cannot inherit a prior checkout's evidence.
+/// is keyed by direction id, but also records the worktree path and HEAD-SHA
+/// signatures that produced it so a recreated or newly committed checkout
+/// cannot inherit prior evidence.
 struct CheckFlight {
     cache: Mutex<HashMap<i32, CachedCheckEvidence>>,
     direction_locks: Mutex<HashMap<i32, Arc<AsyncMutex<()>>>>,
@@ -742,7 +773,16 @@ impl CheckFlight {
         }
     }
 
-    fn cached(&self, direction_id: i32, paths: &[String]) -> Result<Option<CheckEvidence>> {
+    fn signatures(targets: &[CheckTarget]) -> (Vec<String>, Vec<String>) {
+        let paths = targets.iter().map(|target| target.path.clone()).collect();
+        let heads = targets
+            .iter()
+            .map(|target| target.head_sha.clone())
+            .collect();
+        (paths, heads)
+    }
+
+    fn cached(&self, direction_id: i32, targets: &[CheckTarget]) -> Result<Option<CheckEvidence>> {
         let cache = self
             .cache
             .lock()
@@ -751,7 +791,11 @@ impl CheckFlight {
             return Ok(None);
         };
         let is_fresh = Instant::now().saturating_duration_since(entry.collected_at) < self.ttl;
-        if entry.paths == paths && is_fresh {
+        let (path_signature, head_signature) = Self::signatures(targets);
+        if entry.path_signature == path_signature
+            && entry.head_signature == head_signature
+            && is_fresh
+        {
             return Ok(Some(entry.evidence));
         }
         Ok(None)
@@ -771,18 +815,20 @@ impl CheckFlight {
     fn cache_result(
         &self,
         direction_id: i32,
-        paths: Vec<String>,
+        targets: &[CheckTarget],
         evidence: CheckEvidence,
     ) -> Result<()> {
         let mut cache = self
             .cache
             .lock()
             .map_err(|_| anyhow!("readiness check cache lock poisoned"))?;
+        let (path_signature, head_signature) = Self::signatures(targets);
         cache.insert(
             direction_id,
             CachedCheckEvidence {
                 collected_at: Instant::now(),
-                paths,
+                path_signature,
+                head_signature,
                 evidence,
             },
         );
@@ -792,21 +838,25 @@ impl CheckFlight {
     async fn get_or_run<F, Fut>(
         &self,
         direction_id: i32,
-        mut paths: Vec<String>,
+        mut targets: Vec<CheckTarget>,
         runner: F,
     ) -> Result<CheckEvidence>
     where
         F: FnOnce(Vec<String>) -> Fut,
-        Fut: Future<Output = CheckEvidence>,
+        Fut: Future<Output = Result<CheckEvidence>>,
     {
-        paths.sort();
-        if let Some(evidence) = self.cached(direction_id, &paths)? {
+        targets.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then(left.head_sha.cmp(&right.head_sha))
+        });
+        if let Some(evidence) = self.cached(direction_id, &targets)? {
             return Ok(evidence);
         }
 
         let direction_lock = self.direction_lock(direction_id)?;
         let _direction_guard = direction_lock.lock().await;
-        if let Some(evidence) = self.cached(direction_id, &paths)? {
+        if let Some(evidence) = self.cached(direction_id, &targets)? {
             return Ok(evidence);
         }
 
@@ -815,8 +865,9 @@ impl CheckFlight {
             .acquire()
             .await
             .map_err(|_| anyhow!("readiness check runner semaphore closed"))?;
-        let evidence = runner(paths.clone()).await;
-        self.cache_result(direction_id, paths, evidence)?;
+        let paths = targets.iter().map(|target| target.path.clone()).collect();
+        let evidence = runner(paths).await?;
+        self.cache_result(direction_id, &targets, evidence)?;
         Ok(evidence)
     }
 }
@@ -891,42 +942,152 @@ async fn checks_for_with_runner<F, Fut>(
 ) -> Result<CheckEvidence>
 where
     F: FnOnce(Vec<String>) -> Fut,
-    Fut: Future<Output = CheckEvidence>,
+    Fut: Future<Output = Result<CheckEvidence>>,
 {
     if !matches!(direction.status.as_str(), "review" | "done") {
         return Ok(CheckEvidence::NotApplicable);
     }
 
     let worktrees = repo::list_worktrees(db, Some(direction.id)).await?;
-    let paths: Vec<String> = worktrees
-        .into_iter()
-        .filter(|worktree| Path::new(&worktree.path).is_dir())
-        .map(|worktree| worktree.path)
-        .collect();
-    if paths.is_empty() {
+    let mut targets = Vec::new();
+    for worktree in worktrees {
+        let path = Path::new(&worktree.path);
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(head_sha) = crate::git::head_commit_full(path) else {
+            return Ok(CheckEvidence::NotProduced);
+        };
+        targets.push(CheckTarget {
+            path: worktree.path,
+            head_sha,
+        });
+    }
+    if targets.is_empty() {
         return Ok(CheckEvidence::NotProduced);
     }
 
-    flight.get_or_run(direction.id, paths, runner).await
+    flight.get_or_run(direction.id, targets, runner).await
+}
+
+fn check_output_tail(output: &str, max: usize) -> String {
+    if output.len() <= max {
+        return output.trim_end().to_string();
+    }
+    let mut start = output.len() - max;
+    while start < output.len() && !output.is_char_boundary(start) {
+        start += 1;
+    }
+    let slice = &output[start..];
+    let slice = slice
+        .find('\n')
+        .map(|index| &slice[index + 1..])
+        .unwrap_or(slice);
+    format!("…\n{}", slice.trim_end())
+}
+
+async fn run_bounded_check(
+    cwd: &Path,
+    check: &crate::check::Check,
+    timeout: Duration,
+) -> Result<Option<crate::check::CheckResult>> {
+    let mut command = tokio::process::Command::new(&check.program);
+    command
+        .args(&check.args)
+        .current_dir(cwd)
+        .env("PATH", crate::detect::tool_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Ok(Some(crate::check::CheckResult {
+                name: check.name.clone(),
+                status: "fail".to_string(),
+                code: -1,
+                output_tail: format!("could not run {}: {error}", check.program),
+            }));
+        }
+    };
+    // `wait_with_output` owns the child. When this deadline elapses, dropping
+    // that future drops the kill-on-drop child; the unknown result must never
+    // retain a CheckFlight direction lock or global runner permit.
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) | Err(_) => return Ok(None),
+    };
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(Some(crate::check::CheckResult {
+        name: check.name.clone(),
+        status: if output.status.success() {
+            "pass"
+        } else {
+            "fail"
+        }
+        .to_string(),
+        code: output.status.code().unwrap_or(-1),
+        output_tail: check_output_tail(&combined, 2_000),
+    }))
+}
+
+async fn run_checks_with_timeout(
+    cwd: &Path,
+    checks: &[crate::check::Check],
+    timeout: Duration,
+) -> Result<CheckEvidence> {
+    let mut evidence = CheckEvidence::Passed;
+    for check in checks {
+        let Some(result) = run_bounded_check(cwd, check, timeout).await? else {
+            return Ok(CheckEvidence::NotProduced);
+        };
+        if result.status == "fail" {
+            evidence = CheckEvidence::Failing;
+        }
+    }
+    Ok(evidence)
+}
+
+async fn run_readiness_checks(paths: Vec<String>, timeout: Duration) -> Result<CheckEvidence> {
+    let mut evidence = CheckEvidence::Passed;
+    for path in paths {
+        let checks = crate::check::infer_checks(Path::new(&path));
+        let path_evidence = run_checks_with_timeout(Path::new(&path), &checks, timeout).await?;
+        if path_evidence == CheckEvidence::NotProduced {
+            return Ok(CheckEvidence::NotProduced);
+        }
+        if path_evidence == CheckEvidence::Failing {
+            evidence = CheckEvidence::Failing;
+            continue;
+        }
+        if path_evidence == CheckEvidence::NotProduced && evidence != CheckEvidence::Failing {
+            evidence = CheckEvidence::NotProduced;
+        }
+    }
+    Ok(evidence)
 }
 
 async fn checks_for(db: &Db, direction: &direction::Model) -> Result<CheckEvidence> {
     checks_for_with_runner(db, direction, check_flight(), |paths| async move {
-        let result = tauri::async_runtime::spawn_blocking(move || {
-            paths.into_iter().any(|path| {
-                crate::check::run_checks(Path::new(&path))
-                    .iter()
-                    .any(|check| check.status == "fail")
-            })
-        })
-        .await;
-        match result {
-            Ok(true) => CheckEvidence::Failing,
-            Ok(false) => CheckEvidence::Passed,
-            Err(_) => CheckEvidence::NotProduced,
-        }
+        run_readiness_checks(paths, READINESS_CHECK_TIMEOUT).await
     })
     .await
+}
+
+async fn checks_after_reconciliation<F, Fut>(
+    reconciliation: ExecutionReconciliation,
+    collect_checks: F,
+) -> Result<CheckEvidence>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<CheckEvidence>>,
+{
+    if reconciliation == ExecutionReconciliation::Drifted {
+        return Ok(CheckEvidence::NotApplicable);
+    }
+    collect_checks().await
 }
 
 fn parse_review_status(raw: &str) -> ReviewStatus {
@@ -993,6 +1154,8 @@ async fn collect_lane(
     let mut pull_requests = repo::list_pull_requests_for_direction(db, direction.id).await?;
     pull_requests.sort_by_key(|row| row.id);
     let pull_requests = pull_requests.iter().map(pull_request_facts).collect();
+    let reconciliation = reconciliation_for(db, direction).await?;
+    let checks = checks_after_reconciliation(reconciliation, || checks_for(db, direction)).await?;
     Ok(LaneFacts {
         direction_id: direction.id,
         name: direction.name.clone(),
@@ -1000,8 +1163,8 @@ async fn collect_lane(
         policy,
         worker_failed: latest_worker_failed(db, direction.id).await?,
         has_open_ask: open_ask_direction_ids.contains(&direction.id),
-        reconciliation: reconciliation_for(db, direction).await?,
-        checks: checks_for(db, direction).await?,
+        reconciliation,
+        checks,
         upstream: upstream_evidence(repo::upstream_merge_state(db, direction.id).await),
         open_pr_snapshot_freshness,
         pull_requests,
@@ -1220,6 +1383,13 @@ mod tests {
         }
     }
 
+    fn check_targets(path: &str, head_sha: &str) -> Vec<CheckTarget> {
+        vec![CheckTarget {
+            path: path.to_string(),
+            head_sha: head_sha.to_string(),
+        }]
+    }
+
     fn verdict(facts: &LaneFacts) -> (LaneReadiness, Option<ReasonCode>) {
         let verdict = lane_readiness(facts).expect("active lane has a verdict");
         let reason = verdict.reasons.first().map(|reason| reason.code);
@@ -1410,6 +1580,28 @@ mod tests {
             lane.pull_requests = vec![pr];
             assert_eq!(verdict(&lane), (readiness, Some(reason)));
         }
+    }
+
+    #[test]
+    fn github_merged_fixture_shape_is_terminally_clear() {
+        // Mirrors host/github.rs's real `gh pr view` merged fixture: GitHub
+        // leaves `mergeable: "UNKNOWN"` and an empty review decision after a
+        // merge, so all live axes must be skipped by the terminal lifecycle.
+        let mut lane = facts();
+        let mut merged = pr();
+        merged.lifecycle = Some(PrLifecycle::Merged);
+        merged.review = ReviewStatus::AwaitingApproval;
+        merged.threads = ThreadStatus::Unknown {
+            reason: "review threads have not been read yet".to_string(),
+        };
+        merged.conflict = ConflictStatus::Unknown {
+            reason: "GitHub hasn't finished computing mergeability yet".to_string(),
+        };
+        merged.last_checked_at = None;
+        merged.probe_failed = true;
+        lane.pull_requests = vec![merged];
+
+        assert_eq!(verdict(&lane), (LaneReadiness::ReviewReady, None));
     }
 
     #[test]
@@ -1693,8 +1885,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_flight_singleflights_and_reuses_fresh_evidence() {
-        let flight = Arc::new(CheckFlight::new(Duration::from_secs(60), 2));
+    async fn check_flight_singleflights_reuses_matching_heads_and_reruns_on_head_change() {
+        let flight = Arc::new(CheckFlight::new(CHECK_EVIDENCE_TTL, 2));
         let runs = Arc::new(AtomicUsize::new(0));
         let mut tasks = Vec::new();
         for _ in 0..8 {
@@ -1702,14 +1894,18 @@ mod tests {
             let runs = Arc::clone(&runs);
             tasks.push(tokio::spawn(async move {
                 flight
-                    .get_or_run(41, vec!["/tmp/check-flight".to_string()], move |_| {
-                        let runs = Arc::clone(&runs);
-                        async move {
-                            runs.fetch_add(1, Ordering::SeqCst);
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                            CheckEvidence::Passed
-                        }
-                    })
+                    .get_or_run(
+                        41,
+                        check_targets("/tmp/check-flight", "head-a"),
+                        move |_| {
+                            let runs = Arc::clone(&runs);
+                            async move {
+                                runs.fetch_add(1, Ordering::SeqCst);
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                                Ok(CheckEvidence::Passed)
+                            }
+                        },
+                    )
                     .await
             }));
         }
@@ -1724,17 +1920,39 @@ mod tests {
 
         let reuse_runs = Arc::clone(&runs);
         let reused = flight
-            .get_or_run(41, vec!["/tmp/check-flight".to_string()], move |_| {
-                let reuse_runs = Arc::clone(&reuse_runs);
-                async move {
-                    reuse_runs.fetch_add(1, Ordering::SeqCst);
-                    CheckEvidence::Failing
-                }
-            })
+            .get_or_run(
+                41,
+                check_targets("/tmp/check-flight", "head-a"),
+                move |_| {
+                    let reuse_runs = Arc::clone(&reuse_runs);
+                    async move {
+                        reuse_runs.fetch_add(1, Ordering::SeqCst);
+                        Ok(CheckEvidence::Failing)
+                    }
+                },
+            )
             .await
             .expect("fresh cache result");
         assert_eq!(reused, CheckEvidence::Passed);
         assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        let changed_head_runs = Arc::clone(&runs);
+        let changed_head = flight
+            .get_or_run(
+                41,
+                check_targets("/tmp/check-flight", "head-b"),
+                move |_| {
+                    let changed_head_runs = Arc::clone(&changed_head_runs);
+                    async move {
+                        changed_head_runs.fetch_add(1, Ordering::SeqCst);
+                        Ok(CheckEvidence::Failing)
+                    }
+                },
+            )
+            .await
+            .expect("changed head reruns checks");
+        assert_eq!(changed_head, CheckEvidence::Failing);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1744,18 +1962,107 @@ mod tests {
         for _ in 0..2 {
             let runs = Arc::clone(&runs);
             let evidence = flight
-                .get_or_run(42, vec!["/tmp/check-expiry".to_string()], move |_| {
-                    let runs = Arc::clone(&runs);
-                    async move {
-                        runs.fetch_add(1, Ordering::SeqCst);
-                        CheckEvidence::Passed
-                    }
-                })
+                .get_or_run(
+                    42,
+                    check_targets("/tmp/check-expiry", "head-a"),
+                    move |_| {
+                        let runs = Arc::clone(&runs);
+                        async move {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            Ok(CheckEvidence::Passed)
+                        }
+                    },
+                )
                 .await
                 .expect("expired check result");
             assert_eq!(evidence, CheckEvidence::Passed);
         }
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn timed_out_readiness_check_is_not_produced_and_releases_the_runner_permit() {
+        let root = tempfile::tempdir().expect("temporary check fixture");
+        let flight = CheckFlight::new(Duration::ZERO, 1);
+        let hanging_check = crate::check::Check {
+            name: "hang".to_string(),
+            program: "sleep".to_string(),
+            args: vec!["30".to_string()],
+        };
+        let timed_out_path = root.path().to_path_buf();
+        let timed_out_checks = vec![hanging_check];
+        let timed_out = tokio::time::timeout(
+            Duration::from_secs(1),
+            flight.get_or_run(
+                81,
+                check_targets("/tmp/check-timeout", "head-a"),
+                move |_| async move {
+                    run_checks_with_timeout(
+                        timed_out_path.as_path(),
+                        &timed_out_checks,
+                        Duration::from_millis(25),
+                    )
+                    .await
+                },
+            ),
+        )
+        .await
+        .expect("timed-out check returns before the outer deadline")
+        .expect("timed-out check result");
+        assert_eq!(timed_out, CheckEvidence::NotProduced);
+
+        let released = tokio::time::timeout(
+            Duration::from_millis(250),
+            flight.get_or_run(
+                82,
+                check_targets("/tmp/check-after-timeout", "head-a"),
+                |_| async { Ok(CheckEvidence::Passed) },
+            ),
+        )
+        .await
+        .expect("timed-out runner released its global permit")
+        .expect("post-timeout check result");
+        assert_eq!(released, CheckEvidence::Passed);
+    }
+
+    #[tokio::test]
+    async fn drifted_reconciliation_skips_the_check_flight() {
+        let flight = Arc::new(CheckFlight::new(Duration::ZERO, 1));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let skipped_flight = Arc::clone(&flight);
+        let skipped_runs = Arc::clone(&runs);
+        let evidence = checks_after_reconciliation(ExecutionReconciliation::Drifted, move || {
+            let flight = Arc::clone(&skipped_flight);
+            let runs = Arc::clone(&skipped_runs);
+            async move {
+                flight
+                    .get_or_run(83, check_targets("/tmp/check-drift", "head-a"), move |_| {
+                        let runs = Arc::clone(&runs);
+                        async move {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            Ok(CheckEvidence::Passed)
+                        }
+                    })
+                    .await
+            }
+        })
+        .await
+        .expect("drift check decision");
+        assert_eq!(evidence, CheckEvidence::NotApplicable);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+
+        let released = tokio::time::timeout(
+            Duration::from_millis(250),
+            flight.get_or_run(
+                84,
+                check_targets("/tmp/check-after-drift", "head-a"),
+                |_| async { Ok(CheckEvidence::Passed) },
+            ),
+        )
+        .await
+        .expect("drift skip did not retain a runner permit")
+        .expect("post-drift check result");
+        assert_eq!(released, CheckEvidence::Passed);
     }
 
     fn record_max(maximum: &AtomicUsize, candidate: usize) {
@@ -1786,7 +2093,7 @@ mod tests {
                 flight
                     .get_or_run(
                         direction_id,
-                        vec![format!("/tmp/check-{direction_id}")],
+                        check_targets(&format!("/tmp/check-{direction_id}"), "head-a"),
                         move |_| {
                             let active = Arc::clone(&active);
                             let maximum = Arc::clone(&maximum);
@@ -1795,7 +2102,7 @@ mod tests {
                                 record_max(&maximum, current);
                                 tokio::time::sleep(Duration::from_millis(20)).await;
                                 active.fetch_sub(1, Ordering::SeqCst);
-                                CheckEvidence::Passed
+                                Ok(CheckEvidence::Passed)
                             }
                         },
                     )
