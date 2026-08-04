@@ -291,6 +291,13 @@ impl TurnState {
         }
     }
 
+    /// Whether `on_turn_end` will immediately reserve another direct turn.
+    /// This is deliberately a pure look-ahead so callers can join worker
+    /// verification admission before mutating queue state.
+    fn will_start_next_turn(&self) -> bool {
+        self.bus_read_pos.is_some() || !self.queue.is_empty()
+    }
+
     /// Turn finished: deliver the next thing in FIFO order. Messages queued
     /// before a coalesced bus wake drain first; when the wake's position is
     /// reached, synthesize one invisible inbox-read turn; then the rest; finally
@@ -982,17 +989,85 @@ fn finish_hidden_receipt(inner: &mut EngineInner, delivery_id: i32, consumed: bo
     }
 }
 
+/// Returns the readiness direction for a worker engine. Leads deliberately have
+/// no numeric direction and therefore never participate in verification
+/// admission.
+fn worker_direction_id(inner: &EngineInner) -> anyhow::Result<Option<i32>> {
+    if inner.session_id.is_none() {
+        return Ok(None);
+    }
+    let direction_id = inner
+        .ask_dir
+        .parse::<i32>()
+        .map_err(|_| anyhow::anyhow!("invalid worker direction identity"))?;
+    if direction_id <= 0 {
+        anyhow::bail!("invalid worker direction identity");
+    }
+    Ok(Some(direction_id))
+}
+
+/// Acquire the shared readiness gate for a real worker direct turn and drop
+/// any evidence from before that turn. The caller owns the returned guard and
+/// must retain it through the `running` persistence.
+async fn acquire_worker_direct_turn_admission(
+    direction_id: Option<i32>,
+) -> anyhow::Result<Option<crate::readiness::VerificationAdmission>> {
+    let Some(direction_id) = direction_id else {
+        return Ok(None);
+    };
+    let admission = crate::readiness::acquire_verification_admission(direction_id).await?;
+    crate::readiness::invalidate_verification_memo(direction_id)?;
+    Ok(Some(admission))
+}
+
+/// Linearize one worker direct-turn start with readiness verification.
+///
+/// The closure must reserve/begin the direct turn and persist its session as
+/// `running`. It runs only after stale verification evidence has been dropped,
+/// while the shared direction gate remains held. `None` is the lead path and
+/// intentionally preserves its existing no-direction behavior.
+async fn with_worker_direct_turn_admission<T, F, Fut>(
+    direction_id: Option<i32>,
+    start: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let admission = acquire_worker_direct_turn_admission(direction_id).await?;
+    let result = start().await;
+    drop(admission);
+    result
+}
+
+/// Join worker verification admission only when the current turn-end will
+/// actually dequeue another direct turn. Empty queues go idle without touching
+/// cached verification evidence.
+async fn acquire_dequeued_worker_turn_admission(
+    inner: &EngineInner,
+) -> anyhow::Result<Option<crate::readiness::VerificationAdmission>> {
+    if !inner.turn.will_start_next_turn() {
+        return Ok(None);
+    }
+    acquire_worker_direct_turn_admission(worker_direction_id(inner)?).await
+}
+
 async fn begin_hidden_turn(
     app: &AppHandle,
     db: &Db,
     inner: &mut EngineInner,
     hidden_delivery_id: Option<i32>,
-) -> i32 {
-    let turn_id = mark_hidden_turn_started_with_delivery(inner, hidden_delivery_id);
-    crate::power::on_turn_began(app);
-    // Hidden delivery is a turn-start too, so persist `running`; otherwise a
-    // crash mid-action can leave stale `idle` state and skip boot revive.
-    persist_activity(db, inner.session_id, inner.thread_id, "running").await;
+) -> anyhow::Result<i32> {
+    let direction_id = worker_direction_id(inner)?;
+    let turn_id = with_worker_direct_turn_admission(direction_id, || async {
+        let turn_id = mark_hidden_turn_started_with_delivery(inner, hidden_delivery_id);
+        crate::power::on_turn_began(app);
+        // Hidden delivery is a turn-start too, so persist `running`; otherwise a
+        // crash mid-action can leave stale `idle` state and skip boot revive.
+        persist_activity(db, inner.session_id, inner.thread_id, "running").await;
+        Ok(turn_id)
+    })
+    .await?;
     emit_turn_state(
         app,
         inner.thread_id,
@@ -1000,7 +1075,7 @@ async fn begin_hidden_turn(
         inner.turn.busy,
         queue_items(&inner.turn),
     );
-    turn_id
+    Ok(turn_id)
 }
 
 fn queue_hidden_delivery(app: &AppHandle, inner: &mut EngineInner, out: Outgoing) {
@@ -3058,7 +3133,7 @@ async fn admit_pending_durable_batch_admitted(
                 admitted = true;
             }
             HiddenDelivery::WriteResident => {
-                let turn_id = begin_hidden_turn(app, db, &mut inner, Some(row.id)).await;
+                let turn_id = begin_hidden_turn(app, db, &mut inner, Some(row.id)).await?;
                 if let Err(error) = write_user(&mut inner, &out).await {
                     drop(inner);
                     rollback_failed_turn(app, db, eng, turn_id, "error").await;
@@ -3068,7 +3143,7 @@ async fn admit_pending_durable_batch_admitted(
                 admitted = true;
             }
             HiddenDelivery::SpawnTurn => {
-                let turn_id = begin_hidden_turn(app, db, &mut inner, Some(row.id)).await;
+                let turn_id = begin_hidden_turn(app, db, &mut inner, Some(row.id)).await?;
                 let reset_epoch = inner.reset_epoch;
                 drop(inner);
                 if let Err(error) = spawn_hidden_turn_after_admission(
@@ -3533,24 +3608,39 @@ pub async fn send(
         {
             return Err(anyhow::anyhow!("该 worktree 正在回退代码，请稍后重试"));
         }
-        let direct = inner.turn.try_begin_send();
-        // Count only tracked (user-visible) items: hidden plumbing deliveries
-        // (queue_id == None) are filtered out of the UI, so they must not eat the budget.
-        if !direct && visible_queued(&inner.turn) >= MAX_QUEUED {
-            return Err(anyhow::anyhow!("queue_full"));
-        }
-        if direct {
-            inner.turn_id += 1;
-            inner.clock.begin_turn();
-            // This send starts a turn now → its tag IS the in-flight turn's tag.
-            inner.current_origin_tag = origin_tag.clone();
-            crate::power::on_turn_began(app);
-            // Persist "running" WHILE holding the lock so it is ordered before any
-            // concurrent stop's "stopped" write: stop_quiet must take this same lock
-            // first, so its later "stopped" write can't be overtaken and leave a
-            // stopped session recorded as running (which boot-revive would resume).
-            persist_activity(db, inner.session_id, inner.thread_id, "running").await;
-        }
+        // A queued send does not mutate a verification target yet, so it skips
+        // the direction gate entirely. A real direct start invalidates old
+        // evidence before it reserves `busy`, and keeps the gate through this
+        // locked `running` persistence.
+        let starts_direct = !inner.turn.busy;
+        let direction_id = if starts_direct {
+            worker_direction_id(&inner)?
+        } else {
+            None
+        };
+        let direct = with_worker_direct_turn_admission(direction_id, || async {
+            let direct = inner.turn.try_begin_send();
+            debug_assert_eq!(direct, starts_direct);
+            // Count only tracked (user-visible) items: hidden plumbing deliveries
+            // (queue_id == None) are filtered out of the UI, so they must not eat the budget.
+            if !direct && visible_queued(&inner.turn) >= MAX_QUEUED {
+                return Err(anyhow::anyhow!("queue_full"));
+            }
+            if direct {
+                inner.turn_id += 1;
+                inner.clock.begin_turn();
+                // This send starts a turn now → its tag IS the in-flight turn's tag.
+                inner.current_origin_tag = origin_tag.clone();
+                crate::power::on_turn_began(app);
+                // Persist "running" WHILE holding the lock so it is ordered before any
+                // concurrent stop's "stopped" write: stop_quiet must take this same lock
+                // first, so its later "stopped" write can't be overtaken and leave a
+                // stopped session recorded as running (which boot-revive would resume).
+                persist_activity(db, inner.session_id, inner.thread_id, "running").await;
+            }
+            Ok(direct)
+        })
+        .await?;
         SendContext {
             thread_id: inner.thread_id,
             session_id: inner.session_id,
@@ -3772,18 +3862,22 @@ pub async fn send(
                 // The active turn ENDED while this send persisted: nothing drains
                 // an idle queue, so deliver NOW by promoting into a fresh direct
                 // turn — the same commit-time decision a direct send makes.
-                promoted = Some(promote_queued_reservation(
-                    &mut inner,
-                    ctx.origin_tag.clone(),
-                ));
-                // Same pre-turn checkpoint as a direct send, taken between the
-                // promotion and the dispatch (the resident write below; per-turn
-                // / codex spawns in Phase 4).
-                snapshot_turn_checkpoint(app, db, inner.session_id, inner.turn_id, row_id).await;
-                crate::power::on_turn_began(app);
-                // Under the lock for the same ordering reason as Phase 1's direct
-                // write: a concurrent stop's "stopped" write must not be overtaken.
-                persist_activity(db, inner.session_id, inner.thread_id, "running").await;
+                let direction_id = worker_direction_id(&inner)?;
+                let promoted_turn = with_worker_direct_turn_admission(direction_id, || async {
+                    let turn_id =
+                        promote_queued_reservation(&mut inner, ctx.origin_tag.clone());
+                    crate::power::on_turn_began(app);
+                    // Under the lock for the same ordering reason as Phase 1's direct
+                    // write: a concurrent stop's "stopped" write must not be overtaken.
+                    persist_activity(db, inner.session_id, inner.thread_id, "running").await;
+                    Ok(turn_id)
+                })
+                .await?;
+                promoted = Some(promoted_turn);
+                // Same pre-turn checkpoint as a direct send, taken after the
+                // worker-start admission and before the resident write / Phase-4
+                // spawn dispatch.
+                snapshot_turn_checkpoint(app, db, inner.session_id, promoted_turn, row_id).await;
                 if !per_turn(&ctx.tool) && !is_connection {
                     // Resident tool: deliver through the live stdin under this
                     // lock, exactly like a direct resident send.
@@ -4784,6 +4878,16 @@ async fn acp_emit_turn_end(
                 );
             }
         }
+        let worker_admission = match acquire_dequeued_worker_turn_admission(&inner).await {
+            Ok(admission) => admission,
+            Err(error) => {
+                let failed_turn = inner.turn_id;
+                eprintln!("[weft] queued ACP turn could not join readiness admission: {error}");
+                drop(inner);
+                rollback_failed_turn(&app, &db, &eng, failed_turn, "error").await;
+                break;
+            }
+        };
         let next = inner.turn.on_turn_end();
         advance_dequeued_turn(&mut inner, &next);
         inner.last_assistant_uuid = None;
@@ -4798,6 +4902,7 @@ async fn acp_emit_turn_end(
         let still_busy = inner.turn.busy;
         let client = inner.acp_client.clone();
         let native = inner.native_id.clone();
+        inner.clock.on_turn_end(still_busy);
         persist_activity(
             &db,
             inner.session_id,
@@ -4805,7 +4910,7 @@ async fn acp_emit_turn_end(
             if still_busy { "running" } else { "idle" },
         )
         .await;
-        inner.clock.on_turn_end(still_busy);
+        drop(worker_admission);
         let _ = app.emit(
             EVENT,
             Push::Turn {
@@ -5797,6 +5902,19 @@ async fn codex_consumer(
                         );
                     }
                 }
+                let worker_admission =
+                    match acquire_dequeued_worker_turn_admission(&inner).await {
+                        Ok(admission) => admission,
+                        Err(error) => {
+                            let failed_turn = inner.turn_id;
+                            eprintln!(
+                                "[weft] queued app-server turn could not join readiness admission: {error}"
+                            );
+                            drop(inner);
+                            rollback_failed_turn(&app, &db, &eng, failed_turn, "error").await;
+                            return;
+                        }
+                    };
                 let next = inner.turn.on_turn_end();
                 advance_dequeued_turn(&mut inner, &next);
                 inner.last_assistant_uuid = None;
@@ -5812,6 +5930,7 @@ async fn codex_consumer(
                 // but the epoch has advanced — the canceled message must not launch.
                 let dequeue_epoch = inner.reset_epoch;
                 let still_busy = inner.turn.busy;
+                inner.clock.on_turn_end(still_busy);
                 persist_activity(
                     &db,
                     inner.session_id,
@@ -5819,7 +5938,7 @@ async fn codex_consumer(
                     if still_busy { "running" } else { "idle" },
                 )
                 .await;
-                inner.clock.on_turn_end(still_busy);
+                drop(worker_admission);
                 let _ = app.emit(
                     EVENT,
                     Push::Turn {
@@ -6858,7 +6977,7 @@ async fn send_hidden_inner(
             Ok(true)
         }
         HiddenDelivery::WriteResident => {
-            let turn_id = begin_hidden_turn(app, db, &mut inner, hidden_delivery_id).await;
+            let turn_id = begin_hidden_turn(app, db, &mut inner, hidden_delivery_id).await?;
             if let Err(e) = write_user(&mut inner, &out).await {
                 drop(inner);
                 rollback_failed_turn(app, db, eng, turn_id, "error").await;
@@ -6872,7 +6991,7 @@ async fn send_hidden_inner(
             // on the same thread. ACP tools similarly stay on the ACP runtime.
             let codex_appserver = inner.tool == "codex" && codex_appserver_enabled();
             let acp = is_acp_tool(&inner.tool);
-            let turn_id = begin_hidden_turn(app, db, &mut inner, hidden_delivery_id).await;
+            let turn_id = begin_hidden_turn(app, db, &mut inner, hidden_delivery_id).await?;
             // Captured under the lock: a stop-then-restart before the spawn task
             // runs clears `stopped` but bumps the epoch — a canceled hidden turn
             // (bus read / tool-result nudge) must not launch on the restarted
@@ -8736,6 +8855,19 @@ fn spawn_reader(
                             },
                         );
                     }
+                    let worker_admission =
+                        match acquire_dequeued_worker_turn_admission(&inner).await {
+                            Ok(admission) => admission,
+                            Err(error) => {
+                                let failed_turn = inner.turn_id;
+                                eprintln!(
+                                    "[weft] queued reader turn could not join readiness admission: {error}"
+                                );
+                                drop(inner);
+                                rollback_failed_turn(&app, &db, &eng, failed_turn, "error").await;
+                                return;
+                            }
+                        };
                     let next = inner.turn.on_turn_end();
                     // Set BEFORE `next`'s input is dispatched below so its output
                     // frames carry the retargeted origin tag.
@@ -8804,6 +8936,7 @@ fn spawn_reader(
                         }
                     }
                     let still_busy = inner.turn.busy;
+                    inner.clock.on_turn_end(still_busy);
                     persist_activity(
                         &db,
                         inner.session_id,
@@ -8811,7 +8944,7 @@ fn spawn_reader(
                         if still_busy { "running" } else { "idle" },
                     )
                     .await;
-                    inner.clock.on_turn_end(still_busy);
+                    drop(worker_admission);
                     let state = if still_busy { "busy" } else { "idle" };
                     let _ = app.emit(
                         EVENT,
@@ -8919,6 +9052,18 @@ fn spawn_reader(
             // through the same queue any other waiting session would go through,
             // rather than this session silently keeping the slot it already earned.
             inner.child_permit = None;
+            let worker_admission = match acquire_dequeued_worker_turn_admission(&inner).await {
+                Ok(admission) => admission,
+                Err(error) => {
+                    let failed_turn = inner.turn_id;
+                    eprintln!(
+                        "[weft] queued per-turn delivery could not join readiness admission: {error}"
+                    );
+                    drop(inner);
+                    rollback_failed_turn(&app, &db, &eng, failed_turn, "error").await;
+                    return;
+                }
+            };
             let next = inner.turn.on_turn_end();
             // A kill-only interrupt (see interrupt()) leaves `generation`/the
             // queue untouched, so THIS EOF branch — not a reset — is what runs
@@ -8959,6 +9104,7 @@ fn spawn_reader(
                 });
             }
             let still_busy = inner.turn.busy;
+            inner.clock.on_turn_end(still_busy);
             persist_activity(
                 &db,
                 inner.session_id,
@@ -8966,7 +9112,7 @@ fn spawn_reader(
                 if still_busy { "running" } else { "idle" },
             )
             .await;
-            inner.clock.on_turn_end(still_busy);
+            drop(worker_admission);
             let state = if still_busy { "busy" } else { "idle" };
             let _ = app.emit(
                 EVENT,
@@ -9152,6 +9298,93 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn next_worker_admission_test_direction() -> i32 {
+        static NEXT_DIRECTION: std::sync::atomic::AtomicI32 =
+            std::sync::atomic::AtomicI32::new(1_800_000_000);
+        NEXT_DIRECTION.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn worker_direct_start_waits_for_a_check_that_already_holds_admission() {
+        let direction_id = next_worker_admission_test_direction();
+        let check_admission = crate::readiness::acquire_verification_admission(direction_id)
+            .await
+            .expect("check admission");
+        let worker_ready = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let worker_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let check_released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let worker = tokio::spawn({
+            let worker_ready = std::sync::Arc::clone(&worker_ready);
+            let worker_started = std::sync::Arc::clone(&worker_started);
+            let check_released = std::sync::Arc::clone(&check_released);
+            async move {
+                worker_ready.wait().await;
+                with_worker_direct_turn_admission(Some(direction_id), || async move {
+                    assert!(
+                        check_released.load(std::sync::atomic::Ordering::SeqCst),
+                        "a worker direct turn must not begin before the earlier check releases admission"
+                    );
+                    worker_started.notify_one();
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await
+            }
+        });
+
+        worker_ready.wait().await;
+        check_released.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(check_admission);
+        worker_started.notified().await;
+        worker.await.expect("worker task joins").expect("worker start");
+    }
+
+    #[tokio::test]
+    async fn check_after_worker_direct_start_waits_for_running_persistence() {
+        let direction_id = next_worker_admission_test_direction();
+        let worker_reserved = std::sync::Arc::new(tokio::sync::Notify::new());
+        let allow_running_persist = std::sync::Arc::new(tokio::sync::Notify::new());
+        let running_persisted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let check_attempt = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let worker = tokio::spawn({
+            let worker_reserved = std::sync::Arc::clone(&worker_reserved);
+            let allow_running_persist = std::sync::Arc::clone(&allow_running_persist);
+            let running_persisted = std::sync::Arc::clone(&running_persisted);
+            async move {
+                with_worker_direct_turn_admission(Some(direction_id), || async move {
+                    worker_reserved.notify_one();
+                    allow_running_persist.notified().await;
+                    running_persisted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await
+            }
+        });
+
+        worker_reserved.notified().await;
+        let check = tokio::spawn({
+            let check_attempt = std::sync::Arc::clone(&check_attempt);
+            let running_persisted = std::sync::Arc::clone(&running_persisted);
+            async move {
+                check_attempt.wait().await;
+                let admission = crate::readiness::acquire_verification_admission(direction_id)
+                    .await
+                    .expect("check admission after worker start");
+                assert!(
+                    running_persisted.load(std::sync::atomic::Ordering::SeqCst),
+                    "a check must not pass worker admission before session running is persisted"
+                );
+                drop(admission);
+            }
+        });
+
+        check_attempt.wait().await;
+        allow_running_persist.notify_one();
+        worker.await.expect("worker task joins").expect("worker start");
+        check.await.expect("check task joins");
+    }
 
     /// Stop must actually stop. `interrupt()` sets `interrupting` without
     /// bumping the epoch, so a Stop landing between `on_turn_end` promoting a

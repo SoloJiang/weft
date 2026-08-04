@@ -1655,15 +1655,30 @@ fn check_targets_for_worktrees(worktrees: &[ProbedWorktree]) -> Option<Vec<Check
     Some(targets)
 }
 
-/// Fetch the currently registered worktrees and sample their live Git
-/// signatures. Leaders call this while holding the admission gate, so a
-/// queued verification cannot run against a target that changed before it
-/// acquired the per-direction turn.
+/// Re-read the direction's active-worker state, then fetch the currently
+/// registered worktrees and sample their live Git signatures. Leaders call
+/// this while holding the admission gate, so a queued verification cannot run
+/// against a worker that started or a target that changed before it acquired
+/// the per-direction turn.
 async fn verification_targets_for_direction(
     db: &Db,
     direction_id: i32,
     git_probe: &GitSignatureProbe,
 ) -> Result<Vec<CheckTarget>> {
+    let direction = repo::get_direction(db, direction_id)
+        .await?
+        .ok_or_else(|| anyhow!("direction {direction_id} no longer exists"))?;
+    if !direction_claimed_completion(direction.status.as_str()) {
+        anyhow::bail!(
+            "verification was not produced for direction {direction_id}: completion was withdrawn"
+        );
+    }
+    let worker = latest_worker_facts(db, direction_id).await?;
+    if worker_active_preempts_completion(worker.active, direction.status.as_str()) {
+        anyhow::bail!(
+            "verification was not produced for direction {direction_id}: worker is active"
+        );
+    }
     let worktrees = probe_worktrees_for_direction(db, direction_id, git_probe).await?;
     check_targets_for_worktrees(&worktrees).ok_or_else(|| {
         anyhow!(
@@ -3067,6 +3082,70 @@ mod tests {
             pull_requests: Vec::new(),
             direction_status: "review".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn admission_target_recheck_refuses_a_worker_that_started_after_collection() {
+        let db = Db::connect("sqlite::memory:").await.expect("memory db");
+        let workspace = repo::create_workspace(&db, "admission recheck")
+            .await
+            .expect("workspace");
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "admission-recheck-repo",
+            "/tmp/admission-recheck-repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .expect("repo ref");
+        let thread = repo::create_thread(
+            &db,
+            workspace.id,
+            "admission recheck",
+            "feature/admission-recheck",
+            "claude",
+        )
+        .await
+        .expect("thread");
+        let direction = repo::create_direction(
+            &db,
+            thread.id,
+            "implementation",
+            "claude",
+            repo_ref.id,
+            "exercise admission recheck",
+            "impl-only",
+            "main",
+        )
+        .await
+        .expect("direction");
+        repo::set_direction_status(&db, direction.id, "review")
+            .await
+            .expect("review direction");
+        let worker = repo::create_session(
+            &db,
+            direction.id,
+            repo_ref.id,
+            "claude",
+            "/tmp/admission-recheck-worker",
+        )
+        .await
+        .expect("worker session");
+        repo::set_session_status(&db, worker.id, "running")
+            .await
+            .expect("worker running");
+
+        let error = verification_targets_for_direction(
+            &db,
+            direction.id,
+            &GitSignatureProbe::readiness(),
+        )
+        .await
+        .expect_err("active worker must preempt the admitted verification target probe");
+        assert!(error.to_string().contains("worker is active"));
     }
 
     fn pr() -> PullRequestFacts {
@@ -5051,6 +5130,48 @@ mod tests {
                 .expect("memo lookup after invalidation"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn worker_start_invalidation_prevents_cached_only_reuse_of_prior_memo() {
+        let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
+        let targets = check_targets("/tmp/cached-only-after-worker-start", "head-a");
+        let primed = flight
+            .get_or_run(424, targets.clone(), |_| async {
+                Ok(CheckEvidence::Passed)
+            })
+            .await
+            .expect("prime cached evidence");
+        assert_eq!(primed, CheckEvidence::Passed);
+
+        // This is the worker direct-start sequence: acquire the shared gate,
+        // invalidate the older memo, then reserve/persist while it is held.
+        let worker_admission = flight
+            .acquire_admission(424)
+            .await
+            .expect("worker start admission");
+        flight
+            .invalidate_cached(424)
+            .expect("worker start invalidates prior memo");
+        drop(worker_admission);
+
+        let runner_calls = Arc::new(AtomicUsize::new(0));
+        let attempted_runner = Arc::clone(&runner_calls);
+        let evidence = checks_for_targets_with_runner(
+            &flight,
+            CheckExecution::CachedOnly,
+            424,
+            targets,
+            move |_| {
+                attempted_runner.fetch_add(1, Ordering::SeqCst);
+                async { Ok(CheckEvidence::Failing) }
+            },
+        )
+        .await
+        .expect("cached-only lookup after worker start");
+
+        assert_eq!(evidence, CheckEvidence::NotProduced);
+        assert_eq!(runner_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
