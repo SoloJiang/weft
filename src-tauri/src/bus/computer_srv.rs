@@ -312,17 +312,39 @@ fn session_token_generation(thread: i32, dir: &str, wt: Option<i32>) -> u64 {
 /// verifies. `#[doc(hidden)] pub` for the same sibling-module/
 /// cross-crate-test reason as [`computer_session_token`].
 #[doc(hidden)]
-pub fn rotate_and_mint_computer_session_token(thread: i32, dir: &str, wt: Option<i32>) -> String {
+pub fn rotate_and_mint_computer_session_token(
+    thread: i32,
+    dir: &str,
+    wt: Option<i32>,
+) -> MintedBearer {
     let mut generations =
         session_token_generations().lock().unwrap_or_else(|e| e.into_inner());
     let slot = generations.entry((thread, dir.to_string(), wt)).or_insert(0);
     *slot = slot.wrapping_add(1);
-    render_computer_session_token(thread, dir, wt, *slot)
+    MintedBearer {
+        token: render_computer_session_token(thread, dir, wt, *slot),
+        generation: *slot,
+    }
 }
 
-/// Invalidate every previously-minted bearer for `(thread, dir, wt)` WITHOUT
+/// What [`rotate_and_mint_computer_session_token`] produced: the bearer the
+/// child will carry, and the generation it was pinned to.
+///
+/// The generation is returned rather than re-read afterwards because a re-read
+/// races: another engine's injection for the SAME identity could rotate in
+/// between, and the caller would then record — and later revoke — a generation
+/// that belongs to somebody else's child. See
+/// [`revoke_computer_session_token_generation`] for what that ownership record
+/// is for.
+#[doc(hidden)]
+pub struct MintedBearer {
+    pub token: String,
+    pub generation: u64,
+}
+
+/// Invalidate the bearer minted at `generation` for `(thread, dir, wt)` WITHOUT
 /// minting a replacement — the teardown counterpart of
-/// [`rotate_and_mint_computer_session_token`].
+/// [`rotate_and_mint_computer_session_token`]. Returns whether it revoked.
 ///
 /// Rotation alone happens at INJECTION, which covers every case where a
 /// replacement child takes over an identity. It does NOT cover a session
@@ -337,19 +359,46 @@ pub fn rotate_and_mint_computer_session_token(thread: i32, dir: &str, wt: Option
 /// grant. Bumping the generation here kills that token the instant Stop
 /// lands.
 ///
-/// Safe to call for an identity that never had a token: the entry is
-/// created at generation 1 and the next injection simply mints at 2.
+/// # Why this is compare-and-revoke, not an unconditional bump
+///
+/// The generation is a property of the IDENTITY, but the bearer is held by a
+/// specific CHILD, and an identity outlives any one of them. `(thread, dir,
+/// wt)` is `(thread, direction, worktree)` for a worker — two sessions of the
+/// same direction in the same worktree share it — so a replacement child's
+/// injection can rotate the shared generation while the child it replaced is
+/// still winding down. An unconditional bump from that older child's teardown
+/// would then invalidate the REPLACEMENT's current bearer, and every computer
+/// call from that healthy session would 401. Caller-local guards can't see
+/// this: each engine's `generation`/`turn_id` counters are its own, and agree
+/// that its own teardown is legitimate.
+///
+/// Requiring the caller to name the generation it minted turns "revoke this
+/// identity" into "revoke MY child's bearer", which is the actual intent
+/// everywhere. A caller whose generation has been superseded gets `false` and
+/// changes nothing — correctly, because rotation already killed its token.
+///
+/// Harmless for a generation that was never current (a stale record, or `0`,
+/// which no mint ever produces — the first mint lands on 1).
 ///
 /// A caller that revokes MUST also guarantee a fresh injection before the
 /// same identity's next child starts, or that child inherits a
 /// now-invalid bearer — see `lead_chat::engine::refresh_computer_injection`,
 /// which every respawn path runs for exactly this reason.
 #[doc(hidden)]
-pub fn revoke_computer_session_tokens(thread: i32, dir: &str, wt: Option<i32>) {
+pub fn revoke_computer_session_token_generation(
+    thread: i32,
+    dir: &str,
+    wt: Option<i32>,
+    generation: u64,
+) -> bool {
     let mut generations =
         session_token_generations().lock().unwrap_or_else(|e| e.into_inner());
     let slot = generations.entry((thread, dir.to_string(), wt)).or_insert(0);
+    if *slot != generation {
+        return false;
+    }
     *slot = slot.wrapping_add(1);
+    true
 }
 
 /// The ONE place this module's HMAC key material gets constructed — shared by
@@ -4952,7 +5001,7 @@ mod tests {
         assert!(verify_computer_token(933_001, "70", Some(1), &old), "current render verifies");
         let sibling = computer_session_token(933_001, "70", Some(2));
 
-        let fresh = rotate_and_mint_computer_session_token(933_001, "70", Some(1));
+        let fresh = rotate_and_mint_computer_session_token(933_001, "70", Some(1)).token;
 
         assert!(
             !verify_computer_token(933_001, "70", Some(1), &old),
@@ -4984,7 +5033,8 @@ mod tests {
         let sibling = computer_session_token(933_201, "70", Some(2));
         assert!(verify_computer_token(933_201, "70", Some(1), &stopped));
 
-        revoke_computer_session_tokens(933_201, "70", Some(1));
+        let live = session_token_generation(933_201, "70", Some(1));
+        assert!(revoke_computer_session_token_generation(933_201, "70", Some(1), live));
 
         assert!(
             !verify_computer_token(933_201, "70", Some(1), &stopped),
@@ -4997,7 +5047,7 @@ mod tests {
 
         // Resume: the respawn path re-injects, which mints under the bumped
         // generation — so the resumed child gets a working bearer.
-        let resumed = rotate_and_mint_computer_session_token(933_201, "70", Some(1));
+        let resumed = rotate_and_mint_computer_session_token(933_201, "70", Some(1)).token;
         assert_ne!(resumed, stopped, "resume must not hand back the revoked token");
         assert!(
             verify_computer_token(933_201, "70", Some(1), &resumed),
@@ -5014,13 +5064,18 @@ mod tests {
     #[test]
     fn a_revoke_after_a_mint_leaves_no_valid_bearer() {
         let minted = rotate_and_mint_computer_session_token(933_401, "70", Some(3));
-        assert!(verify_computer_token(933_401, "70", Some(3), &minted));
+        assert!(verify_computer_token(933_401, "70", Some(3), &minted.token));
 
         // The doomed child's connection is torn down: revoke what we minted.
-        revoke_computer_session_tokens(933_401, "70", Some(3));
+        assert!(revoke_computer_session_token_generation(
+            933_401,
+            "70",
+            Some(3),
+            minted.generation
+        ));
 
         assert!(
-            !verify_computer_token(933_401, "70", Some(3), &minted),
+            !verify_computer_token(933_401, "70", Some(3), &minted.token),
             "a bearer minted for a child that is then torn down must not survive it"
         );
     }
@@ -5032,9 +5087,12 @@ mod tests {
     /// call the revoke unconditionally.
     #[test]
     fn revoking_an_identity_that_never_minted_is_harmless() {
-        revoke_computer_session_tokens(933_301, "lead", None);
+        assert!(
+            !revoke_computer_session_token_generation(933_301, "lead", None, 1),
+            "a generation this identity never minted must not be revocable"
+        );
         let minted = rotate_and_mint_computer_session_token(933_301, "lead", None);
-        assert!(verify_computer_token(933_301, "lead", None, &minted));
+        assert!(verify_computer_token(933_301, "lead", None, &minted.token));
     }
 
     /// Bump and render share one critical section: each of two back-to-back
@@ -5043,8 +5101,8 @@ mod tests {
     /// the LAST rotation's token verifies.
     #[test]
     fn overlapping_rotations_never_share_the_latest_bearer() {
-        let first = rotate_and_mint_computer_session_token(933_101, "70", None);
-        let second = rotate_and_mint_computer_session_token(933_101, "70", None);
+        let first = rotate_and_mint_computer_session_token(933_101, "70", None).token;
+        let second = rotate_and_mint_computer_session_token(933_101, "70", None).token;
         assert_ne!(first, second, "each rotation mints its own generation's token");
         assert!(
             !verify_computer_token(933_101, "70", None, &first),
@@ -6211,7 +6269,7 @@ mod tests {
     #[test]
     fn the_entry_capture_binds_a_request_to_the_generation_its_bearer_verified_at() {
         let thread = 933_201;
-        let token = rotate_and_mint_computer_session_token(thread, "lead", None);
+        let token = rotate_and_mint_computer_session_token(thread, "lead", None).token;
         let auth_gen = verify_computer_token_at_current_generation(thread, "lead", None, &token)
             .expect("a freshly minted bearer must verify");
         assert_eq!(auth_gen, session_token_generation(thread, "lead", None));

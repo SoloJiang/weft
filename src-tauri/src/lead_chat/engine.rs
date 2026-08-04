@@ -2186,6 +2186,29 @@ pub struct EngineInner {
     pub computer_args: Vec<String>,
     /// The env half of the computer injection — see [`Self::computer_args`].
     pub computer_env: Vec<(String, String)>,
+    /// The bearer generation this engine's live computer injection was minted
+    /// at — its OWNERSHIP STAMP over a shared identity. `None` before the first
+    /// mint, and after a teardown consumed it.
+    ///
+    /// Required because `(thread_id, ask_dir, worktree_id)` is not unique to an
+    /// engine: for a worker it is `(thread, direction, worktree)`, and a second
+    /// session opened on the same direction and worktree shares it. So the
+    /// identity's generation can be rotated out from under this engine by
+    /// somebody else's injection while this engine's child is still winding
+    /// down. Revoking the identity's CURRENT generation at that point would
+    /// kill the replacement's live bearer and 401 a healthy session; no local
+    /// counter can detect it, since `generation`/`turn_id` are per-engine and
+    /// agree that this engine's own teardown is legitimate.
+    ///
+    /// [`revoke_engine_bearer`] compares this stamp against the identity's
+    /// current generation and revokes only on a match — see
+    /// `computer_srv::revoke_computer_session_token_generation`.
+    ///
+    /// Set for ALL FOUR engine shapes. Three receive it through
+    /// `Injection::computer_generation` in [`refresh_computer_injection`]; ACP,
+    /// whose bearer never travels through an `Injection` at all, receives it
+    /// from `bus::inject::AcpMcpInjection` at session establishment.
+    pub computer_gen: Option<u64>,
     pub system_prompt: String,
     pub native_id: Option<String>,
     /// A mechanical digest of the thread's history, staged by an engine/model
@@ -2870,6 +2893,14 @@ fn refresh_computer_injection(app: &AppHandle, inner: &mut EngineInner) {
         &inner.tool,
         inner.worktree_id,
     );
+    // Record the ownership stamp BEFORE the empty-injection bail. The mint
+    // rotated the identity's generation either way, so the previous stamp is
+    // already stale; keeping it would leave this engine able to revoke only a
+    // generation that no longer exists, while the one it just created — whose
+    // config may well be on disk — becomes unrevocable.
+    if fresh.computer_generation.is_some() {
+        inner.computer_gen = fresh.computer_generation;
+    }
     if fresh.args.is_empty() && fresh.env.is_empty() {
         return;
     }
@@ -2928,19 +2959,35 @@ fn spawn_env(inner: &EngineInner) -> Vec<(String, String)> {
 /// eligible.
 fn release_child_slot(inner: &mut EngineInner) {
     inner.child_permit = None;
+    // A LIVE app-server client is the holder of this engine's bearer, and a
+    // child teardown does not destroy it — `spawn_codex_turn`'s reuse arm hands
+    // the next turn that same client WITHOUT refreshing its injection, so
+    // revoking here would 401 a connection that is about to be used again.
+    // Every path that genuinely ends the client takes it out of this field
+    // first (`stop_quiet`, both exec fallbacks) or revokes at the client's own
+    // death site (`codex_consumer`), so the revoke is never merely deferred.
+    if inner.codex_client.is_some() {
+        return;
+    }
     revoke_engine_bearer(inner);
 }
 
-/// The bearer half of [`release_child_slot`], for the process this engine owns
-/// that is NOT `inner.child`: the codex app-server.
+/// Revoke the bearer THIS engine minted — and only if it is still the current
+/// one for the identity.
 ///
-/// That client spawns and owns its own child, so it holds no `child_permit`,
-/// never passes through `spawn_reader`, and its death is not a teardown site in
-/// `child_permit`'s enumeration — the reason it needs saying separately. The
-/// rule is the same one: whenever THIS engine's app-server is shut down or
-/// found disconnected, the bearer it was launched with dies with it, because
-/// nothing else will rotate that generation until the next injection, which may
-/// never come.
+/// Consumes the record: [`EngineInner::computer_gen`] is taken, so a second
+/// call before the next mint is a no-op. That makes it safe to revoke
+/// defensively (early AND late around an unlocked teardown, say) without a
+/// second revoke landing on a generation someone else minted in between.
+///
+/// Also the bearer half of [`release_child_slot`] for the process this engine
+/// owns that is NOT `inner.child`: the codex app-server. That client spawns and
+/// owns its own child, so it holds no `child_permit`, never passes through
+/// `spawn_reader`, and its death is not a teardown site in `child_permit`'s
+/// enumeration — the reason it needs saying separately. The rule is the same
+/// one: whenever THIS engine's app-server is shut down or found disconnected,
+/// the bearer it was launched with dies with it, because nothing else will
+/// rotate that generation until the next injection, which may never come.
 ///
 /// `cleanup_disconnected_turn` is not sufficient on its own even though it
 /// routes through `release_child_slot`: it early-returns on an already-idle
@@ -2951,11 +2998,37 @@ fn release_child_slot(inner: &mut EngineInner) {
 /// `take`). An exec fallback that deliberately replaces the client may call it
 /// too: `spawn_turn` re-mints immediately afterwards, so the new child still
 /// starts live.
-fn revoke_engine_bearer(inner: &EngineInner) {
-    crate::bus::computer_srv::revoke_computer_session_tokens(
+/// Guard a fallible step that sits BETWEEN a mint and the child being alive: on
+/// failure, revoke the bearer `refresh_computer_injection` just minted.
+///
+/// Every spawn path re-mints immediately before launching, which rotates the
+/// identity's generation and writes the new bearer wherever that tool reads it
+/// (claude's `.mcp.json`, codex's env, opencode's inline config). If the launch
+/// then fails — the cwd vanished, the binary lost its execute bit, the host is
+/// out of process slots, the adapter refused the argv — that bearer is current
+/// and valid but belongs to a child that will never exist. Nothing later
+/// necessarily rotates it: the engine just sits there, its DB rows keep
+/// `session_is_live` true, and the next teardown may never come.
+///
+/// Local to the spawn rather than left to the caller's rollback on purpose:
+/// which rollback runs (if any) depends on how the spawn was reached, and that
+/// is exactly the kind of coupling this file has already been bitten by.
+fn revoke_if_spawn_failed<T, E>(inner: &mut EngineInner, r: Result<T, E>) -> Result<T, E> {
+    if r.is_err() {
+        revoke_engine_bearer(inner);
+    }
+    r
+}
+
+fn revoke_engine_bearer(inner: &mut EngineInner) {
+    let Some(generation) = inner.computer_gen.take() else {
+        return;
+    };
+    crate::bus::computer_srv::revoke_computer_session_token_generation(
         inner.thread_id,
         &inner.ask_dir,
         inner.worktree_id,
+        generation,
     );
 }
 
@@ -3060,7 +3133,8 @@ async fn ensure_running_locked(
     let session_permit = crate::session_gate::acquire_session_slot().await;
     // T1: own process group + marker before spawn, register PAIRED with the child.
     let configured = crate::proc_registry::configure(&mut command, owner);
-    let mut child = command.spawn()?;
+    let spawned = command.spawn();
+    let mut child = revoke_if_spawn_failed(inner, spawned)?;
     let reg = configured.register(&child);
     inner.stdin = child.stdin.take();
     // Ask for the command list NOW: the init system message only ships with the
@@ -3074,10 +3148,11 @@ async fn ensure_running_locked(
         let _ = stdin.write_all(format!("{req}\n").as_bytes()).await;
         let _ = stdin.flush().await;
     }
-    let stdout = child
+    let piped = child
         .stdout
         .take()
-        .ok_or_else(|| anyhow::anyhow!("child stdout not piped"))?;
+        .ok_or_else(|| anyhow::anyhow!("child stdout not piped"));
+    let stdout = revoke_if_spawn_failed(inner, piped)?;
     inner.child = Some(child);
     inner.child_reg = Some(reg);
     // permit 与 child_reg 同寿:child 被 take/overwrite/stop 清掉时一并 drop=释放槽。
@@ -4819,7 +4894,7 @@ async fn spawn_codex_turn(
     // the epoch — tear the freshly connected client down and abort rather than
     // starting a turn the user canceled. (The early snapshot check only covers
     // stops that happened before the connect.)
-    let (stop_won, revoke_ident) = {
+    let stop_won = {
         // Check AND publish under ONE lock acquisition: a stop landing between a
         // separate check and a later publish would register a client for a turn
         // the user just canceled. Once published atomically here, a later stop
@@ -4827,12 +4902,23 @@ async fn spawn_codex_turn(
         // it down, failing start_turn below) — that is the designed teardown.
         let mut g = eng.lock().await;
         let won = g.stopped || expected_epoch.is_some_and(|e| e != g.reset_epoch);
+        // This task minted a bearer for the connection it is about to tear down
+        // (the connect arm above refreshed, which stamped `computer_gen`). The
+        // stop that won this race revoked the generation that existed BEFORE
+        // that mint, so ours would otherwise outlive the child it was issued to
+        // — exactly the orphan-keeps-a-live-token shape the revoke exists to
+        // close. Under THIS lock, so there is no window at all between the stop
+        // being observed and the token dying; the shutdown below is unlocked.
+        //
+        // A REUSED client needs nothing: the stop took it out of the registry
+        // and shut it down itself, revoking on the way through.
+        if won && freshly_connected {
+            revoke_engine_bearer(&mut g);
+        }
         if !won && freshly_connected {
             g.codex_client = Some(client.clone());
         }
-        // Carried out of the lock so the teardown below can revoke the bearer
-        // this task minted — see its own comment.
-        (won, (g.thread_id, g.ask_dir.clone(), g.worktree_id))
+        won
     };
     if stop_won {
         // Never touch the registry here: a restarted send may have published a
@@ -4841,21 +4927,6 @@ async fn spawn_codex_turn(
         // connection THIS task made; a reused registered client was already shut
         // down by the stop itself (stop_quiet takes it).
         if freshly_connected {
-            // This task minted a bearer for the connection it is now tearing
-            // down. The stop that won this race revoked the generation that
-            // existed BEFORE that mint, so ours would otherwise outlive the
-            // child it was issued to — exactly the orphan-keeps-a-live-token
-            // shape the revoke exists to close. Revoke before the shutdown so
-            // there is no window where the child is dying with a valid token.
-            //
-            // `revoke_engine_bearer`'s rule, spelled out rather than called:
-            // the identity was carried out of the lock above (this teardown
-            // deliberately runs unlocked), so there is no `inner` to hand it.
-            crate::bus::computer_srv::revoke_computer_session_tokens(
-                revoke_ident.0,
-                &revoke_ident.1,
-                revoke_ident.2,
-            );
             client.shutdown_and_reap().await;
         }
         return Err(anyhow::anyhow!(
@@ -4923,7 +4994,7 @@ async fn spawn_codex_turn_or_exec(
             let mut inner = eng.lock().await;
             let c = inner.codex_client.take();
             if c.is_some() {
-                revoke_engine_bearer(&inner);
+                revoke_engine_bearer(&mut inner);
             }
             c
         };
@@ -5040,7 +5111,7 @@ async fn spawn_acp_turn(
     // to hand out (the description also says it needs enabling in Settings,
     // and the server denies every call otherwise).
     let mcp = if base.is_empty() {
-        vec![]
+        crate::bus::inject::AcpMcpInjection { servers: vec![], computer_generation: None }
     } else if sid.is_none() {
         // Lead-kind engine: choose MCP from thread kind.
         // : a TRANSIENT `get_thread` failure must fail
@@ -5053,7 +5124,9 @@ async fn spawn_acp_turn(
         // still runs; it simply gets no injected server, and definitely not
         // computer-use); a genuine `Ok(None)` keeps the prior default.
         match repo::get_thread(&db, thread_id_i).await {
-            Err(_) => vec![],
+            Err(_) => {
+                crate::bus::inject::AcpMcpInjection { servers: vec![], computer_generation: None }
+            }
             Ok(row) => match row.map(|th| th.kind).unwrap_or_default().as_str() {
                 // Concierge: weft_global only (never bus, never computer).
                 "concierge" => crate::bus::inject::acp_mcp_servers(
@@ -5115,6 +5188,15 @@ async fn spawn_acp_turn(
         )
     };
 
+    // The ACP bearer is minted inside `acp_mcp_servers`, not by
+    // `refresh_computer_injection` (ACP supplies MCP on session/new|resume, so
+    // `inject_computer` produces nothing for it). Stamp the engine with the
+    // generation it just minted, or an ACP teardown would have no bearer of its
+    // own to revoke — see `EngineInner::computer_gen`.
+    if let Some(generation) = mcp.computer_generation {
+        eng.lock().await.computer_gen = Some(generation);
+    }
+    let mcp = mcp.servers;
     let had_native = native.is_some();
     let prior_native = native.clone();
     // Keep mcp specs for Session Info seeding (moved into open calls via clone).
@@ -6852,7 +6934,7 @@ async fn codex_consumer(
                                     let mut inner = eng.lock().await;
                                     let c = inner.codex_client.take();
                                     if c.is_some() {
-                                        revoke_engine_bearer(&inner);
+                                        revoke_engine_bearer(&mut inner);
                                     }
                                     c
                                 };
@@ -7005,7 +7087,7 @@ async fn codex_consumer(
     // taken/replaced (the exec-fallback teardown shut us down on purpose), skip it
     // — else this cleanup races spawn_turn and can kill/stop the fallback turn.
     let still_active = {
-        let inner = eng.lock().await;
+        let mut inner = eng.lock().await;
         let ours = matches!(&inner.codex_client, Some(c) if c.ptr_eq(&client));
         if ours {
             // The app-server this consumer was attached to is gone: kill its
@@ -7017,7 +7099,7 @@ async fn codex_consumer(
             // Not left to `cleanup_disconnected_turn` below, even though that
             // revokes too: it early-returns on an idle engine, which is exactly
             // an app-server that died between turns. See `revoke_engine_bearer`.
-            revoke_engine_bearer(&inner);
+            revoke_engine_bearer(&mut inner);
         }
         ours
     };
@@ -7211,14 +7293,15 @@ async fn spawn_turn(
     // `extra_args`, mirroring `build_args` — see `EngineInner::computer_args`.
     let mut adapter_extra = inner.extra_args.clone();
     adapter_extra.extend(inner.computer_args.iter().cloned());
-    let (_program, args) = adapter.build_argv(&crate::adapters::AdapterContext {
+    let built = adapter.build_argv(&crate::adapters::AdapterContext {
         cwd: &inner.cwd,
         system_prompt: &inner.system_prompt,
         extra_args: &adapter_extra,
         native_id: inner.native_id.as_deref(),
         message: &out.text,
         slash_commands: &inner.slash_commands,
-    })?;
+    });
+    let (_program, args) = revoke_if_spawn_failed(&mut inner, built)?;
     // The adapter's program is the tool identity; resolve it through the
     // per-session pin / global override map so an aliased binary is spawned.
     let program = crate::tool_command::effective(inner.command.as_deref(), &inner.tool);
@@ -7246,12 +7329,14 @@ async fn spawn_turn(
     let session_permit = crate::session_gate::acquire_session_slot().await;
     // T1: own process group + marker before spawn, register PAIRED with the child.
     let configured = crate::proc_registry::configure(&mut command, owner);
-    let mut child = command.spawn()?;
+    let spawned = command.spawn();
+    let mut child = revoke_if_spawn_failed(&mut inner, spawned)?;
     let reg = configured.register(&child);
-    let stdout = child
+    let piped = child
         .stdout
         .take()
-        .ok_or_else(|| anyhow::anyhow!("child stdout not piped"))?;
+        .ok_or_else(|| anyhow::anyhow!("child stdout not piped"));
+    let stdout = revoke_if_spawn_failed(&mut inner, piped)?;
     inner.stdin = None;
     inner.child = Some(child);
     inner.child_reg = Some(reg);
@@ -8257,6 +8342,20 @@ async fn stop_quiet_admitted(eng: &EngineRef) -> StopQuietOutcome {
     if let Some(c) = inner.codex_client.take() {
         c.shutdown().await;
     }
+    // Kill the bearer BEFORE the lock goes, not only at the release below.
+    // Stop is the user saying "no more actions from this session", and the ACP
+    // cancel/unsubscribe this function is about to await can block on a backend
+    // that is still running — for an ACP engine that is precisely the window in
+    // which its child, or an orphan holding the session URL, could keep issuing
+    // computer actions under a standing Full/Always grant. Bumping the epoch
+    // does not help: the HTTP endpoint authenticates the bearer, not the epoch.
+    //
+    // The later `release_child_slot` is still required and is NOT redundant: a
+    // send admitted during the unlocked window can reach `spawn_turn` and mint
+    // a REPLACEMENT bearer, and that one has to die with this stop too. Doing
+    // both is safe because `revoke_engine_bearer` consumes the stamp — the
+    // second call is a no-op unless a new mint re-stamped it.
+    revoke_engine_bearer(&mut inner);
     // Cancel any in-flight ACP prompt and drop the session route so a late
     // acp_emit_turn_end cannot overwrite stopped → idle after takeover.
     let AcpTeardown {
@@ -10118,6 +10217,7 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
         extra_env: vec![],
         computer_args: vec![],
         computer_env: vec![],
+        computer_gen: None,
         system_prompt: String::new(),
         native_id: None,
         pending_context_digest: None,
@@ -13519,11 +13619,15 @@ mod tests {
     fn mint_bearer_for(inner: &mut EngineInner, thread: i32) -> String {
         inner.thread_id = thread;
         inner.worktree_id = None;
-        crate::bus::computer_srv::rotate_and_mint_computer_session_token(
+        let minted = crate::bus::computer_srv::rotate_and_mint_computer_session_token(
             thread,
             &inner.ask_dir,
             None,
-        )
+        );
+        // Exactly what `refresh_computer_injection` does: the stamp is what
+        // makes this engine's teardown able to revoke, and only its own.
+        inner.computer_gen = Some(minted.generation);
+        minted.token
     }
 
     fn bearer_is_live(inner: &EngineInner, minted: &str) -> bool {
@@ -13605,7 +13709,7 @@ mod tests {
             "an app-server dying between turns leaves nothing for the cleanup to do"
         );
 
-        revoke_engine_bearer(&idle);
+        revoke_engine_bearer(&mut idle);
 
         assert!(
             !bearer_is_live(&idle, &bearer),
@@ -13620,7 +13724,113 @@ mod tests {
         );
     }
 
-    /// Revoking an identity that never minted is a no-op bump, so the uniform
+    /// The identity is SHARED, the bearer is not. `(thread, ask_dir,
+    /// worktree_id)` is `(thread, direction, worktree)` for a worker, so a
+    /// second session opened on the same direction and worktree lands on the
+    /// same identity while the first engine's child is still winding down. Its
+    /// teardown must not take the replacement's live bearer with it — no
+    /// per-engine counter can see the collision, because each engine's
+    /// `generation`/`turn_id` agree that its own teardown is legitimate.
+    #[tokio::test]
+    async fn a_stale_engines_teardown_leaves_a_replacements_bearer_alone() {
+        let mut first = test_inner("claude");
+        let first_bearer = mint_bearer_for(&mut first, 951_701);
+
+        // A second engine opens on the SAME identity and mints, which rotates
+        // the shared generation out from under the first.
+        let mut second = test_inner("claude");
+        second.ask_dir = first.ask_dir.clone();
+        let second_bearer = mint_bearer_for(&mut second, 951_701);
+        assert!(!bearer_is_live(&first, &first_bearer), "rotation already killed it");
+        assert!(bearer_is_live(&second, &second_bearer));
+
+        // NOW the first engine's child finally exits.
+        invalidate_resident(&mut first);
+
+        assert!(
+            bearer_is_live(&second, &second_bearer),
+            "the replacement's bearer must survive the predecessor's teardown"
+        );
+    }
+
+    /// A mint whose child never starts is not somebody else's problem. Every
+    /// spawn path re-mints right before launching, so a launch that then fails
+    /// leaves a current, valid bearer — and a written config — belonging to a
+    /// process that does not exist. `revoke_if_spawn_failed` is what closes it
+    /// at the spawn rather than hoping a rollback runs.
+    #[tokio::test]
+    async fn a_mint_whose_spawn_fails_is_revoked_at_the_failure() {
+        let mut inner = test_inner("claude");
+        let stillborn = mint_bearer_for(&mut inner, 951_801);
+        assert!(bearer_is_live(&inner, &stillborn));
+
+        let failed: Result<(), std::io::Error> = Err(std::io::Error::other("no such cwd"));
+        assert!(revoke_if_spawn_failed(&mut inner, failed).is_err());
+
+        assert!(
+            !bearer_is_live(&inner, &stillborn),
+            "a bearer minted for a child that never started must not stay valid"
+        );
+    }
+
+    /// The mirror: a spawn that SUCCEEDS must keep its freshly minted bearer,
+    /// or every session would 401 on its first computer call.
+    #[tokio::test]
+    async fn a_successful_spawn_keeps_the_bearer_it_was_minted() {
+        let mut inner = test_inner("claude");
+        let live = mint_bearer_for(&mut inner, 951_901);
+
+        let ok: Result<(), std::io::Error> = Ok(());
+        assert!(revoke_if_spawn_failed(&mut inner, ok).is_ok());
+
+        assert!(bearer_is_live(&inner, &live), "a launched child keeps its bearer");
+    }
+
+    /// A LIVE app-server client holds this engine's bearer, and a child
+    /// teardown does not destroy it — the next turn reuses that same client
+    /// WITHOUT refreshing its injection. Revoking on a turn rollback would 401
+    /// an otherwise healthy connection until it is rebuilt.
+    #[tokio::test]
+    async fn a_turn_rollback_spares_the_bearer_of_a_surviving_codex_client() {
+        let mut inner = test_inner("codex");
+        let client_bearer = mint_bearer_for(&mut inner, 952_001);
+        inner.codex_client = Some(crate::codex_app_server::Client::disconnected_for_test());
+        let turn_id = mark_hidden_turn_started(&mut inner);
+
+        assert!(reset_failed_hidden_turn(&mut inner, turn_id).is_some());
+
+        assert!(
+            bearer_is_live(&inner, &client_bearer),
+            "the surviving client's bearer must outlive the rolled-back turn"
+        );
+        assert!(inner.child_permit.is_none(), "the slot still goes back");
+    }
+
+    /// Revoking twice around an unlocked teardown (Stop revokes before
+    /// releasing the lock for the ACP cancel, and again after re-locking) must
+    /// not consume a generation somebody else minted in between. The stamp is
+    /// taken by the first call, so the second is inert.
+    #[tokio::test]
+    async fn a_second_revoke_before_the_next_mint_is_inert() {
+        let mut stopping = test_inner("claude");
+        let doomed = mint_bearer_for(&mut stopping, 952_101);
+        revoke_engine_bearer(&mut stopping);
+        assert!(!bearer_is_live(&stopping, &doomed));
+
+        // Somebody else takes over the identity while Stop is mid-teardown.
+        let mut taker = test_inner("claude");
+        taker.ask_dir = stopping.ask_dir.clone();
+        let takers_bearer = mint_bearer_for(&mut taker, 952_101);
+
+        revoke_engine_bearer(&mut stopping);
+
+        assert!(
+            bearer_is_live(&taker, &takers_bearer),
+            "a repeat revoke must not reach past its own generation"
+        );
+    }
+
+    /// Revoking an identity that never minted is a no-op, so the uniform
     /// teardown costs nothing for engines that never had the tool — a
     /// concierge/curator lead, or a worker with an unresolved worktree. Guards
     /// the "just call it everywhere" simplification the helper is built on.
@@ -14068,6 +14278,7 @@ mod tests {
             extra_env: vec![],
             computer_args: vec![],
             computer_env: vec![],
+            computer_gen: None,
             system_prompt: "be lead".into(),
             native_id: None,
             pending_context_digest: None,
