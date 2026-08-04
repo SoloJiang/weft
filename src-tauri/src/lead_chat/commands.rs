@@ -302,7 +302,7 @@ pub async fn lead_engine(
     // never receive computer use (see `EngineInner::computer_args`).
     let mut computer_args: Vec<String> = vec![];
     let mut computer_env: Vec<(String, String)> = vec![];
-    let mut computer_gen: Option<u64> = None;
+    let mut computer_mint: Option<crate::bus::computer_srv::MintGuard> = None;
     if is_concierge {
         // Concierge is the IM-scoped global helper, not a thread participant: it
         // gets weft_global, never the per-thread bus.
@@ -364,9 +364,12 @@ pub async fn lead_engine(
         );
         computer_args = comp.args;
         computer_env = comp.env;
-        // The ownership stamp over a shared identity — see
-        // `EngineInner::computer_gen` for why a teardown needs it.
-        computer_gen = comp.computer_generation;
+        // The mint's ownership receipt. Committed at the engine literal below,
+        // where the engine that will spawn with this bearer finally exists; if
+        // anything between here and there returned, dropping it would revoke.
+        // Nothing does — see the system-prompt block's own note — and this is
+        // what keeps that true if someone adds a `?`.
+        computer_mint = comp.computer_guard;
     }
     // The computer halves stay in their OWN fields rather than being folded
     // in here — they have to be replaceable at respawn (see
@@ -395,7 +398,7 @@ pub async fn lead_engine(
         extra_env,
         computer_args,
         computer_env,
-        computer_gen,
+        computer_gen: computer_mint.map(|m| m.commit()),
         acp_route_gen: None,
         system_prompt,
         native_id: repo::lead_native_id(db, thread_id).await.ok().flatten(),
@@ -1713,7 +1716,7 @@ pub(crate) async fn chat_open_worker_impl(
             // entry to clobber the bus one via `Command::envs`' last-wins.
             let computer_args = comp.args;
             let computer_env = comp.env;
-            let computer_gen = comp.computer_generation;
+            let computer_mint = comp.computer_guard;
             let extra_env = crate::bus::inject::coalesce_env(extra_env);
             let mut inner = engine::EngineInner {
                 thread_id: dir.thread_id,
@@ -1725,7 +1728,7 @@ pub(crate) async fn chat_open_worker_impl(
                 extra_env,
                 computer_args,
                 computer_env,
-                computer_gen,
+                computer_gen: computer_mint.map(|m| m.commit()),
                 acp_route_gen: None,
                 system_prompt: String::new(),
                 native_id: native.clone(),
@@ -1901,7 +1904,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
     // must fail closed: skip the computer injection entirely — this session
     // simply has no computer tool until a rebuild resolves its worktree —
     // rather than gambling on whichever worktree happens to sort first.
-    let (comp_args, comp_env, comp_gen) = match worktree_id {
+    let (comp_args, comp_env, comp_mint) = match worktree_id {
         Some(_) => {
             let comp = crate::bus::inject::inject_computer(
                 &base,
@@ -1910,7 +1913,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
                 &sess.tool,
                 worktree_id,
             );
-            (comp.args, comp.env, comp.computer_generation)
+            (comp.args, comp.env, comp.computer_guard)
         }
         None => (Vec::new(), Vec::new(), None),
     };
@@ -1935,7 +1938,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         extra_env,
         computer_args,
         computer_env,
-        computer_gen: comp_gen,
+        computer_gen: comp_mint.map(|m| m.commit()),
         acp_route_gen: None,
         system_prompt: String::new(),
         native_id: sess.native_session_id.clone(),

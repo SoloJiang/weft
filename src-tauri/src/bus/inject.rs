@@ -32,20 +32,22 @@ pub struct Injection {
     /// `Command::envs` applies duplicate keys last-wins, which would silently
     /// drop the earlier server's config.
     pub env: Vec<(String, String)>,
-    /// The computer-use bearer generation this injection was minted at — set
-    /// ONLY by [`inject_computer`], `None` for every other producer.
+    /// Ownership receipt for the computer-use bearer this injection carries —
+    /// set ONLY by [`inject_computer`], `None` for every other producer.
     ///
-    /// The spawn site records it so a later teardown can revoke the bearer it
-    /// handed to THIS child rather than whatever is current for the identity;
-    /// `computer_srv::revoke_computer_session_token_generation` documents the
-    /// false-revoke that distinction prevents. Returned here (rather than
-    /// re-read from the generation map afterwards) because a re-read races a
-    /// concurrent injection for the same identity.
+    /// The spawn site must `commit()` it once a live child holds the bearer;
+    /// otherwise dropping this injection revokes. See
+    /// `computer_srv::MintGuard` for the invariant and why the drop is safe.
     ///
     /// Set even when `args`/`env` came back EMPTY: the rotation happened
     /// regardless, and a mint whose config could not be written is exactly the
-    /// one nothing else will ever clean up.
-    pub computer_generation: Option<u64>,
+    /// one nothing else would ever clean up — so it must still be revocable.
+    ///
+    /// `Injection` deliberately does NOT implement `Drop` itself, so a caller
+    /// can still move `args`/`env` out field-by-field. Moving those without
+    /// also moving this one drops the guard and revokes — which is the correct
+    /// default for a caller that took the argv but is not spawning anything.
+    pub computer_guard: Option<crate::bus::computer_srv::MintGuard>,
 }
 
 /// The one environment variable two different injections can both target —
@@ -121,13 +123,13 @@ impl Injection {
     /// The empty injection — no args, no env. The overwhelmingly common
     /// fallback shape in this module.
     fn none() -> Injection {
-        Injection { args: vec![], env: vec![], computer_generation: None }
+        Injection { args: vec![], env: vec![], computer_guard: None }
     }
 
     /// An args-only injection (no env) — every producer that carries no env
     /// entry (most of this module).
     fn args_only(args: Vec<String>) -> Injection {
-        Injection { args, env: vec![], computer_generation: None }
+        Injection { args, env: vec![], computer_guard: None }
     }
 }
 
@@ -237,7 +239,7 @@ pub fn acp_mcp_servers(
     computer_wt: Option<i32>,
 ) -> AcpMcpInjection {
     let mut out = Vec::new();
-    let mut computer_generation = None;
+    let mut computer_guard = None;
     // Concierge is global-only (no per-thread bus) — same as inject_global path.
     if include_bus {
         out.push(crate::acp::McpServerSpec {
@@ -278,11 +280,12 @@ pub fn acp_mcp_servers(
             name: "weft_computer".into(),
             url: computer_url_with_key(base, thread, dir, computer_wt, &minted.token),
         });
-        computer_generation = Some(minted.generation);
+        let minted = minted.guard;
+        computer_guard = Some(minted);
     }
     AcpMcpInjection {
         servers: out,
-        computer_generation,
+        computer_guard,
     }
 }
 
@@ -292,12 +295,14 @@ pub fn acp_mcp_servers(
 ///
 /// ACP is the one engine shape whose computer bearer does NOT travel through
 /// [`Injection`] — MCP is supplied on `session/new|resume`, so `inject_computer`
-/// returns nothing for it. The generation still has to reach the engine, or its
+/// returns nothing for it. The mint still has to reach the engine, or its
 /// teardown has no bearer to revoke; this is the ACP analogue of
-/// [`Injection::computer_generation`], and carries it for the same reason.
+/// [`Injection::computer_guard`], and carries it for the same reason — including
+/// the revoke-on-drop, which is what makes every abort between here and an
+/// established route safe without a cleanup call at each one.
 pub struct AcpMcpInjection {
     pub servers: Vec<crate::acp::McpServerSpec>,
-    pub computer_generation: Option<u64>,
+    pub computer_guard: Option<crate::bus::computer_srv::MintGuard>,
 }
 
 /// The shared, FAIL-CLOSED tail of both bash ask-hook scripts — claude's
@@ -538,7 +543,7 @@ fn opencode_env_config_injection(server: &str, url: &str) -> Injection {
         return Injection {
             args: vec![],
             env: vec![],
-            computer_generation: None,
+            computer_guard: None,
         };
     };
     let mcp = root_obj
@@ -556,7 +561,7 @@ fn opencode_env_config_injection(server: &str, url: &str) -> Injection {
     Injection {
         args: vec![],
         env: vec![(OPENCODE_CONFIG_CONTENT_VAR.to_string(), root.to_string())],
-        computer_generation: None,
+        computer_guard: None,
     }
 }
 
@@ -634,6 +639,7 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, wt: Optio
     // `computer_srv::rotate_and_mint_computer_session_token`).
     let minted = crate::bus::computer_srv::rotate_and_mint_computer_session_token(thread, dir, wt);
     let key = minted.token;
+    let guard = minted.guard;
     let url = computer_url_with_key(base, thread, dir, wt, &key);
     let mut injection = match tool {
         "claude" => inject_computer_claude(thread, dir, wt, &url),
@@ -667,7 +673,7 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, wt: Optio
                 // produced above — never a separate re-read, which could
                 // render a LATER overlapping injection's generation.
                 env: vec![(COMPUTER_TOKEN_ENV_VAR.to_string(), key.clone())],
-                computer_generation: None,
+                computer_guard: None,
             }
         }
         // The bearer-carrying URL rides the OPENCODE_CONFIG_CONTENT
@@ -687,11 +693,11 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, wt: Optio
         "opencode" => opencode_env_config_injection("weft_computer", &url),
         _ => Injection::none(),
     };
-    // Stamped AFTER the match so no arm can forget it, and stamped even when
+    // Attached AFTER the match so no arm can forget it, and attached even when
     // the arm produced an empty injection — the rotation above already
-    // happened, and the caller needs the generation to revoke a bearer whose
-    // child never started. See `Injection::computer_generation`.
-    injection.computer_generation = Some(minted.generation);
+    // happened, so that bearer must stay revocable. See
+    // `Injection::computer_guard`.
+    injection.computer_guard = Some(guard);
     injection
 }
 
@@ -1841,7 +1847,7 @@ mod tests {
         assert!(with_computer.servers.iter().any(|s| s.name == "weft_computer"
             && s.url == format!("http://127.0.0.1:9/computer/631/10/mcp?key={key}")));
         assert!(
-            with_computer.computer_generation.is_some(),
+            with_computer.computer_guard.is_some(),
             "an ACP session that gets the computer server must report the generation \
              it minted — that stamp is the engine's only way to revoke it later"
         );
@@ -1860,7 +1866,7 @@ mod tests {
         );
         assert!(!without_computer.servers.iter().any(|s| s.name == "weft_computer"));
         assert!(
-            without_computer.computer_generation.is_none(),
+            without_computer.computer_guard.is_none(),
             "no computer server means nothing was minted, so there is no stamp"
         );
     }

@@ -2208,9 +2208,11 @@ pub struct EngineInner {
     /// outlives individual turns while the mint does not.
     ///
     /// Set for ALL FOUR engine shapes. Three receive it through
-    /// `Injection::computer_generation` in [`refresh_computer_injection`]; ACP,
+    /// `Injection::computer_guard` in [`refresh_computer_injection`]; ACP,
     /// whose bearer never travels through an `Injection` at all, receives it
-    /// from `bus::inject::AcpMcpInjection` at session establishment.
+    /// from `bus::inject::AcpMcpInjection` at session establishment. In every
+    /// case it is written ONLY by [`commit_computer_mint`] — an uncommitted
+    /// mint revokes itself instead of landing here.
     pub computer_gen: Option<u64>,
     /// The generation the CURRENT ACP route owns, shared with the consumer that
     /// will revoke it when the backend dies. `0` means "none". `None` on every
@@ -2897,7 +2899,11 @@ fn build_args(inner: &EngineInner) -> Vec<String> {
 /// UNCHANGED rather than cleared — a spawn with a stale (possibly revoked)
 /// config degrades to 401s on computer calls, whereas clearing them would
 /// silently strip a working tool from a session that legitimately had it.
-fn refresh_computer_injection(app: &AppHandle, inner: &mut EngineInner) -> Option<u64> {
+#[must_use = "the returned mint is revoked on drop — hand it to               `commit_computer_mint` once the child is live"]
+fn refresh_computer_injection(
+    app: &AppHandle,
+    inner: &mut EngineInner,
+) -> Option<crate::bus::computer_srv::MintGuard> {
     if inner.computer_args.is_empty() && inner.computer_env.is_empty() {
         return None;
     }
@@ -2907,27 +2913,42 @@ fn refresh_computer_injection(app: &AppHandle, inner: &mut EngineInner) -> Optio
     if base.is_empty() {
         return None;
     }
-    let fresh = crate::bus::inject::inject_computer(
+    let mut fresh = crate::bus::inject::inject_computer(
         &base,
         inner.thread_id,
         &inner.ask_dir,
         &inner.tool,
         inner.worktree_id,
     );
-    // Record the ownership stamp BEFORE the empty-injection bail. The mint
-    // rotated the identity's generation either way, so the previous stamp is
-    // already stale; keeping it would leave this engine able to revoke only a
-    // generation that no longer exists, while the one it just created — whose
-    // config may well be on disk — becomes unrevocable.
-    if fresh.computer_generation.is_some() {
-        inner.computer_gen = fresh.computer_generation;
-    }
+    // Taken BEFORE the empty-injection bail: the mint rotated the identity's
+    // generation either way, so that bearer has to stay revocable even when the
+    // arm produced nothing usable (an unwritable config is exactly the case
+    // nothing else would clean up). Dropping `fresh` here would revoke it —
+    // correct, but the CALLER is the one that knows whether a child took it.
+    let mint = fresh.computer_guard.take();
     if fresh.args.is_empty() && fresh.env.is_empty() {
-        return fresh.computer_generation;
+        return mint;
     }
     inner.computer_args = fresh.args;
     inner.computer_env = fresh.env;
-    fresh.computer_generation
+    mint
+}
+
+/// A live child or connection now carries the bearer this mint produced:
+/// record its generation as the engine's and disarm the drop-revoke.
+///
+/// The ONLY way a mint stops being revocable. Every path from
+/// [`refresh_computer_injection`] to a running child must end either here or in
+/// a drop — there is no third option, which is the point (see
+/// `computer_srv::MintGuard`). `None` (this engine never had the tool) is a
+/// no-op.
+fn commit_computer_mint(
+    inner: &mut EngineInner,
+    mint: Option<crate::bus::computer_srv::MintGuard>,
+) {
+    if let Some(mint) = mint {
+        inner.computer_gen = Some(mint.commit());
+    }
 }
 
 /// The env pairs for ONE spawn: the engine's own injections plus the
@@ -2994,48 +3015,22 @@ fn release_child_slot(inner: &mut EngineInner) {
     revoke_engine_bearer(inner);
 }
 
-/// Guard a fallible step that sits BETWEEN a mint and the child being alive: on
-/// failure, revoke the bearer `refresh_computer_injection` just minted.
+/// Revoke a NAMED generation, for the one owner that holds a generation but no
+/// [`MintGuard`](crate::bus::computer_srv::MintGuard): the ACP route consumer.
 ///
-/// Every spawn path re-mints immediately before launching, which rotates the
-/// identity's generation and writes the new bearer wherever that tool reads it
-/// (claude's `.mcp.json`, codex's env, opencode's inline config). If the launch
-/// then fails — the cwd vanished, the binary lost its execute bit, the host is
-/// out of process slots, the adapter refused the argv — that bearer is current
-/// and valid but belongs to a child that will never exist. Nothing later
-/// necessarily rotates it: the engine just sits there, its DB rows keep
-/// `session_is_live` true, and the next teardown may never come.
+/// Everywhere else, an uncommitted mint revokes itself by dropping, and a
+/// committed one is revoked through [`EngineInner::computer_gen`]. The ACP
+/// consumer is neither — it outlives the turn that minted (which committed at
+/// its own hand-off point) and learns the route's CURRENT generation from a
+/// shared cell that resumes update in place. So it must name what it revokes.
 ///
-/// Local to the spawn rather than left to the caller's rollback on purpose:
-/// which rollback runs (if any) depends on how the spawn was reached, and that
-/// is exactly the kind of coupling this file has already been bitten by.
-fn revoke_if_spawn_failed<T, E>(inner: &mut EngineInner, r: Result<T, E>) -> Result<T, E> {
-    if r.is_err() {
-        revoke_engine_bearer(inner);
-    }
-    r
-}
-
-/// [`revoke_if_spawn_failed`]'s shape for the codex connect path, which does its
-/// fallible work with the engine lock RELEASED — `connect_session` and
-/// `start_thread` are awaits that must not hold it — so the revoke has to
-/// re-acquire. Same rule, same reason: the connect arm re-mints before spawning
-/// the app-server, and a connect or thread/start that then fails leaves that
-/// bearer current with no process behind it.
-///
-/// Takes the generation EXPLICITLY rather than reading
-/// [`EngineInner::computer_gen`], because on this path the engine is
-/// deliberately still stamped with the PREDECESSOR connection's generation
-/// until the replacement is published — see the connect arm's own comment.
-/// `None` (nothing was minted) is a no-op.
+/// Compare-and-revoke, so a consumer whose route was already replaced changes
+/// nothing.
 async fn revoke_engine_generation_locked(eng: &EngineRef, generation: Option<u64>) {
     revoke_engine_generation(&*eng.lock().await, generation);
 }
 
-/// [`revoke_engine_generation_locked`] for a caller that already holds the
-/// lock. Revokes a NAMED generation rather than [`EngineInner::computer_gen`],
-/// for the same reason: on the codex connect path the stamp still belongs to
-/// the predecessor connection until the replacement is published.
+/// [`revoke_engine_generation_locked`] for a caller that already holds the lock.
 fn revoke_engine_generation(inner: &EngineInner, generation: Option<u64>) {
     let Some(generation) = generation else {
         return;
@@ -3171,7 +3166,9 @@ async fn ensure_running_locked(
     // 撤销。若先铸币,一个全新的、有效的 bearer(claude 还会把它写进磁盘上的 MCP
     // 配置)就会在没有任何子进程的情况下一直有效,同 uid 的进程读到即可用。
     // 铸币必须紧贴 spawn,中间不留可阻塞的等待。
-    let _ = refresh_computer_injection(app, inner);
+    // Held until the child is confirmed running. Every `?` between here and the
+    // commit below drops it, which revokes — no explicit cleanup at any of them.
+    let mint = refresh_computer_injection(app, inner);
     // Resolve the actual binary: a per-session pin, else the global override for
     // "claude" (e.g. a user-aliased `cc-claude`), else "claude" itself.
     let program = crate::tool_command::effective(inner.command.as_deref(), &inner.tool);
@@ -3196,8 +3193,7 @@ async fn ensure_running_locked(
         .kill_on_drop(true);
     // T1: own process group + marker before spawn, register PAIRED with the child.
     let configured = crate::proc_registry::configure(&mut command, owner);
-    let spawned = command.spawn();
-    let mut child = revoke_if_spawn_failed(inner, spawned)?;
+    let mut child = command.spawn()?;
     let reg = configured.register(&child);
     inner.stdin = child.stdin.take();
     // Ask for the command list NOW: the init system message only ships with the
@@ -3211,11 +3207,13 @@ async fn ensure_running_locked(
         let _ = stdin.write_all(format!("{req}\n").as_bytes()).await;
         let _ = stdin.flush().await;
     }
-    let piped = child
+    let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| anyhow::anyhow!("child stdout not piped"));
-    let stdout = revoke_if_spawn_failed(inner, piped)?;
+        .ok_or_else(|| anyhow::anyhow!("child stdout not piped"))?;
+    // The child is up and carries the bearer: hand the mint over. Anything that
+    // returned before this point revoked by dropping it.
+    commit_computer_mint(inner, mint);
     inner.child = Some(child);
     inner.child_reg = Some(reg);
     // permit 与 child_reg 同寿:child 被 take/overwrite/stop 清掉时一并 drop=释放槽。
@@ -4850,10 +4848,10 @@ async fn spawn_codex_turn(
     // Per-session app-server: reuse the engine's connection or spawn one with this
     // session's `-c mcp_servers` bus flags. Its own process keeps the per-thread
     // MCP isolated (app-server MCP is app-scoped).
-    // `minted_gen`: the generation the connect arm minted for THIS app-server.
-    // `None` on the reuse arm — it does not mint, and the live client's bearer
-    // must not be touched.
-    let (client, freshly_connected, minted_gen) = match existing {
+    // `mint`: the ownership receipt for the bearer the connect arm minted for
+    // THIS app-server, held until the client is published. `None` on the reuse
+    // arm — it does not mint, and the live client's bearer must not be touched.
+    let (client, freshly_connected, mint) = match existing {
         Some(c) if c.is_alive().await => (c, false, None),
         dead => {
             // Pre-accept folder trust (like the exec adapter's prepare) so the
@@ -4871,7 +4869,7 @@ async fn spawn_codex_turn(
             // `extra_args`/`extra_env` deliberately carry no computer entries
             // (they live in their own fields), so this re-lock is what
             // assembles the pair the connection actually spawns with.
-            let (spawn_args, spawn_pairs, minted_gen) = {
+            let (spawn_args, spawn_pairs, mint) = {
                 let mut i = eng.lock().await;
                 // Re-check cancellation under THIS lock, before minting. The
                 // `is_alive()` guard on the reuse arm above is an `.await`, so
@@ -4911,37 +4909,29 @@ async fn spawn_codex_turn(
                     i.codex_client = None;
                     revoke_engine_bearer(&mut i);
                 }
-                let minted_gen = refresh_computer_injection(&app, &mut i);
+                let mint = refresh_computer_injection(&app, &mut i);
                 let mut args = extra_args.clone();
                 args.extend(i.computer_args.iter().cloned());
-                (args, spawn_env(&i), minted_gen)
+                (args, spawn_env(&i), mint)
             };
-            let connected = crate::codex_app_server::Client::connect_session(
+            // A connect failure returns through this `?`, dropping `mint` —
+            // which revokes. The `or_exec` fallback could never have cleaned
+            // this up: its revoke is guarded on having a client to take, and
+            // nothing was ever published here.
+            let c = crate::codex_app_server::Client::connect_session(
                 &program,
                 &spawn_args,
                 &spawn_pairs,
                 &cwd,
                 owner,
             )
-            .await;
-            // The re-mint above already rotated and handed this bearer to a
-            // child that now does not exist. The `or_exec` fallback cannot
-            // clean it up: its revoke is guarded on having a client to take,
-            // and nothing was ever published here. See
-            // `revoke_engine_bearer_locked`.
-            let c = match connected {
-                Ok(c) => c,
-                Err(e) => {
-                    revoke_engine_generation_locked(&eng, minted_gen).await;
-                    return Err(e);
-                }
-            };
+            .await?;
             // NOT published to the engine yet: the stop check below must pass
             // first. Publishing early would let this task's stop-cleanup tear a
             // RESTARTED send's client out of the registry (a restart may reuse
             // whatever is registered), or let a restarted send adopt a connection
             // the stop already doomed.
-            (c, true, minted_gen)
+            (c, true, mint)
         }
     };
     let cwd = cwd.to_string_lossy().into_owned();
@@ -4960,10 +4950,9 @@ async fn spawn_codex_turn(
                 // would leak the app-server child (reader/writer tasks hold
                 // clones) alive alongside the exec fallback. Shut it down.
                 if freshly_connected {
+                    // Reaped with the bearer it was spawned carrying; the
+                    // return below drops `mint`, which revokes it.
                     client.shutdown_and_reap().await;
-                    // Reaped with the bearer it was spawned carrying — same
-                    // rule as the connect failure above.
-                    revoke_engine_generation_locked(&eng, minted_gen).await;
                 }
                 return Err(e);
             }
@@ -5006,25 +4995,20 @@ async fn spawn_codex_turn(
         // it down, failing start_turn below) — that is the designed teardown.
         let mut g = eng.lock().await;
         let won = g.stopped || expected_epoch.is_some_and(|e| e != g.reset_epoch);
-        // This task minted a bearer for the connection it is about to tear down
-        // (the connect arm above refreshed, which stamped `computer_gen`). The
-        // stop that won this race revoked the generation that existed BEFORE
-        // that mint, so ours would otherwise outlive the child it was issued to
-        // — exactly the orphan-keeps-a-live-token shape the revoke exists to
-        // close. Under THIS lock, so there is no window at all between the stop
-        // being observed and the token dying; the shutdown below is unlocked.
+        // Publish AND commit under ONE lock acquisition, so `codex_client` and
+        // `computer_gen` describe the same connection from the moment either is
+        // set. The dead predecessor was detached in the connect arm, so nothing
+        // else holds this identity here.
         //
-        // A REUSED client needs nothing: the stop took it out of the registry
-        // and shut it down itself, revoking on the way through.
-        if won && freshly_connected {
-            revoke_engine_generation(&g, minted_gen);
-        }
-        // The stamp was already set by the connect arm's refresh, and the dead
-        // predecessor was detached there — so publishing is all that is left,
-        // and `codex_client`/`computer_gen` describe the same connection from
-        // the moment either is set.
+        // When the stop won, this simply does NOT commit — `mint` then falls
+        // out of scope and revokes, killing the bearer the connection now being
+        // torn down was spawned with. Nothing to write for that case, which is
+        // the whole point of the guard. A REUSED client carries no mint at all:
+        // the stop took it out of the registry and shut it down itself,
+        // revoking on the way through.
         if !won && freshly_connected {
             g.codex_client = Some(client.clone());
+            commit_computer_mint(&mut g, mint);
         }
         won
     };
@@ -5219,7 +5203,7 @@ async fn spawn_acp_turn(
     // to hand out (the description also says it needs enabling in Settings,
     // and the server denies every call otherwise).
     let mcp = if base.is_empty() {
-        crate::bus::inject::AcpMcpInjection { servers: vec![], computer_generation: None }
+        crate::bus::inject::AcpMcpInjection { servers: vec![], computer_guard: None }
     } else if sid.is_none() {
         // Lead-kind engine: choose MCP from thread kind.
         // : a TRANSIENT `get_thread` failure must fail
@@ -5233,7 +5217,7 @@ async fn spawn_acp_turn(
         // computer-use); a genuine `Ok(None)` keeps the prior default.
         match repo::get_thread(&db, thread_id_i).await {
             Err(_) => {
-                crate::bus::inject::AcpMcpInjection { servers: vec![], computer_generation: None }
+                crate::bus::inject::AcpMcpInjection { servers: vec![], computer_guard: None }
             }
             Ok(row) => match row.map(|th| th.kind).unwrap_or_default().as_str() {
                 // Concierge: weft_global only (never bus, never computer).
@@ -5301,26 +5285,23 @@ async fn spawn_acp_turn(
     // `inject_computer` produces nothing for it). Stamp the engine with the
     // generation it just minted, or an ACP teardown would have no bearer of its
     // own to revoke — see `EngineInner::computer_gen`.
-    let computer_generation = mcp.computer_generation;
+    // Held until the route is established. Every abort between here and the
+    // commit — the cancellation re-check below, both session-open failures, the
+    // stop-won teardown — drops it, which revokes. None of them needs a cleanup
+    // call, which is exactly the class of omission this guard exists to end.
+    let mint = mcp.computer_guard;
     {
         // Re-check cancellation HERE, not only at the entry gate. Reaching this
         // point crossed `client()` and a thread lookup, both awaits, so a Stop
         // can have completed — and revoked — in between. The mint above already
         // rotated a fresh, VALID bearer for an engine the user just stopped,
         // undoing that revoke; the codex connect arm re-checks for the identical
-        // reason. Revoke what we minted before failing, because the abort paths
-        // that would otherwise clean up cannot: the caller's rollback no-ops
-        // once Stop has reset the turn, and a resume that fails before
-        // subscription has no consumer to do it either.
-        let mut g = eng.lock().await;
+        // reason.
+        let g = eng.lock().await;
         let cancelled =
             g.stopped || g.interrupting || expected_epoch.is_some_and(|e| e != g.reset_epoch);
         if cancelled {
-            revoke_engine_generation(&g, computer_generation);
             return Err(anyhow::anyhow!("engine stopped; not starting an ACP turn"));
-        }
-        if computer_generation.is_some() {
-            g.computer_gen = computer_generation;
         }
     }
     let mcp = mcp.servers;
@@ -5358,10 +5339,9 @@ async fn spawn_acp_turn(
                         // also pins the pooled client so it can never retire.
                         let _ = client.cancel(&id).await;
                         client.unsubscribe(&id).await;
-                        // Minted above for a session that never opened: no
-                        // consumer exists to revoke it at exit, and the route
-                        // just torn down was never subscribed under it.
-                        revoke_engine_generation_locked(&eng, computer_generation).await;
+                        // The mint dies with the return below: no consumer will
+                        // ever exist to revoke it, and the route just torn down
+                        // was never subscribed under it.
                         clear_acp_native_never_prompted(&app, &db, &eng, sid, thread_id_i).await;
                         return Err(anyhow::anyhow!("acp_session_open_failed"));
                     }
@@ -5374,8 +5354,7 @@ async fn spawn_acp_turn(
                 Err(e) => {
                     eprintln!("[weft][acp] session/new failed: {e}");
                     // Same as the resume/load failure above: the mint happened,
-                    // the session did not, and nothing downstream will clean up.
-                    revoke_engine_generation_locked(&eng, computer_generation).await;
+                    // the session did not, and the return drops it.
                     return Err(anyhow::anyhow!("acp_session_open_failed"));
                 }
             };
@@ -5439,16 +5418,19 @@ async fn spawn_acp_turn(
     // rotated while that route's consumer kept running.
     let route_gen_cell = {
         let mut g = eng.lock().await;
+        // Seed/refresh the route's cell from the mint WITHOUT committing: the
+        // stop-won check below can still tear this turn down, and only there is
+        // the hand-off actually final. `MintGuard::generation` exists for
+        // exactly this — name the generation while ownership is still pending.
+        let pending = mint.as_ref().map(|m| m.generation());
         if !need_sub {
-            if let (Some(generation), Some(cell)) = (computer_generation, g.acp_route_gen.as_ref())
-            {
+            if let (Some(generation), Some(cell)) = (pending, g.acp_route_gen.as_ref()) {
                 cell.store(generation, std::sync::atomic::Ordering::SeqCst);
             }
             None
         } else {
-            let cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                computer_generation.unwrap_or(0),
-            ));
+            let cell =
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(pending.unwrap_or(0)));
             g.acp_route_gen = Some(cell.clone());
             Some(cell)
         }
@@ -5487,11 +5469,18 @@ async fn spawn_acp_turn(
         // Ordinary composer Stop sets `interrupting` without bumping epoch until
         // the delayed force reset — must not publish acp_client or arm prompt.
         let won = g.stopped || g.interrupting || expected_epoch.is_some_and(|e| e != g.reset_epoch);
+        // The hand-off is final HERE, not at the route block above: only past
+        // this check is the turn actually going to run. Committing publishes
+        // the generation as the engine's; a stop that won simply does not
+        // commit, and `mint` then drops at the end of this function and
+        // revokes. The route's consumer will also try, reading the cell seeded
+        // above — compare-and-revoke makes whichever lands second inert.
         if !won {
             g.acp_client = Some(client.clone());
             if g.native_id.as_deref() != Some(session_id.as_str()) {
                 g.native_id = Some(session_id.clone());
             }
+            commit_computer_mint(&mut g, mint);
         }
         won
     };
@@ -5501,13 +5490,6 @@ async fn spawn_acp_turn(
         // next send reuses a stale-epoch consumer that drops every update.
         let _ = client.cancel(&session_id).await;
         client.unsubscribe(&session_id).await;
-        // The unsubscribe above ends this route's consumer, which is what would
-        // otherwise revoke — but it revokes what the CELL holds, and if this
-        // turn resumed a live route that cell is shared with a session the Stop
-        // is tearing down anyway. Revoke what THIS turn minted, by name, so the
-        // path is right whether the route was new or reused. Compare-and-revoke
-        // makes the consumer's own attempt inert rather than double-counting.
-        revoke_engine_generation_locked(&eng, computer_generation).await;
         // First open never got session/prompt — drop native id so the next
         // send re-opens and still prepends the system prompt.
         if prior_native.is_none() {
@@ -7487,7 +7469,9 @@ async fn spawn_turn(
     // Re-mint the computer bearer before this turn's child — a per-turn tool
     // spawns from the engine's stored injection just like the resident path,
     // so a Stop-revoked bearer would otherwise ride into the new process
-    let _ = refresh_computer_injection(&app, &mut inner);
+    // Same hand-off discipline as the resident path: held until the child is
+    // running, dropped (revoked) by any early return in between.
+    let mint = refresh_computer_injection(&app, &mut inner);
     // The computer injection is appended here rather than living in
     // `extra_args`, mirroring `build_args` — see `EngineInner::computer_args`.
     let mut adapter_extra = inner.extra_args.clone();
@@ -7500,7 +7484,7 @@ async fn spawn_turn(
         message: &out.text,
         slash_commands: &inner.slash_commands,
     });
-    let (_program, args) = revoke_if_spawn_failed(&mut inner, built)?;
+    let (_program, args) = built?;
     // The adapter's program is the tool identity; resolve it through the
     // per-session pin / global override map so an aliased binary is spawned.
     let program = crate::tool_command::effective(inner.command.as_deref(), &inner.tool);
@@ -7526,14 +7510,13 @@ async fn spawn_turn(
         .kill_on_drop(true);
     // T1: own process group + marker before spawn, register PAIRED with the child.
     let configured = crate::proc_registry::configure(&mut command, owner);
-    let spawned = command.spawn();
-    let mut child = revoke_if_spawn_failed(&mut inner, spawned)?;
+    let mut child = command.spawn()?;
     let reg = configured.register(&child);
-    let piped = child
+    let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| anyhow::anyhow!("child stdout not piped"));
-    let stdout = revoke_if_spawn_failed(&mut inner, piped)?;
+        .ok_or_else(|| anyhow::anyhow!("child stdout not piped"))?;
+    commit_computer_mint(&mut inner, mint);
     inner.stdin = None;
     inner.child = Some(child);
     inner.child_reg = Some(reg);
@@ -13827,9 +13810,12 @@ mod tests {
             &inner.ask_dir,
             None,
         );
-        // Exactly what `refresh_computer_injection` does: the stamp is what
-        // makes this engine's teardown able to revoke, and only its own.
-        inner.computer_gen = Some(minted.generation);
+        // Exactly what a spawn path does once the child is live: commit the
+        // mint, which both disarms the drop-revoke and records the generation
+        // this engine's teardown may revoke. Without the commit the guard would
+        // drop at the end of this helper and kill the bearer the caller is
+        // about to assert on.
+        commit_computer_mint(inner, Some(minted.guard));
         minted.token
     }
 
@@ -13959,34 +13945,55 @@ mod tests {
     /// A mint whose child never starts is not somebody else's problem. Every
     /// spawn path re-mints right before launching, so a launch that then fails
     /// leaves a current, valid bearer — and a written config — belonging to a
-    /// process that does not exist. `revoke_if_spawn_failed` is what closes it
-    /// at the spawn rather than hoping a rollback runs.
+    /// process that does not exist. The guard closes it by DEFAULT: an early
+    /// return anywhere between the mint and a live child drops it.
+    ///
+    /// Written against the drop rather than against a spawn path so it holds
+    /// for every such path, including ones added later.
     #[tokio::test]
     async fn a_mint_whose_spawn_fails_is_revoked_at_the_failure() {
-        let mut inner = test_inner("claude");
-        let stillborn = mint_bearer_for(&mut inner, 951_801);
-        assert!(bearer_is_live(&inner, &stillborn));
+        let inner = test_inner("claude");
+        let minted = crate::bus::computer_srv::rotate_and_mint_computer_session_token(
+            951_801,
+            &inner.ask_dir,
+            None,
+        );
+        let stillborn = minted.token;
+        assert!(crate::bus::computer_srv::computer_session_token(951_801, &inner.ask_dir, None)
+            == stillborn);
 
-        let failed: Result<(), std::io::Error> = Err(std::io::Error::other("no such cwd"));
-        assert!(revoke_if_spawn_failed(&mut inner, failed).is_err());
+        // The spawn failed: nothing committed, so the guard falls out of scope.
+        drop(minted.guard);
 
         assert!(
-            !bearer_is_live(&inner, &stillborn),
+            crate::bus::computer_srv::computer_session_token(951_801, &inner.ask_dir, None)
+                != stillborn,
             "a bearer minted for a child that never started must not stay valid"
         );
     }
 
-    /// The mirror: a spawn that SUCCEEDS must keep its freshly minted bearer,
-    /// or every session would 401 on its first computer call.
+    /// The mirror, and the one that catches "just revoke everything": a spawn
+    /// that SUCCEEDS commits, and the bearer must survive — otherwise every
+    /// session would 401 on its first computer call.
     #[tokio::test]
     async fn a_successful_spawn_keeps_the_bearer_it_was_minted() {
         let mut inner = test_inner("claude");
-        let live = mint_bearer_for(&mut inner, 951_901);
+        inner.thread_id = 951_901;
+        inner.worktree_id = None;
+        let minted = crate::bus::computer_srv::rotate_and_mint_computer_session_token(
+            inner.thread_id,
+            &inner.ask_dir,
+            None,
+        );
+        let live = minted.token;
 
-        let ok: Result<(), std::io::Error> = Ok(());
-        assert!(revoke_if_spawn_failed(&mut inner, ok).is_ok());
+        commit_computer_mint(&mut inner, Some(minted.guard));
 
         assert!(bearer_is_live(&inner, &live), "a launched child keeps its bearer");
+        assert!(
+            inner.computer_gen.is_some(),
+            "committing is also what records the generation a teardown will revoke"
+        );
     }
 
     /// A LIVE app-server client holds this engine's bearer, and a child
@@ -14051,7 +14058,8 @@ mod tests {
             &inner.ask_dir,
             inner.worktree_id,
         );
-        inner.computer_gen = Some(replacement.generation);
+        let replacement_gen = replacement.guard.commit();
+        inner.computer_gen = Some(replacement_gen);
         assert!(!bearer_is_live(&inner, &predecessor), "rotation killed it already");
 
         // The predecessor's consumer only now notices its connection is gone.
@@ -14129,8 +14137,9 @@ mod tests {
             &inner.ask_dir,
             inner.worktree_id,
         );
-        inner.computer_gen = Some(turn_two.generation);
-        cell.store(turn_two.generation, SeqCst);
+        let turn_two_gen = turn_two.guard.commit();
+        inner.computer_gen = Some(turn_two_gen);
+        cell.store(turn_two_gen, SeqCst);
 
         // The backend dies; the consumer reads its cell and revokes.
         let owned = Some(held_by_consumer.load(SeqCst)).filter(|g| *g != 0);
@@ -14160,9 +14169,10 @@ mod tests {
             &inner.ask_dir,
             inner.worktree_id,
         );
-        inner.computer_gen = Some(new_route.generation);
+        let new_route_gen = new_route.guard.commit();
+        inner.computer_gen = Some(new_route_gen);
         let _new_cell = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-            new_route.generation,
+            new_route_gen,
         ));
 
         // The OLD consumer finally exits, reading its own (untouched) cell.

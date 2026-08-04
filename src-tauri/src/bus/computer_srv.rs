@@ -323,23 +323,93 @@ pub fn rotate_and_mint_computer_session_token(
     *slot = slot.wrapping_add(1);
     MintedBearer {
         token: render_computer_session_token(thread, dir, wt, *slot),
-        generation: *slot,
+        guard: MintGuard {
+            thread,
+            dir: dir.to_string(),
+            wt,
+            generation: *slot,
+            committed: false,
+        },
     }
 }
 
 /// What [`rotate_and_mint_computer_session_token`] produced: the bearer the
-/// child will carry, and the generation it was pinned to.
-///
-/// The generation is returned rather than re-read afterwards because a re-read
-/// races: another engine's injection for the SAME identity could rotate in
-/// between, and the caller would then record — and later revoke — a generation
-/// that belongs to somebody else's child. See
-/// [`revoke_computer_session_token_generation`] for what that ownership record
-/// is for.
+/// child will carry, and a [`MintGuard`] that revokes it unless the caller
+/// says a live process took it.
 #[doc(hidden)]
 pub struct MintedBearer {
     pub token: String,
-    pub generation: u64,
+    pub guard: MintGuard,
+}
+
+/// Ownership receipt for one freshly minted bearer: revokes on drop unless
+/// [`MintGuard::commit`] is called.
+///
+/// # The invariant this exists to enforce
+///
+/// A minted generation is owned by exactly one LIVE thing — a child process, an
+/// app-server connection, an ACP route, or the engine that will spawn one — or
+/// it is revoked. Between the mint and that owner existing, the bearer is valid
+/// and unowned: the identity's DB rows keep `session_is_live` true, so nothing
+/// downstream refuses it, and for claude it is already written to an
+/// owner-readable config on disk. Anything that returns, fails, or blocks in
+/// that window leaves desktop control reachable by an orphaned descendant or
+/// any same-uid process that read the config/env/argv.
+///
+/// Enforced by the type rather than by convention, because convention did not
+/// hold here. The unowned-mint paths are not exotic and they do not look alike:
+/// a `?` between the mint and the spawn; a connection torn down on a path with
+/// no revoke; a constructor that fails before an engine exists to tear down; a
+/// mint left straddling a blocking queue wait, unrevokable because the engine
+/// lock is held across it. Each is invisible at the site that introduces it —
+/// the code reads as if the bearer simply went to a child. Making the revoke
+/// the DEFAULT inverts that: a new path has to SAY that something took the
+/// bearer, and `#[must_use]` plus the absence of any other way to obtain the
+/// generation is what forces it to.
+///
+/// # Why dropping is safe
+///
+/// Drop goes through [`revoke_computer_session_token_generation`], which is
+/// compare-and-revoke: a guard whose generation was already superseded by
+/// another injection for the same identity changes nothing. So a late or
+/// duplicate drop can never take a live replacement's bearer with it — which
+/// matters because `(thread, dir, wt)` is shared between sessions of one
+/// direction and worktree.
+///
+/// Revocation is a synchronous map bump, so it is safe to do in `Drop`.
+#[doc(hidden)]
+#[must_use = "an unheld mint is revoked on drop — commit it once a live child               or connection carries the bearer, or drop it deliberately"]
+pub struct MintGuard {
+    thread: i32,
+    dir: String,
+    wt: Option<i32>,
+    generation: u64,
+    committed: bool,
+}
+
+impl MintGuard {
+    /// A live child/connection now carries this bearer, and its caller records
+    /// the returned generation as the owner's. Disarms the drop-revoke.
+    pub fn commit(mut self) -> u64 {
+        self.committed = true;
+        self.generation
+    }
+
+    /// The generation this guard would revoke, WITHOUT disarming it. For a
+    /// caller that must name the generation while the hand-off is still
+    /// pending (an ACP route cell seeded before the consumer exists).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl Drop for MintGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        revoke_computer_session_token_generation(self.thread, &self.dir, self.wt, self.generation);
+    }
 }
 
 /// Invalidate the bearer minted at `generation` for `(thread, dir, wt)` WITHOUT
@@ -5001,7 +5071,7 @@ mod tests {
         assert!(verify_computer_token(933_001, "70", Some(1), &old), "current render verifies");
         let sibling = computer_session_token(933_001, "70", Some(2));
 
-        let fresh = rotate_and_mint_computer_session_token(933_001, "70", Some(1)).token;
+        let fresh = mint_committed(933_001, "70", Some(1));
 
         assert!(
             !verify_computer_token(933_001, "70", Some(1), &old),
@@ -5018,6 +5088,17 @@ mod tests {
             verify_computer_token(933_001, "70", Some(2), &sibling),
             "a sibling worktree's own bearer must survive the rotation"
         );
+    }
+
+    /// Mint and immediately accept the hand-off. These tests exercise token and
+    /// generation semantics, not the ownership protocol, so they stand in for
+    /// "a live child took this bearer". Without the commit the `MintGuard`
+    /// drops at the end of the statement and revokes what was just minted —
+    /// which is the guard working, and exactly what it is for.
+    fn mint_committed(thread: i32, dir: &str, wt: Option<i32>) -> String {
+        let minted = rotate_and_mint_computer_session_token(thread, dir, wt);
+        let _ = minted.guard.commit();
+        minted.token
     }
 
     /// Stopping a session must kill its bearer even though no replacement is
@@ -5047,7 +5128,7 @@ mod tests {
 
         // Resume: the respawn path re-injects, which mints under the bumped
         // generation — so the resumed child gets a working bearer.
-        let resumed = rotate_and_mint_computer_session_token(933_201, "70", Some(1)).token;
+        let resumed = mint_committed(933_201, "70", Some(1));
         assert_ne!(resumed, stopped, "resume must not hand back the revoked token");
         assert!(
             verify_computer_token(933_201, "70", Some(1), &resumed),
@@ -5064,6 +5145,7 @@ mod tests {
     #[test]
     fn a_revoke_after_a_mint_leaves_no_valid_bearer() {
         let minted = rotate_and_mint_computer_session_token(933_401, "70", Some(3));
+        let generation = minted.guard.commit();
         assert!(verify_computer_token(933_401, "70", Some(3), &minted.token));
 
         // The doomed child's connection is torn down: revoke what we minted.
@@ -5071,7 +5153,7 @@ mod tests {
             933_401,
             "70",
             Some(3),
-            minted.generation
+            generation
         ));
 
         assert!(
@@ -5091,8 +5173,8 @@ mod tests {
             !revoke_computer_session_token_generation(933_301, "lead", None, 1),
             "a generation this identity never minted must not be revocable"
         );
-        let minted = rotate_and_mint_computer_session_token(933_301, "lead", None);
-        assert!(verify_computer_token(933_301, "lead", None, &minted.token));
+        let minted = mint_committed(933_301, "lead", None);
+        assert!(verify_computer_token(933_301, "lead", None, &minted));
     }
 
     /// Bump and render share one critical section: each of two back-to-back
@@ -5101,8 +5183,8 @@ mod tests {
     /// the LAST rotation's token verifies.
     #[test]
     fn overlapping_rotations_never_share_the_latest_bearer() {
-        let first = rotate_and_mint_computer_session_token(933_101, "70", None).token;
-        let second = rotate_and_mint_computer_session_token(933_101, "70", None).token;
+        let first = mint_committed(933_101, "70", None);
+        let second = mint_committed(933_101, "70", None);
         assert_ne!(first, second, "each rotation mints its own generation's token");
         assert!(
             !verify_computer_token(933_101, "70", None, &first),
@@ -6269,7 +6351,7 @@ mod tests {
     #[test]
     fn the_entry_capture_binds_a_request_to_the_generation_its_bearer_verified_at() {
         let thread = 933_201;
-        let token = rotate_and_mint_computer_session_token(thread, "lead", None).token;
+        let token = mint_committed(thread, "lead", None);
         let auth_gen = verify_computer_token_at_current_generation(thread, "lead", None, &token)
             .expect("a freshly minted bearer must verify");
         assert_eq!(auth_gen, session_token_generation(thread, "lead", None));
@@ -6278,7 +6360,7 @@ mod tests {
         // A replacement launch rotates: the old bearer no longer verifies at
         // the entry gate, and the old captured generation now fails every
         // in-flight checkpoint with the superseded message.
-        let _replacement = rotate_and_mint_computer_session_token(thread, "lead", None);
+        let _replacement = mint_committed(thread, "lead", None);
         assert!(
             verify_computer_token_at_current_generation(thread, "lead", None, &token).is_none(),
             "the superseded bearer must 401 at the entry gate"
@@ -6338,7 +6420,7 @@ mod tests {
         // ...and a replacement launch rotates it while the activation
         // shell-out is running.
         *mock.on_activate.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
-            let _ = rotate_and_mint_computer_session_token(906_401, "lead", None);
+            let _ = mint_committed(906_401, "lead", None);
         }));
 
         let mut window_id_out = None;
