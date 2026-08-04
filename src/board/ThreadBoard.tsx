@@ -130,6 +130,7 @@ export function ThreadBoard() {
     worktrees: worktreeSignatures,
     workerSessions: Object.values(sessions).map((session) => ({
       directionId: session.directionId,
+      repoId: session.repoId,
       sessionId: session.info.session_id,
       status: session.status,
     })),

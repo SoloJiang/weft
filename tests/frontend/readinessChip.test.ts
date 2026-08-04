@@ -37,10 +37,14 @@ type ReadinessKeyModule = {
     directions: { id: number; status: string }[];
     attentionIds: string[];
     worktrees: { directionId: number; worktreeId?: number; exists: boolean }[];
-    workerSessions: { directionId: number; sessionId: number; status: string }[];
+    workerSessions: { directionId: number; repoId: number; sessionId: number; status: string }[];
     planStatus: string | null;
     prRevision: number;
   }): string;
+  latestWorkerSessionSignatures(
+    directionIds: number[],
+    sessions: { directionId: number; repoId: number; sessionId: number; status: string }[],
+  ): { directionId: number; repoId: number; sessionId: number; status: string }[];
   beginReadinessRefresh<T>(): ReadinessFetchState;
   completeReadinessRefresh<T>(dto: T): ReadinessFetchState;
   failReadinessRefresh<T>(): ReadinessFetchState;
@@ -203,15 +207,15 @@ test("readiness key includes direction statuses, attention identities, worktrees
       { directionId: 4, exists: true },
     ],
     workerSessions: [
-      { directionId: 9, sessionId: 12, status: "idle" },
-      { directionId: 4, sessionId: 8, status: "running" },
+      { directionId: 9, repoId: 90, sessionId: 12, status: "idle" },
+      { directionId: 4, repoId: 40, sessionId: 8, status: "running" },
     ],
     planStatus: "proposed",
     prRevision: 0,
   });
   assert.equal(
     base,
-    "directions:4:working,9:review|attention:need-4,need-9|worktrees:4:true,9:true|workers:4:8:running,9:12:idle|plan:proposed|pr:0",
+    "directions:4:working,9:review|attention:need-4,need-9|worktrees:4:true,9:true|workers:4:40:8:running,9:90:12:idle|plan:proposed|pr:0",
   );
   assert.notEqual(
     base,
@@ -226,8 +230,8 @@ test("readiness key includes direction statuses, attention identities, worktrees
         { directionId: 4, exists: true },
       ],
       workerSessions: [
-        { directionId: 9, sessionId: 12, status: "idle" },
-        { directionId: 4, sessionId: 8, status: "running" },
+        { directionId: 9, repoId: 90, sessionId: 12, status: "idle" },
+        { directionId: 4, repoId: 40, sessionId: 8, status: "running" },
       ],
       planStatus: "proposed",
       prRevision: 0,
@@ -246,8 +250,8 @@ test("readiness key includes direction statuses, attention identities, worktrees
         { directionId: 4, exists: true },
       ],
       workerSessions: [
-        { directionId: 9, sessionId: 12, status: "idle" },
-        { directionId: 4, sessionId: 8, status: "running" },
+        { directionId: 9, repoId: 90, sessionId: 12, status: "idle" },
+        { directionId: 4, repoId: 40, sessionId: 8, status: "running" },
       ],
       planStatus: "proposed",
       prRevision: 0,
@@ -266,8 +270,8 @@ test("readiness key includes direction statuses, attention identities, worktrees
         { directionId: 4, exists: true },
       ],
       workerSessions: [
-        { directionId: 9, sessionId: 12, status: "idle" },
-        { directionId: 4, sessionId: 8, status: "running" },
+        { directionId: 9, repoId: 90, sessionId: 12, status: "idle" },
+        { directionId: 4, repoId: 40, sessionId: 8, status: "running" },
       ],
       planStatus: "confirmed",
       prRevision: 0,
@@ -286,8 +290,8 @@ test("readiness key includes direction statuses, attention identities, worktrees
         { directionId: 4, exists: true },
       ],
       workerSessions: [
-        { directionId: 9, sessionId: 12, status: "idle" },
-        { directionId: 4, sessionId: 8, status: "running" },
+        { directionId: 9, repoId: 90, sessionId: 12, status: "idle" },
+        { directionId: 4, repoId: 40, sessionId: 8, status: "running" },
       ],
       planStatus: "proposed",
       prRevision: 1,
@@ -505,8 +509,8 @@ test("worker terminal status changes synchronously hide a prior verdict", async 
     attentionIds: [],
     worktrees: [{ directionId: 17, exists: true }],
     workerSessions: [
-      { directionId: 17, sessionId: 2, status: "idle" },
-      { directionId: 17, sessionId: 3, status: "running" },
+      { directionId: 17, repoId: 170, sessionId: 2, status: "idle" },
+      { directionId: 17, repoId: 170, sessionId: 3, status: "running" },
     ],
     planStatus: null,
     prRevision: 0,
@@ -516,8 +520,8 @@ test("worker terminal status changes synchronously hide a prior verdict", async 
     attentionIds: [],
     worktrees: [{ directionId: 17, exists: true }],
     workerSessions: [
-      { directionId: 17, sessionId: 2, status: "idle" },
-      { directionId: 17, sessionId: 3, status: "error" },
+      { directionId: 17, repoId: 170, sessionId: 2, status: "idle" },
+      { directionId: 17, repoId: 170, sessionId: 3, status: "error" },
     ],
     planStatus: null,
     prRevision: 0,
@@ -528,6 +532,84 @@ test("worker terminal status changes synchronously hide a prior verdict", async 
   assert.notEqual(runningKey, failedKey, "the latest worker terminal state changes the key");
   assert.equal(selectVisibleReadiness(stored, 17, runningKey), ready);
   assert.deepEqual(selectVisibleReadiness(stored, 17, failedKey), { kind: "loading" });
+});
+
+test("latest worker sessions retain the newest session for each relevant repository slot", async () => {
+  const { latestWorkerSessionSignatures } = await loadReadinessKey();
+  const latest = latestWorkerSessionSignatures(
+    [17, 19],
+    [
+      { directionId: 19, repoId: 2, sessionId: 8, status: "idle" },
+      { directionId: 17, repoId: 4, sessionId: 3, status: "running" },
+      { directionId: 17, repoId: 4, sessionId: 7, status: "error" },
+      { directionId: 17, repoId: 1, sessionId: 5, status: "idle" },
+      { directionId: 17, repoId: 1, sessionId: 2, status: "running" },
+      { directionId: 23, repoId: 9, sessionId: 99, status: "running" },
+    ],
+  );
+
+  assert.deepEqual(latest, [
+    { directionId: 17, repoId: 1, sessionId: 5, status: "idle" },
+    { directionId: 17, repoId: 4, sessionId: 7, status: "error" },
+    { directionId: 19, repoId: 2, sessionId: 8, status: "idle" },
+  ]);
+});
+
+test("multi-repository worker transitions synchronously invalidate readiness", async () => {
+  const { buildReadinessKey, selectVisibleReadiness } = await loadReadinessKey();
+  const base = {
+    directions: [{ id: 17, status: "working" }],
+    attentionIds: [],
+    worktrees: [{ directionId: 17, exists: true }],
+    planStatus: null,
+    prRevision: 0,
+  };
+  const idleKey = buildReadinessKey({
+    ...base,
+    workerSessions: [
+      { directionId: 17, repoId: 101, sessionId: 2, status: "idle" },
+      { directionId: 17, repoId: 101, sessionId: 1, status: "error" },
+      { directionId: 17, repoId: 202, sessionId: 9, status: "idle" },
+    ],
+  });
+  const runningKey = buildReadinessKey({
+    ...base,
+    workerSessions: [
+      { directionId: 17, repoId: 101, sessionId: 2, status: "running" },
+      { directionId: 17, repoId: 101, sessionId: 1, status: "error" },
+      { directionId: 17, repoId: 202, sessionId: 9, status: "idle" },
+    ],
+  });
+  const failedKey = buildReadinessKey({
+    ...base,
+    workerSessions: [
+      { directionId: 17, repoId: 101, sessionId: 2, status: "error" },
+      { directionId: 17, repoId: 101, sessionId: 1, status: "idle" },
+      { directionId: 17, repoId: 202, sessionId: 9, status: "idle" },
+    ],
+  });
+  const ready = { kind: "ready" as const, dto: { readiness: "review_ready", reasons: [] } };
+  const stored = { threadId: 17, key: idleKey, state: ready };
+
+  assert.match(idleKey, /workers:17:101:2:idle,17:202:9:idle/);
+  assert.doesNotMatch(idleKey, /17:101:1:error/);
+  assert.notEqual(
+    idleKey,
+    runningKey,
+    "the older-ID repository worker invalidates readiness while its sibling is unchanged",
+  );
+  assert.notEqual(runningKey, failedKey, "a terminal transition also invalidates readiness");
+  assert.deepEqual(selectVisibleReadiness(stored, 17, runningKey), { kind: "loading" });
+  assert.deepEqual(selectVisibleReadiness(stored, 17, failedKey), { kind: "loading" });
+});
+
+test("both boards pass repository identity into readiness worker signatures", () => {
+  for (const source of [
+    readFileSync(threadBoardPath, "utf8"),
+    readFileSync(workspaceKanbanPath, "utf8"),
+  ]) {
+    assert.match(source, /workerSessions:[\s\S]*?repoId:\s*session\.repoId/);
+  }
 });
 
 test("board urgency preserves baseline signals while consuming lane verdicts", async () => {

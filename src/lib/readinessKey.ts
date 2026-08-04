@@ -20,6 +20,7 @@ export interface ReadinessWorktreeRow {
 /** A live worker session whose terminal transition can invalidate readiness. */
 export interface ReadinessWorkerSessionSignature {
   directionId: number;
+  repoId: number;
   sessionId: number;
   status: string;
 }
@@ -103,25 +104,35 @@ export function buildReadinessWorktreeSignatures(
   );
 }
 
-/** The newest known session per relevant direction, in deterministic order. */
+function compareReadinessWorkerSessions(
+  left: ReadinessWorkerSessionSignature,
+  right: ReadinessWorkerSessionSignature,
+): number {
+  const directionOrder = left.directionId - right.directionId;
+  if (directionOrder !== 0) {
+    return directionOrder;
+  }
+  return left.repoId - right.repoId;
+}
+
+/** The newest known session per relevant (direction, repository) slot. */
 export function latestWorkerSessionSignatures(
   directionIds: number[],
   sessions: ReadinessWorkerSessionSignature[],
 ): ReadinessWorkerSessionSignature[] {
   const relevantDirections = new Set(directionIds);
-  const latestByDirection = new Map<number, ReadinessWorkerSessionSignature>();
+  const latestBySlot = new Map<string, ReadinessWorkerSessionSignature>();
   for (const session of sessions) {
     if (!relevantDirections.has(session.directionId)) {
       continue;
     }
-    const current = latestByDirection.get(session.directionId);
+    const slot = `${session.directionId}:${session.repoId}`;
+    const current = latestBySlot.get(slot);
     if (!current || session.sessionId > current.sessionId) {
-      latestByDirection.set(session.directionId, session);
+      latestBySlot.set(slot, session);
     }
   }
-  return [...latestByDirection.values()].sort(
-    (left, right) => left.directionId - right.directionId,
-  );
+  return [...latestBySlot.values()].sort(compareReadinessWorkerSessions);
 }
 
 /** Stable refresh input for one backend readiness read. */
@@ -139,7 +150,10 @@ export function buildReadinessKey(input: ReadinessKeyInput): string {
     input.directions.map((direction) => direction.id),
     input.workerSessions,
   )
-    .map((session) => `${session.directionId}:${session.sessionId}:${session.status}`)
+    .map(
+      (session) =>
+        `${session.directionId}:${session.repoId}:${session.sessionId}:${session.status}`,
+    )
     .join(",");
   const planStatus = input.planStatus ?? "";
   return [

@@ -227,6 +227,7 @@ function ThreadCard({
     worktrees: buildReadinessWorktreeSignatures(readinessDirections, worktreesByDirection),
     workerSessions: Object.values(sessions).map((session) => ({
       directionId: session.directionId,
+      repoId: session.repoId,
       sessionId: session.info.session_id,
       status: session.status,
     })),
