@@ -520,9 +520,10 @@ fn reset_failed_hidden_turn(inner: &mut EngineInner, turn_id: i32) -> Option<Vec
     // be waiting on the admission gate even though this hidden spawn rolled
     // back. Its DB result must still linearize before a retry can replay it.
     inner.child = None;
-    // Dropping `child` kills it (kill_on_drop), so its session_gate slot must go
-    // with it — see `child_permit`'s doc for the leak this closes.
-    inner.child_permit = None;
+    // Dropping `child` kills it (kill_on_drop), so its session_gate slot and its
+    // computer bearer both go with it — see `release_child_slot`. Inside the
+    // turn_id+busy guard, as that helper requires.
+    release_child_slot(inner);
     inner.stdin = None;
     inner.current = None;
     inner.interrupting = false;
@@ -1865,6 +1866,22 @@ async fn finalize_text_row(
     }
 }
 
+/// Nothing about a turn is in flight or half-written: no busy turn, no open
+/// text or tool rows, no queue. [`cleanup_disconnected_turn`] has nothing to
+/// tear down in that state and returns immediately.
+///
+/// Named rather than inlined because callers reason about the skip. Notably
+/// `codex_consumer`: an app-server that dies BETWEEN turns finds the engine in
+/// exactly this state, so anything that must happen on a disconnect — the
+/// bearer revoke especially — cannot be placed inside that cleanup alone.
+fn turn_state_is_untouched(inner: &EngineInner) -> bool {
+    !inner.turn.busy
+        && inner.current.is_none()
+        && inner.open_texts.is_empty()
+        && inner.turn.queue.is_empty()
+        && inner.tool_rows.is_empty()
+}
+
 async fn cleanup_disconnected_turn(
     app: &AppHandle,
     db: &Db,
@@ -1872,12 +1889,7 @@ async fn cleanup_disconnected_turn(
     fallback_status: &str,
 ) {
     let mut inner = eng.lock().await;
-    if !inner.turn.busy
-        && inner.current.is_none()
-        && inner.open_texts.is_empty()
-        && inner.turn.queue.is_empty()
-        && inner.tool_rows.is_empty()
-    {
+    if turn_state_is_untouched(&inner) {
         return;
     }
     let thread_id = inner.thread_id;
@@ -1912,8 +1924,15 @@ async fn cleanup_disconnected_turn(
     inner.child = None;
     // This reset carries STOP semantics (`stopped = true` below), so nothing
     // will respawn a child until the human sends again — quite possibly never.
-    // The slot goes back with the process it belonged to.
-    inner.child_permit = None;
+    // The slot and the bearer both go back with the process they belonged to.
+    //
+    // This is also the ONLY teardown a codex app-server death reaches: that
+    // child is owned by the app-server client, never by `inner.child`, so it
+    // never passes through `spawn_reader`'s EOF branches — `codex_consumer`
+    // routes a genuine disconnect straight here. Without the revoke, a crashed
+    // app-server whose session is never reconnected leaves its generation
+    // current for the life of the process.
+    release_child_slot(&mut inner);
     inner.stdin = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
@@ -2220,6 +2239,14 @@ pub struct EngineInner {
     /// rest of the process: the gate is a `OnceLock` singleton, so a session
     /// that was stopped hours ago keeps counting against the ceiling until the
     /// app restarts — see `stop_quiet_releases_the_session_gate_slot`.
+    ///
+    /// Every entry in that list EXCEPT the two respawn overwrites goes through
+    /// [`release_child_slot`], which drops the permit and revokes the child's
+    /// computer-use bearer together. The list above is the reason: bearer
+    /// revocation needs the identical enumeration, and maintaining it twice
+    /// guarantees drift. The respawn overwrites are the deliberate exception —
+    /// they re-mint in the same critical section, which rotates the generation
+    /// on its own. See that helper's doc before adding a teardown site here.
     ///
     /// The pairing is directional both ways: a respawn must also release the
     /// DEAD child's permit *before* queuing for a new one, or a saturated gate
@@ -2867,6 +2894,71 @@ fn spawn_env(inner: &EngineInner) -> Vec<(String, String)> {
     crate::bus::inject::coalesce_env(pairs)
 }
 
+/// Hand back a dead child's session_gate slot AND kill the computer-use bearer
+/// it was launched with, in one step.
+///
+/// The two belong together, and keeping them together is the point of this
+/// helper. `EngineInner::child_permit` already carries an EXHAUSTIVE list of
+/// the sites that tear a child down — miss one and the gate slot leaks. Bearer
+/// revocation needs that same list for a sharper reason: a generation only
+/// rotates at INJECTION, and an engine whose child just died may never inject
+/// again, while the session's DB rows keep `session_is_live` true. So a token
+/// that leaked out of the injected config/env/argv — to an orphaned descendant,
+/// or to any same-uid process that read it — stays valid indefinitely and can
+/// go on driving the desktop under a standing Full/Always grant. Two lists that
+/// must stay identical inevitably drift; one call site each cannot.
+///
+/// Use at every teardown that does NOT immediately respawn. The two respawn
+/// overwrites (`ensure_running_locked`, `spawn_turn`) release the stale permit
+/// and mint a fresh injection inside the same critical section; that mint
+/// rotates the generation itself, so the dead child's bearer dies there without
+/// an explicit revoke — and revoking after the mint would kill the token the
+/// NEW child is about to carry. That is why those two sites clear the permit
+/// inline instead of calling this.
+///
+/// Callers that sit behind an ownership guard (`turn_id`/`busy`, or a reader's
+/// `generation`) must keep this inside the guard, exactly as the bare permit
+/// release had to be: a stale caller revoking would strip a NEWER child's live
+/// bearer, and unlike a wrongly-released permit that failure is user-visible —
+/// every computer call from a healthy session starts 401ing.
+///
+/// Free for engines that never had the tool (concierge/curator leads, workers
+/// with an unresolved worktree): revoking an identity that never minted is a
+/// no-op bump, so teardown paths stay uniform instead of re-deriving who was
+/// eligible.
+fn release_child_slot(inner: &mut EngineInner) {
+    inner.child_permit = None;
+    revoke_engine_bearer(inner);
+}
+
+/// The bearer half of [`release_child_slot`], for the process this engine owns
+/// that is NOT `inner.child`: the codex app-server.
+///
+/// That client spawns and owns its own child, so it holds no `child_permit`,
+/// never passes through `spawn_reader`, and its death is not a teardown site in
+/// `child_permit`'s enumeration — the reason it needs saying separately. The
+/// rule is the same one: whenever THIS engine's app-server is shut down or
+/// found disconnected, the bearer it was launched with dies with it, because
+/// nothing else will rotate that generation until the next injection, which may
+/// never come.
+///
+/// `cleanup_disconnected_turn` is not sufficient on its own even though it
+/// routes through `release_child_slot`: it early-returns on an already-idle
+/// engine, and an app-server that dies BETWEEN turns — the ordinary case for a
+/// resident client nothing reconnects — is exactly that shape.
+///
+/// Call it only for a client this engine still owns (`ptr_eq`, or an explicit
+/// `take`). An exec fallback that deliberately replaces the client may call it
+/// too: `spawn_turn` re-mints immediately afterwards, so the new child still
+/// starts live.
+fn revoke_engine_bearer(inner: &EngineInner) {
+    crate::bus::computer_srv::revoke_computer_session_tokens(
+        inner.thread_id,
+        &inner.ask_dir,
+        inner.worktree_id,
+    );
+}
+
 fn merge_init_slash_commands(
     existing: &[super::proto::SlashCmd],
     init: Vec<super::proto::SlashCmd>,
@@ -2958,6 +3050,10 @@ async fn ensure_running_locked(
     // 先还旧槽,再排队要新的。走到这里 `child` 要么是 None、要么已被上面的
     // try_wait 判定为死进程,它的 permit 是陈的;若留着不放就去 await 新槽,gate
     // 打满时这个会话会卡在等一个它自己占着的槽上(自锁),得等别的会话结束才解开。
+    //
+    // 裸释放,不走 `release_child_slot`:上面的 `refresh_computer_injection`
+    // 已经重铸并轮转过 generation(死进程的 bearer 就此作废),而 command 也已
+    // 用新 env 建好;此处再撤销会把新子进程即将带走的令牌一起打掉。见该 helper 文档。
     inner.child_permit = None;
     // 活跃会话软上限:拿一个会话槽,已满则在此排队等某个在跑的会话结束(与上面
     // admit_new_work 的总进程数硬闸互补——那个拒绝、这个排队,不丢会话)。
@@ -3493,10 +3589,12 @@ pub(crate) fn invalidate_resident(inner: &mut EngineInner) {
     if let Some(mut child) = inner.child.take() {
         let _ = child.start_kill();
     }
-    // The killed child's session_gate slot goes with it. Unconditional (not
-    // folded into the `if let`): a permit with no child left to represent is
-    // exactly the leak, whichever way `child` came to be None.
-    inner.child_permit = None;
+    // The killed child's session_gate slot and computer bearer go with it.
+    // Unconditional (not folded into the `if let`): a permit with no child left
+    // to represent is exactly the leak, whichever way `child` came to be None,
+    // and the bearer wants revoking on both paths regardless. `ensure_running_locked`
+    // re-mints before the respawn this invalidation sets up.
+    release_child_slot(inner);
 }
 
 /// Undo the turn reservation made by `send` Phase 1 when later persistence
@@ -4749,6 +4847,10 @@ async fn spawn_codex_turn(
             // child it was issued to — exactly the orphan-keeps-a-live-token
             // shape the revoke exists to close. Revoke before the shutdown so
             // there is no window where the child is dying with a valid token.
+            //
+            // `revoke_engine_bearer`'s rule, spelled out rather than called:
+            // the identity was carried out of the lock above (this teardown
+            // deliberately runs unlocked), so there is no `inner` to hand it.
             crate::bus::computer_srv::revoke_computer_session_tokens(
                 revoke_ident.0,
                 &revoke_ident.1,
@@ -4816,7 +4918,15 @@ async fn spawn_codex_turn_or_exec(
         // subscription may already be live, and a lingering consumer (single-thread
         // routing) could finalize/reset the exec fallback turn or break thread-less
         // routing on the next retry. shutdown() drops the child + closes the consumer.
-        let stale = eng.lock().await.codex_client.take();
+        // Its bearer goes too — the `spawn_turn` below re-mints for the exec child.
+        let stale = {
+            let mut inner = eng.lock().await;
+            let c = inner.codex_client.take();
+            if c.is_some() {
+                revoke_engine_bearer(&inner);
+            }
+            c
+        };
         if let Some(c) = stale {
             c.shutdown().await;
         }
@@ -6736,8 +6846,16 @@ async fn codex_consumer(
                                 // Take + shut down the (closing) client first — same as
                                 // the direct-send fallback — so THIS consumer sees it's
                                 // superseded (ptr_eq) and skips cleanup, instead of
-                                // racing spawn_turn and resetting the exec turn.
-                                let stale = eng.lock().await.codex_client.take();
+                                // racing spawn_turn and resetting the exec turn. The
+                                // bearer dies with it; `spawn_turn` re-mints for exec.
+                                let stale = {
+                                    let mut inner = eng.lock().await;
+                                    let c = inner.codex_client.take();
+                                    if c.is_some() {
+                                        revoke_engine_bearer(&inner);
+                                    }
+                                    c
+                                };
                                 if let Some(c) = stale {
                                     c.shutdown().await;
                                 }
@@ -6886,7 +7004,23 @@ async fn codex_consumer(
     // Only a GENUINE disconnect runs the turn cleanup. If the engine's client was
     // taken/replaced (the exec-fallback teardown shut us down on purpose), skip it
     // — else this cleanup races spawn_turn and can kill/stop the fallback turn.
-    let still_active = matches!(&eng.lock().await.codex_client, Some(c) if c.ptr_eq(&client));
+    let still_active = {
+        let inner = eng.lock().await;
+        let ours = matches!(&inner.codex_client, Some(c) if c.ptr_eq(&client));
+        if ours {
+            // The app-server this consumer was attached to is gone: kill its
+            // bearer under the SAME lock that proved the client is still ours,
+            // so a replacement connected in between can't have its live one
+            // revoked instead. `ptr_eq` plays the role `generation` plays for
+            // `spawn_reader`'s EOF.
+            //
+            // Not left to `cleanup_disconnected_turn` below, even though that
+            // revokes too: it early-returns on an idle engine, which is exactly
+            // an app-server that died between turns. See `revoke_engine_bearer`.
+            revoke_engine_bearer(&inner);
+        }
+        ours
+    };
     if still_active {
         cleanup_disconnected_turn(&app, &db, &eng, "error").await;
     }
@@ -8004,8 +8138,10 @@ fn reset_ignored_cancel_turn(inner: &mut EngineInner, turn_id: i32) -> Option<Ca
     // Inside the turn_id+busy guard on purpose: only the caller that OWNS this
     // frozen turn may hand its slot back. Releasing outside the guard would drop
     // a NEWER turn's permit while its child is still running (issue #118's whole
-    // point is that this path can fire late), under-counting the live gate.
-    inner.child_permit = None;
+    // point is that this path can fire late), under-counting the live gate — and
+    // would revoke that newer child's live bearer, which `release_child_slot`
+    // documents as the sharper half of the same mistake.
+    release_child_slot(inner);
     inner.stdin = None;
     Some(CancelledTurnDrain {
         current,
@@ -8088,28 +8224,6 @@ async fn stop_quiet_admitted(eng: &EngineRef) -> StopQuietOutcome {
     let mut inner = eng.lock().await;
     let target = (inner.thread_id, inner.session_id);
     let was_busy = inner.turn.busy;
-    // Kill this session's computer-use bearer here — the ONE chokepoint every
-    // teardown funnels through (hard stop, switch teardown, restart), so the
-    // token dies whenever this engine's child does.
-    //
-    // Rotation otherwise only happens at INJECTION, and a session that is
-    // stopped and never relaunched never injects again: the identity's DB
-    // rows survive, so neither the deletion revocation set nor
-    // `session_is_live` refuses the old token, and its generation never
-    // moves. An orphaned descendant, or any same-uid process that read the
-    // token out of the injected config/env/argv, could otherwise keep driving
-    // the desktop after the human stopped the session — silently so under a
-    // standing Full/Always grant.
-    //
-    // Safe against resume because every respawn path re-mints first
-    // (`refresh_computer_injection`), and safe for engines that never had the
-    // tool (concierge/curator leads, workers with an unresolved worktree):
-    // revoking an identity that never minted is a no-op bump.
-    crate::bus::computer_srv::revoke_computer_session_tokens(
-        inner.thread_id,
-        &inner.ask_dir,
-        inner.worktree_id,
-    );
     // Open text rows: the anonymous slot PLUS the item-keyed app-server rows.
     // Hard stops also shut the codex client down, so the consumer's disconnect
     // cleanup never runs for them — without this drain an item row would stay
@@ -8175,8 +8289,17 @@ async fn stop_quiet_admitted(eng: &EngineRef) -> StopQuietOutcome {
     // send again — holding its slot until a respawn that never comes is a leak
     // for the life of the process (the gate is a `OnceLock` singleton), and it
     // is exactly what the resource dashboard (issue #112) surfaces as an
-    // active-session count that never falls back to zero.
-    inner.child_permit = None;
+    // active-session count that never falls back to zero. The bearer rides the
+    // same helper: this is the chokepoint every teardown funnels through (hard
+    // stop, switch teardown, restart), and resume stays safe because every
+    // respawn path re-mints first (`refresh_computer_injection`).
+    //
+    // Deliberately AFTER the re-lock rather than at the top of this function.
+    // The lock is dropped for the ACP cancel above, and this teardown does not
+    // set `stopped` until it returns — so a send admitted in that window can
+    // reach `spawn_turn` and mint a fresh bearer for a child that the clears
+    // right here then kill. Revoking early would miss exactly that mint.
+    release_child_slot(&mut inner);
     inner.stdin = None;
     inner.turn = TurnState::default();
     inner.clock = TurnClock::default();
@@ -9722,28 +9845,6 @@ fn spawn_reader(
         // long-lived claude process it means a crash/kill — history stays, the
         // next send resumes.
         let mut inner = eng.lock().await;
-        // The child this reader was attached to is GONE, so its computer bearer
-        // must die with it — the same rule the teardown chokepoint enforces,
-        // applied to the exit paths that never pass through it: a per-turn
-        // dialect's normal end-of-turn EOF, and a resident claude child's crash
-        // or interrupt. Without this the generation stays current while the
-        // session's rows keep `session_is_live` true, so an orphaned descendant
-        // that retained the token could go on using a standing Full/Always
-        // grant after its parent is gone.
-        //
-        // Runs BEFORE the queued-turn dispatch below: that respawn goes through
-        // `spawn_turn`, which re-mints, so the next child gets a live bearer.
-        //
-        // Guarded on `generation` for the same reason both branches below are:
-        // a mismatch means a respawn already superseded this reader, and that
-        // NEWER child holds a newer bearer this stale reader must not revoke.
-        if inner.generation == generation {
-            crate::bus::computer_srv::revoke_computer_session_tokens(
-                inner.thread_id,
-                &inner.ask_dir,
-                inner.worktree_id,
-            );
-        }
         if inner.generation == generation && per_turn(&inner.tool) {
             let status = if inner.interrupting {
                 "interrupted"
@@ -9818,7 +9919,15 @@ fn spawn_reader(
             // queued turn, it re-acquires its own permit inside `spawn_turn` — fairly,
             // through the same queue any other waiting session would go through,
             // rather than this session silently keeping the slot it already earned.
-            inner.child_permit = None;
+            //
+            // The bearer dies with it: a per-turn dialect's end-of-turn EOF is a
+            // real child death that no teardown chokepoint sees, and the session's
+            // rows keep `session_is_live` true afterwards. Runs BEFORE the queued
+            // dispatch below on purpose — that respawn goes through `spawn_turn`,
+            // which re-mints, so the next child still starts with a live bearer.
+            // Inside this branch's `generation` guard, as `release_child_slot`
+            // requires: a superseded reader must not revoke the newer child's.
+            release_child_slot(&mut inner);
             let next = inner.turn.on_turn_end();
             // A kill-only interrupt (see interrupt()) leaves `generation`/the
             // queue untouched, so THIS EOF branch — not a reset — is what runs
@@ -9919,8 +10028,10 @@ fn spawn_reader(
             // process just died (crash, or the kill an `interrupt()` issued) and
             // nothing respawns it until the next send — which may never come. Its
             // slot has to go back now, or a session the user interrupted and then
-            // left alone counts as active forever.
-            inner.child_permit = None;
+            // left alone counts as active forever; its bearer likewise, or an
+            // orphaned descendant outlives the crash still holding a live one.
+            // `ensure_running_locked` re-mints if that next send ever arrives.
+            release_child_slot(&mut inner);
             inner.stdin = None;
             inner.turn = TurnState::default();
             inner.clock = TurnClock::default();
@@ -13398,6 +13509,131 @@ mod tests {
             "an explicit stop must hand the slot back to the gate"
         );
         assert!(eng.lock().await.child_permit.is_none());
+    }
+
+    /// Give `inner` a distinct computer identity and mint the bearer its
+    /// (notional) child was launched with. Returns that bearer; compare it
+    /// against `computer_session_token` for the same identity afterwards —
+    /// equal means the generation never moved and the dead child's token is
+    /// still live.
+    fn mint_bearer_for(inner: &mut EngineInner, thread: i32) -> String {
+        inner.thread_id = thread;
+        inner.worktree_id = None;
+        crate::bus::computer_srv::rotate_and_mint_computer_session_token(
+            thread,
+            &inner.ask_dir,
+            None,
+        )
+    }
+
+    fn bearer_is_live(inner: &EngineInner, minted: &str) -> bool {
+        crate::bus::computer_srv::computer_session_token(
+            inner.thread_id,
+            &inner.ask_dir,
+            inner.worktree_id,
+        ) == minted
+    }
+
+    /// Every teardown that releases the slot also kills the bearer. The two
+    /// are one helper (`release_child_slot`) precisely so this list can't
+    /// diverge from `child_permit`'s enumeration — so assert the pairing on
+    /// each synchronous member of it rather than on the helper alone.
+    #[tokio::test]
+    async fn the_synchronous_teardowns_revoke_the_dead_child_bearer() {
+        let mut wedged = test_inner("claude");
+        let wedged_bearer = mint_bearer_for(&mut wedged, 951_101);
+        assert!(bearer_is_live(&wedged, &wedged_bearer));
+        invalidate_resident(&mut wedged);
+        assert!(
+            !bearer_is_live(&wedged, &wedged_bearer),
+            "an invalidated resident's bearer must not survive the kill"
+        );
+
+        let mut hidden = test_inner("claude");
+        let hidden_bearer = mint_bearer_for(&mut hidden, 951_201);
+        let turn_id = mark_hidden_turn_started(&mut hidden);
+        assert!(reset_failed_hidden_turn(&mut hidden, turn_id).is_some());
+        assert!(
+            !bearer_is_live(&hidden, &hidden_bearer),
+            "a rolled-back hidden spawn's bearer must not survive"
+        );
+
+        let mut cancelled = test_inner("codex");
+        let cancelled_bearer = mint_bearer_for(&mut cancelled, 951_301);
+        cancelled.turn.busy = true;
+        cancelled.turn_id = 5;
+        assert!(reset_ignored_cancel_turn(&mut cancelled, 5).is_some());
+        assert!(
+            !bearer_is_live(&cancelled, &cancelled_bearer),
+            "an ignored-cancel recovery's bearer must not survive"
+        );
+    }
+
+    /// The ownership guards protect the bearer, not just the permit. A stale
+    /// caller that no longer owns the turn must leave the CURRENT child's
+    /// bearer alone — revoking it would 401 every computer call from a
+    /// perfectly healthy session, which is louder than the leaked slot the
+    /// same guard was originally written for.
+    #[tokio::test]
+    async fn a_teardown_for_a_turn_it_no_longer_owns_leaves_the_bearer_live() {
+        let mut newer = test_inner("codex");
+        let live_bearer = mint_bearer_for(&mut newer, 951_401);
+        newer.turn.busy = true;
+        newer.turn_id = 6; // advanced past the turn_id=5 being recovered
+
+        assert!(reset_ignored_cancel_turn(&mut newer, 5).is_none());
+
+        assert!(
+            bearer_is_live(&newer, &live_bearer),
+            "the running turn's bearer must outlive a stale recovery attempt"
+        );
+    }
+
+    /// A codex app-server is the one child of this engine whose death the
+    /// `child_permit` teardown list does not cover, and putting its revoke
+    /// inside `cleanup_disconnected_turn` alone would not do: that cleanup
+    /// skips an engine whose turn state is untouched, which is precisely an
+    /// app-server that died BETWEEN turns and is never reconnected. Pin both
+    /// halves — the skip, and that the disconnect revoke still lands on such an
+    /// engine.
+    #[tokio::test]
+    async fn a_codex_disconnect_between_turns_still_kills_the_bearer() {
+        let mut idle = test_inner("codex");
+        let bearer = mint_bearer_for(&mut idle, 951_601);
+        assert!(
+            turn_state_is_untouched(&idle),
+            "an app-server dying between turns leaves nothing for the cleanup to do"
+        );
+
+        revoke_engine_bearer(&idle);
+
+        assert!(
+            !bearer_is_live(&idle, &bearer),
+            "the disconnected app-server's bearer must not outlive it"
+        );
+
+        let mut mid_turn = test_inner("codex");
+        mid_turn.turn.busy = true;
+        assert!(
+            !turn_state_is_untouched(&mid_turn),
+            "a disconnect mid-turn still has a turn to tear down"
+        );
+    }
+
+    /// Revoking an identity that never minted is a no-op bump, so the uniform
+    /// teardown costs nothing for engines that never had the tool — a
+    /// concierge/curator lead, or a worker with an unresolved worktree. Guards
+    /// the "just call it everywhere" simplification the helper is built on.
+    #[tokio::test]
+    async fn tearing_down_an_engine_that_never_had_the_tool_is_harmless() {
+        let mut inner = test_inner("claude");
+        inner.thread_id = 951_501;
+        inner.worktree_id = None;
+        assert!(inner.computer_args.is_empty() && inner.computer_env.is_empty());
+
+        invalidate_resident(&mut inner);
+
+        assert!(inner.child_permit.is_none());
     }
 
     /// `invalidate_resident` kills a wedged resident so the next send respawns
