@@ -782,6 +782,11 @@ export interface ThreadOverview {
   kind: string;
   /** Durable plan status for readiness refresh; null when no plan exists. */
   plan_status: string | null;
+  /**
+   * Proposal version paired with plan_status for readiness refresh. Null when
+   * no plan exists; optional for payloads from an older backend.
+   */
+  plan_created_at?: string | null;
   direction_ids: number[];
   /** stored lifecycle status per direction (same order as direction_ids). */
   statuses: string[];

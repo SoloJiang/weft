@@ -2510,6 +2510,11 @@ pub struct ThreadOverview {
     /// Durable plan state used by the board's readiness refresh key. `None`
     /// means this thread has never stored a plan.
     pub plan_status: Option<String>,
+    /// Proposal version (the plan's `created_at`) paired with `plan_status`.
+    /// A re-proposal may retain its status while changing this value; `None`
+    /// means this thread has never stored a plan.
+    #[serde(default)]
+    pub plan_created_at: Option<String>,
     pub direction_ids: Vec<i32>,
     /// Stored lifecycle status of each direction (same order as direction_ids),
     /// so the workspace board derives the thread's phase deterministically.
@@ -2522,7 +2527,11 @@ pub struct ThreadOverview {
 /// so the board can show roll-ups and the repositories each task writes.
 #[tauri::command]
 pub async fn workspace_overview(db: State<'_, Db>, workspace_id: i32) -> R<Vec<ThreadOverview>> {
-    let threads: Vec<_> = repo::list_threads(&db, workspace_id)
+    workspace_overview_inner(&db, workspace_id).await
+}
+
+async fn workspace_overview_inner(db: &Db, workspace_id: i32) -> R<Vec<ThreadOverview>> {
+    let threads: Vec<_> = repo::list_threads(db, workspace_id)
         .await
         .map_err(e)?
         .into_iter()
@@ -2530,14 +2539,14 @@ pub async fn workspace_overview(db: State<'_, Db>, workspace_id: i32) -> R<Vec<T
         .collect();
     let mut out = Vec::new();
     for t in threads {
-        let dirs = repo::list_directions(&db, t.id).await.map_err(e)?;
-        let plan_status = repo::get_plan(&db, t.id)
-            .await
-            .map_err(e)?
-            .map(|plan| plan.status);
+        let dirs = repo::list_directions(db, t.id).await.map_err(e)?;
+        let (plan_status, plan_created_at) = match repo::get_plan(db, t.id).await.map_err(e)? {
+            Some(plan) => (Some(plan.status), Some(plan.created_at)),
+            None => (None, None),
+        };
         let mut seen = std::collections::BTreeMap::<i32, String>::new();
         for d in &dirs {
-            if let Some(r) = repo::direction_repo_of(&db, d.id).await.map_err(e)? {
+            if let Some(r) = repo::direction_repo_of(db, d.id).await.map_err(e)? {
                 seen.entry(r.id).or_insert(r.name);
             }
         }
@@ -2546,6 +2555,7 @@ pub async fn workspace_overview(db: State<'_, Db>, workspace_id: i32) -> R<Vec<T
             title: t.title,
             kind: t.kind,
             plan_status,
+            plan_created_at,
             direction_ids: dirs.iter().map(|d| d.id).collect(),
             statuses: dirs.iter().map(|d| d.status.clone()).collect(),
             write_repos: seen
@@ -4726,6 +4736,68 @@ mod tests {
                         && reason.direction_id == Some(direction.id)
                 })
         }));
+    }
+
+    #[tokio::test]
+    async fn workspace_overview_refreshes_plan_version_when_status_is_unchanged() {
+        let db = Db::connect("sqlite::memory:").await.expect("memory db");
+        let workspace = repo::create_workspace(&db, "workspace overview plans")
+            .await
+            .expect("workspace");
+        let unplanned = repo::create_thread(
+            &db,
+            workspace.id,
+            "unplanned issue",
+            "feature",
+            "codex",
+        )
+        .await
+        .expect("unplanned thread");
+        let planned = repo::create_thread(
+            &db,
+            workspace.id,
+            "planned issue",
+            "feature",
+            "codex",
+        )
+        .await
+        .expect("planned thread");
+        repo::upsert_plan(&db, planned.id, "{}", "proposed", "plan-v1")
+            .await
+            .expect("initial plan");
+
+        let before = workspace_overview_inner(&db, workspace.id)
+            .await
+            .expect("initial workspace overview");
+        let unplanned_overview = before
+            .iter()
+            .find(|overview| overview.thread_id == unplanned.id)
+            .expect("unplanned overview");
+        assert_eq!(unplanned_overview.plan_status.as_deref(), None);
+        assert_eq!(unplanned_overview.plan_created_at.as_deref(), None);
+        let planned_overview = before
+            .iter()
+            .find(|overview| overview.thread_id == planned.id)
+            .expect("planned overview");
+        assert_eq!(planned_overview.plan_status.as_deref(), Some("proposed"));
+        assert_eq!(planned_overview.plan_created_at.as_deref(), Some("plan-v1"));
+
+        repo::set_plan_created_at(&db, planned.id, "plan-v2")
+            .await
+            .expect("same-status re-proposal");
+
+        let after = workspace_overview_inner(&db, workspace.id)
+            .await
+            .expect("updated workspace overview");
+        let refreshed_overview = after
+            .iter()
+            .find(|overview| overview.thread_id == planned.id)
+            .expect("refreshed overview");
+        assert_eq!(refreshed_overview.plan_status.as_deref(), Some("proposed"));
+        assert_eq!(
+            refreshed_overview.plan_created_at.as_deref(),
+            Some("plan-v2")
+        );
     }
 
     #[tokio::test]
