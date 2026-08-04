@@ -133,10 +133,13 @@
 //! uncacheable, so uncommitted changes can never inherit a previously passing
 //! result. Requests that observed the same dirty signature while its one
 //! execution is still in flight share that execution only; its result is
-//! discarded as soon as the flight completes. HEAD and dirty-state sampling are
-//! performed in a blocking task, never on a Tokio executor worker. Branch
-//! reconciliation uses the same blocking-task boundary for its read-only Git
-//! probe.
+//! discarded as soon as the flight completes. Each worktree's HEAD, branch,
+//! and dirty-state facts come from one bounded Git signature sample with a
+//! 15-second total deadline. It uses the same Tokio-child, process-group, and
+//! kill-on-timeout discipline as check execution, rather than a blocking
+//! `Command::output` call. A failed or timed-out sample is unavailable
+//! evidence: reconciliation is unknown, checks are `NotProduced`, and no old
+//! cache entry may be reused or written as `Passed`.
 //!
 //! The desktop `issue_readiness` command collects with `RunAllowed`. The
 //! read-only global `issue_status` bus tool instead uses `CachedOnly`: it may
@@ -804,6 +807,8 @@ fn virtual_lane_facts(
 
 const CHECK_EVIDENCE_TTL: Duration = Duration::from_secs(10 * 60);
 const READINESS_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
+const GIT_SIGNATURE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+const BOUNDED_PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_CONCURRENT_CHECK_RUNNERS: usize = 2;
 const CHECK_OUTPUT_TAIL_BYTES: usize = 2_000;
 const CHECK_OUTPUT_READ_BUFFER_BYTES: usize = 8 * 1024;
@@ -1229,107 +1234,151 @@ async fn latest_worker_facts(db: &Db, direction_id: i32) -> Result<WorkerSession
     })
 }
 
-async fn reconciliation_for(
-    db: &Db,
-    direction: &direction::Model,
-) -> Result<ExecutionReconciliation> {
-    let worktrees = repo::list_worktrees(db, Some(direction.id)).await?;
-    if worktrees.is_empty() {
-        return match direction.status.as_str() {
-            "queued" | "planning" => Ok(ExecutionReconciliation::Matched),
-            _ => Ok(ExecutionReconciliation::Unknown),
-        };
-    }
-    if direction.branch.trim().is_empty() {
-        return Ok(ExecutionReconciliation::Unknown);
-    }
+/// One bounded source of local Git facts. Branch reconciliation and the
+/// worktree signature for check-flight reuse share its deadline and failure
+/// boundary, rather than independently sampling an unbounded Git command.
+#[derive(Clone, Debug)]
+struct GitSignatureProbe {
+    program: PathBuf,
+    timeout: Duration,
+}
 
-    let mut unknown = false;
-    for worktree in worktrees {
-        match reconciliation_branch_for_worktree(worktree.path).await {
-            Ok(branch) => {
-                if branch != direction.branch {
-                    return Ok(ExecutionReconciliation::Drifted);
-                }
-            }
-            Err(_) => unknown = true,
+impl GitSignatureProbe {
+    fn readiness() -> Self {
+        Self {
+            program: PathBuf::from("git"),
+            timeout: GIT_SIGNATURE_PROBE_TIMEOUT,
         }
     }
 
-    if unknown {
-        return Ok(ExecutionReconciliation::Unknown);
-    }
-    Ok(ExecutionReconciliation::Matched)
-}
-
-/// `git::current_branch` is synchronous. Worktree existence and branch
-/// sampling therefore share one blocking task so board refreshes cannot block
-/// a Tokio executor worker on a slow filesystem.
-async fn reconciliation_branch_for_worktree(worktree_path: String) -> Result<String> {
-    tokio::task::spawn_blocking(move || {
-        let path = PathBuf::from(worktree_path);
+    async fn sample(&self, path: &Path) -> Result<GitWorktreeSignature> {
         if !path.is_dir() {
             return Err(anyhow!(
                 "readiness worktree is unavailable at {}",
                 path.display()
             ));
         }
-        crate::git::current_branch(path.as_path())
-    })
-    .await
-    .map_err(|error| anyhow!("readiness branch reconciliation task failed: {error}"))?
-}
 
-/// Read the inexpensive tracked/untracked worktree signal used by the check
-/// cache. This mirrors the existing `git.rs` read-only command convention and
-/// intentionally treats a probe failure as unavailable evidence at the caller.
-fn worktree_is_dirty_blocking(path: &Path) -> Result<bool> {
-    let output = std::process::Command::new("git")
-        .env("PATH", crate::detect::tool_path())
-        .args(["status", "--porcelain"])
-        .current_dir(path)
-        .output()
-        .map_err(|error| {
-            anyhow!(
-                "could not inspect worktree status at {}: {error}",
-                path.display()
-            )
-        })?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "git status failed at {}: {}",
-            path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        // This is deliberately one total budget rather than 15 seconds per
+        // subcommand: a slow fsmonitor cannot turn status + branch + HEAD into
+        // an unbounded sequence of readiness refresh work.
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let porcelain = run_bounded_git_command(
+            path,
+            self.program.as_path(),
+            &["status", "--porcelain"],
+            deadline,
+        )
+        .await?;
+        let branch = run_bounded_git_command(
+            path,
+            self.program.as_path(),
+            &["rev-parse", "--abbrev-ref", "HEAD"],
+            deadline,
+        )
+        .await?;
+        let head = run_bounded_git_command(
+            path,
+            self.program.as_path(),
+            &["rev-parse", "HEAD"],
+            deadline,
+        )
+        .await?;
+
+        Ok(GitWorktreeSignature {
+            branch: required_git_probe_output(branch.stdout, "branch")?,
+            head_sha: required_git_probe_output(head.stdout, "HEAD")?,
+            dirty: !porcelain.stdout.is_empty(),
+        })
     }
-    Ok(!output.stdout.is_empty())
 }
 
-fn check_target_for_worktree_blocking(path: &Path, stored_path: String) -> Result<CheckTarget> {
-    let head_sha = crate::git::head_commit_full(path)
-        .ok_or_else(|| anyhow!("could not resolve worktree HEAD at {}", path.display()))?;
-    Ok(CheckTarget {
-        path: stored_path,
-        head_sha,
-        dirty: worktree_is_dirty_blocking(path)?,
-    })
+#[derive(Clone, Debug)]
+struct GitWorktreeSignature {
+    branch: String,
+    head_sha: String,
+    dirty: bool,
 }
 
-/// HEAD and porcelain status both use synchronous read-only Git helpers. Keep
-/// that potentially slow filesystem work off the async executor so concurrent
-/// board refreshes do not stall unrelated Tokio tasks.
-async fn check_target_for_worktree(path: &Path, stored_path: String) -> Result<CheckTarget> {
-    let path = PathBuf::from(path);
-    tokio::task::spawn_blocking(move || {
-        check_target_for_worktree_blocking(path.as_path(), stored_path)
-    })
-    .await
-    .map_err(|error| anyhow!("readiness worktree signature task failed: {error}"))?
+#[derive(Clone, Debug)]
+struct ProbedWorktree {
+    stored_path: String,
+    signature: Option<GitWorktreeSignature>,
+}
+
+async fn probe_worktrees_for_direction(
+    db: &Db,
+    direction_id: i32,
+    git_probe: &GitSignatureProbe,
+) -> Result<Vec<ProbedWorktree>> {
+    let worktrees = repo::list_worktrees(db, Some(direction_id)).await?;
+    let mut probed = Vec::with_capacity(worktrees.len());
+    for worktree in worktrees {
+        let stored_path = worktree.path;
+        let signature = git_probe.sample(Path::new(&stored_path)).await.ok();
+        probed.push(ProbedWorktree {
+            stored_path,
+            signature,
+        });
+    }
+    Ok(probed)
+}
+
+fn reconciliation_for(
+    direction: &direction::Model,
+    worktrees: &[ProbedWorktree],
+) -> ExecutionReconciliation {
+    if worktrees.is_empty() {
+        return match direction.status.as_str() {
+            "queued" | "planning" => ExecutionReconciliation::Matched,
+            _ => ExecutionReconciliation::Unknown,
+        };
+    }
+    if direction.branch.trim().is_empty() {
+        return ExecutionReconciliation::Unknown;
+    }
+
+    let mut unknown = false;
+    for worktree in worktrees {
+        let Some(signature) = worktree.signature.as_ref() else {
+            unknown = true;
+            continue;
+        };
+        if signature.branch != direction.branch {
+            return ExecutionReconciliation::Drifted;
+        }
+    }
+
+    if unknown {
+        return ExecutionReconciliation::Unknown;
+    }
+    ExecutionReconciliation::Matched
+}
+
+fn check_targets_for_worktrees(worktrees: &[ProbedWorktree]) -> Option<Vec<CheckTarget>> {
+    if worktrees.is_empty() {
+        return None;
+    }
+
+    let mut targets = Vec::with_capacity(worktrees.len());
+    for worktree in worktrees {
+        let Some(signature) = worktree.signature.as_ref() else {
+            // A failed or timed-out signature cannot safely inherit a cached
+            // pass: unknown cleanliness means NotProduced, fail-closed.
+            return None;
+        };
+        targets.push(CheckTarget {
+            path: worktree.stored_path.clone(),
+            head_sha: signature.head_sha.clone(),
+            dirty: signature.dirty,
+        });
+    }
+    Some(targets)
 }
 
 async fn checks_for_with_runner<F, Fut>(
-    db: &Db,
     direction: &direction::Model,
+    worktrees: &[ProbedWorktree],
     flight: &CheckFlight,
     execution: CheckExecution,
     runner: F,
@@ -1342,27 +1391,9 @@ where
         return Ok(CheckEvidence::NotApplicable);
     }
 
-    let worktrees = repo::list_worktrees(db, Some(direction.id)).await?;
-    let mut targets = Vec::new();
-    for worktree in worktrees {
-        let path = Path::new(&worktree.path);
-        if !path.is_dir() {
-            continue;
-        }
-        let target = match check_target_for_worktree(path, worktree.path.clone()).await {
-            Ok(target) => target,
-            Err(_) => {
-                // A worktree whose cheap read-only state cannot be inspected
-                // cannot safely inherit cached verification evidence.
-                return Ok(CheckEvidence::NotProduced);
-            }
-        };
-        targets.push(target);
-    }
-    if targets.is_empty() {
+    let Some(targets) = check_targets_for_worktrees(worktrees) else {
         return Ok(CheckEvidence::NotProduced);
-    }
-
+    };
     checks_for_targets_with_runner(flight, execution, direction.id, targets, runner).await
 }
 
@@ -1500,16 +1531,16 @@ enum BoundedCheckOutcome {
     NotProduced { output_tail: String },
 }
 
-/// A Unix check command owns a fresh process group. Keep the group armed until
-/// every return path has swept it: a direct child can exit normally while a
-/// redirected background descendant remains in that group.
+/// A Unix readiness subprocess owns a fresh process group. Keep the group
+/// armed until every return path has swept it: a direct child can exit normally
+/// while a redirected background descendant remains in that group.
 #[cfg(unix)]
-struct BoundedCheckProcessGroup {
+struct BoundedReadinessProcessGroup {
     pgid: Option<i32>,
 }
 
 #[cfg(unix)]
-impl BoundedCheckProcessGroup {
+impl BoundedReadinessProcessGroup {
     fn from_child_id(child_id: Option<u32>) -> Self {
         Self {
             pgid: child_id.map(|pid| pid as i32),
@@ -1525,9 +1556,170 @@ impl BoundedCheckProcessGroup {
 }
 
 #[cfg(unix)]
-impl Drop for BoundedCheckProcessGroup {
+impl Drop for BoundedReadinessProcessGroup {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+#[cfg(unix)]
+async fn kill_and_reap_bounded_readiness_process(
+    child: &mut tokio::process::Child,
+    process_group: &mut BoundedReadinessProcessGroup,
+) {
+    process_group.kill();
+    let _ = tokio::time::timeout(BOUNDED_PROCESS_REAP_TIMEOUT, child.wait()).await;
+}
+
+#[cfg(not(unix))]
+async fn kill_and_reap_bounded_readiness_process(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(BOUNDED_PROCESS_REAP_TIMEOUT, child.wait()).await;
+}
+
+struct GitProbeOutput {
+    stdout: String,
+}
+
+fn required_git_probe_output(output: String, field: &str) -> Result<String> {
+    let mut lines = output.lines();
+    let Some(value) = lines.next() else {
+        return Err(anyhow!("readiness git probe returned no {field}"));
+    };
+    if lines.next().is_some() {
+        return Err(anyhow!(
+            "readiness git probe returned an ambiguous {field} value"
+        ));
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow!("readiness git probe returned an empty {field}"));
+    }
+    Ok(value.to_string())
+}
+
+/// Run one cheap Git probe under the same cancellation discipline as inferred
+/// checks. `deadline` is shared by status, branch, and HEAD commands, so the
+/// complete signature collection has one bounded budget.
+async fn run_bounded_git_command(
+    cwd: &Path,
+    program: &Path,
+    args: &[&str],
+    deadline: tokio::time::Instant,
+) -> Result<GitProbeOutput> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(anyhow!("readiness git signature probe deadline elapsed"));
+    }
+
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("PATH", crate::detect::tool_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        anyhow!(
+            "could not start readiness git probe {:?} at {}: {error}",
+            args,
+            cwd.display()
+        )
+    })?;
+    #[cfg(unix)]
+    let mut process_group = BoundedReadinessProcessGroup::from_child_id(child.id());
+
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            #[cfg(unix)]
+            kill_and_reap_bounded_readiness_process(&mut child, &mut process_group).await;
+            #[cfg(not(unix))]
+            kill_and_reap_bounded_readiness_process(&mut child).await;
+            return Err(anyhow!("readiness git probe {:?} has no stdout pipe", args));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            #[cfg(unix)]
+            kill_and_reap_bounded_readiness_process(&mut child, &mut process_group).await;
+            #[cfg(not(unix))]
+            kill_and_reap_bounded_readiness_process(&mut child).await;
+            return Err(anyhow!("readiness git probe {:?} has no stderr pipe", args));
+        }
+    };
+    let stdout_tail = Arc::new(Mutex::new(OutputTailBuffer::new(CHECK_OUTPUT_TAIL_BYTES)));
+    let stderr_tail = Arc::new(Mutex::new(OutputTailBuffer::new(CHECK_OUTPUT_TAIL_BYTES)));
+    let mut stdout_reader = tokio::spawn(drain_check_output(stdout, Arc::clone(&stdout_tail)));
+    let mut stderr_reader = tokio::spawn(drain_check_output(stderr, Arc::clone(&stderr_tail)));
+
+    let waited = tokio::time::timeout_at(deadline, async {
+        let status = child
+            .wait()
+            .await
+            .map_err(|error| anyhow!("could not wait for readiness git probe: {error}"))?;
+        wait_for_check_output(&mut stdout_reader, "git stdout").await?;
+        wait_for_check_output(&mut stderr_reader, "git stderr").await?;
+        Ok::<std::process::ExitStatus, anyhow::Error>(status)
+    })
+    .await;
+
+    match waited {
+        Ok(Ok(status)) => {
+            #[cfg(unix)]
+            // The direct child was reaped above; this only sweeps a redirected
+            // fsmonitor/helper descendant which escaped the Git process's pipes.
+            process_group.kill();
+            let stdout = rendered_check_output_tail(&stdout_tail)?;
+            let stderr = rendered_check_output_tail(&stderr_tail)?;
+            if !status.success() {
+                let detail = if stderr.is_empty() { &stdout } else { &stderr };
+                return Err(anyhow!(
+                    "readiness git probe {:?} failed at {} (code {}): {}",
+                    args,
+                    cwd.display(),
+                    status.code().unwrap_or(-1),
+                    detail
+                ));
+            }
+            Ok(GitProbeOutput { stdout })
+        }
+        Ok(Err(error)) => {
+            #[cfg(unix)]
+            kill_and_reap_bounded_readiness_process(&mut child, &mut process_group).await;
+            #[cfg(not(unix))]
+            kill_and_reap_bounded_readiness_process(&mut child).await;
+            stdout_reader.abort();
+            stderr_reader.abort();
+            let _ = stdout_reader.await;
+            let _ = stderr_reader.await;
+            Err(anyhow!(
+                "readiness git probe {:?} failed at {}: {error}",
+                args,
+                cwd.display()
+            ))
+        }
+        Err(_) => {
+            #[cfg(unix)]
+            kill_and_reap_bounded_readiness_process(&mut child, &mut process_group).await;
+            #[cfg(not(unix))]
+            kill_and_reap_bounded_readiness_process(&mut child).await;
+            stdout_reader.abort();
+            stderr_reader.abort();
+            let _ = stdout_reader.await;
+            let _ = stderr_reader.await;
+            Err(anyhow!(
+                "readiness git probe {:?} timed out at {}",
+                args,
+                cwd.display()
+            ))
+        }
     }
 }
 
@@ -1566,7 +1758,7 @@ async fn run_bounded_check(
     #[cfg(unix)]
     // process_group(0) makes the direct child the group leader. The guard
     // remains armed if this future is abandoned before the wait completes.
-    let mut process_group = BoundedCheckProcessGroup::from_child_id(child.id());
+    let mut process_group = BoundedReadinessProcessGroup::from_child_id(child.id());
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
@@ -1695,13 +1887,13 @@ async fn run_readiness_checks(paths: Vec<String>, timeout: Duration) -> Result<C
 }
 
 async fn checks_for(
-    db: &Db,
     direction: &direction::Model,
+    worktrees: &[ProbedWorktree],
     execution: CheckExecution,
 ) -> Result<CheckEvidence> {
     checks_for_with_runner(
-        db,
         direction,
+        worktrees,
         check_flight(),
         execution,
         |paths| async move { run_readiness_checks(paths, READINESS_CHECK_TIMEOUT).await },
@@ -1801,6 +1993,7 @@ async fn collect_lane(
     open_ask_direction_ids: &[i32],
     open_pr_snapshot_freshness: OpenPrSnapshotFreshness,
     check_execution: CheckExecution,
+    git_probe: &GitSignatureProbe,
 ) -> Result<LaneFacts> {
     let active = direction_is_active(direction);
     if !active || policy == PolicyDecision::Denied {
@@ -1826,7 +2019,8 @@ async fn collect_lane(
     pull_requests.sort_by_key(|row| row.id);
     let pull_requests: Vec<PullRequestFacts> =
         pull_requests.iter().map(pull_request_facts).collect();
-    let reconciliation = reconciliation_for(db, direction).await?;
+    let worktrees = probe_worktrees_for_direction(db, direction.id, git_probe).await?;
+    let reconciliation = reconciliation_for(direction, &worktrees);
     // Keep collection's cost aligned with `lane_readiness` first-match order.
     // Once a human-action, active-worker, all-clear terminal merge, or drift
     // gate decides the outcome, starting a build/test process cannot add useful
@@ -1840,7 +2034,7 @@ async fn collect_lane(
         reconciliation,
         &pull_requests,
         open_pr_snapshot_freshness,
-        || checks_for(db, direction, check_execution),
+        || checks_for(direction, &worktrees, check_execution),
     )
     .await?;
     Ok(LaneFacts {
@@ -1939,6 +2133,7 @@ pub async fn collect_with_check_execution(
         }
     }
     let open_pr_snapshot_freshness = current_open_pr_snapshot_freshness()?;
+    let git_probe = GitSignatureProbe::readiness();
     let mut facts = Vec::with_capacity(directions.len() + 2);
 
     match planned_lane_source(plan.as_ref()) {
@@ -1952,6 +2147,7 @@ pub async fn collect_with_check_execution(
                         &open_ask_direction_ids,
                         open_pr_snapshot_freshness,
                         check_execution,
+                        &git_probe,
                     )
                     .await?,
                 );
@@ -1967,6 +2163,7 @@ pub async fn collect_with_check_execution(
                         &open_ask_direction_ids,
                         open_pr_snapshot_freshness,
                         check_execution,
+                        &git_probe,
                     )
                     .await?,
                 );
@@ -2043,6 +2240,7 @@ pub async fn collect_with_check_execution(
                         &open_ask_direction_ids,
                         open_pr_snapshot_freshness,
                         check_execution,
+                        &git_probe,
                     )
                     .await?,
                 );
@@ -2060,6 +2258,7 @@ pub async fn collect_with_check_execution(
                         &open_ask_direction_ids,
                         open_pr_snapshot_freshness,
                         check_execution,
+                        &git_probe,
                     )
                     .await?,
                 );
@@ -2081,6 +2280,8 @@ pub async fn collect_with_check_execution(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -2140,6 +2341,18 @@ mod tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    async fn sampled_check_target(path: &Path, stored_path: String) -> CheckTarget {
+        let signature = GitSignatureProbe::readiness()
+            .sample(path)
+            .await
+            .expect("sample test worktree signature");
+        CheckTarget {
+            path: stored_path,
+            head_sha: signature.head_sha,
+            dirty: signature.dirty,
+        }
     }
 
     fn shell_check(name: &str, script: &str) -> crate::check::Check {
@@ -2845,9 +3058,7 @@ mod tests {
         git_in(root.path(), &["commit", "--quiet", "-m", "fixture"]);
 
         let stored_path = root.path().display().to_string();
-        let clean_target = check_target_for_worktree(root.path(), stored_path.clone())
-            .await
-            .expect("clean target");
+        let clean_target = sampled_check_target(root.path(), stored_path.clone()).await;
         assert!(!clean_target.dirty, "freshly committed worktree is clean");
         let clean_head = clean_target.head_sha.clone();
 
@@ -2867,9 +3078,7 @@ mod tests {
         assert_eq!(initial, CheckEvidence::Passed);
 
         std::fs::write(root.path().join("README.md"), "red\n").expect("make uncommitted change");
-        let dirty_target = check_target_for_worktree(root.path(), stored_path.clone())
-            .await
-            .expect("dirty target");
+        let dirty_target = sampled_check_target(root.path(), stored_path.clone()).await;
         assert_eq!(
             dirty_target.head_sha, clean_head,
             "uncommitted changes preserve HEAD"
@@ -2894,9 +3103,7 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 2);
 
         std::fs::write(root.path().join("README.md"), "green\n").expect("restore tracked file");
-        let restored_target = check_target_for_worktree(root.path(), stored_path)
-            .await
-            .expect("restored clean target");
+        let restored_target = sampled_check_target(root.path(), stored_path).await;
         assert!(!restored_target.dirty, "restored worktree is clean");
         let restored_runs = Arc::clone(&runs);
         let restored = flight
@@ -2911,6 +3118,212 @@ mod tests {
             .expect("clean state after dirty interval reruns checks");
         assert_eq!(restored, CheckEvidence::Passed);
         assert_eq!(runs.load(Ordering::SeqCst), 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stalled_git_signature_probe_keeps_collection_bounded_and_fail_closed() {
+        let root = tempfile::tempdir().expect("temporary git probe fixture");
+        std::fs::write(root.path().join("README.md"), "probe fixture\n")
+            .expect("write fixture readme");
+        git_in(root.path(), &["init", "--quiet", "-b", "main"]);
+        git_in(
+            root.path(),
+            &["config", "user.email", "readiness@example.invalid"],
+        );
+        git_in(root.path(), &["config", "user.name", "Readiness Test"]);
+        git_in(root.path(), &["add", "README.md"]);
+        git_in(root.path(), &["commit", "--quiet", "-m", "fixture"]);
+
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("memory readiness db");
+        let workspace = repo::create_workspace(&db, "readiness probe workspace")
+            .await
+            .expect("workspace");
+        let root_path = root.path().display().to_string();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "readiness-probe-repo",
+            &root_path,
+            "main",
+            "",
+            true,
+        )
+        .await
+        .expect("repo reference");
+        let thread = repo::create_thread(
+            &db,
+            workspace.id,
+            "stalled git signature probe",
+            "feature",
+            "claude",
+        )
+        .await
+        .expect("thread");
+        let mut direction = repo::create_direction(
+            &db,
+            thread.id,
+            "implementation",
+            "claude",
+            repo_ref.id,
+            "probe readiness collection",
+            "impl-only",
+            "main",
+        )
+        .await
+        .expect("direction");
+        repo::record_worktree(
+            &db,
+            repo_ref.id,
+            direction.id,
+            &direction.branch,
+            &root_path,
+            false,
+            false,
+            "",
+        )
+        .await
+        .expect("worktree row");
+        repo::set_direction_status(&db, direction.id, "review")
+            .await
+            .expect("review status");
+        direction.status = "review".to_string();
+        assert_eq!(
+            repo::list_worktrees(&db, Some(direction.id))
+                .await
+                .expect("recorded worktrees")
+                .len(),
+            1,
+            "collector must have one worktree to sample"
+        );
+
+        let check_counter = root.path().join("readiness-check-count");
+        std::fs::write(
+            root.path().join("readiness-check.sh"),
+            "#!/bin/sh\nprintf 'run\\n' >> readiness-check-count\n",
+        )
+        .expect("write check runner");
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"scripts":{"build":"sh ./readiness-check.sh"}}"#,
+        )
+        .expect("write package manifest");
+
+        let pid_file = root.path().join("stalled-git-probe.pids");
+        let quoted_pid_file = shell_single_quote(&pid_file.to_string_lossy());
+        let git_stub = root.path().join("git-stall.sh");
+        std::fs::write(
+            &git_stub,
+            format!(
+                "#!/bin/sh\nsleep 30 & child=$!\nprintf '%s %s\\n' \"$$\" \"$child\" > {quoted_pid_file}\nwait\n"
+            ),
+        )
+        .expect("write stalled git stub");
+        let mut permissions = std::fs::metadata(&git_stub)
+            .expect("stalled git stub metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&git_stub, permissions).expect("make stalled git stub executable");
+
+        let git_probe = GitSignatureProbe {
+            program: git_stub,
+            timeout: Duration::from_secs(1),
+        };
+        // The app prewarms this cached PATH at startup. Do the same before the
+        // bounded sample so this test measures the injected Git child rather
+        // than an unrelated one-time login-shell PATH discovery.
+        let _ = crate::detect::tool_path();
+        let lane = tokio::time::timeout(
+            Duration::from_secs(3),
+            collect_lane(
+                &db,
+                &direction,
+                PolicyDecision::AllowedByPolicy,
+                &[],
+                open_pr_snapshot_freshness(1_000, 60),
+                CheckExecution::RunAllowed,
+                &git_probe,
+            ),
+        )
+        .await
+        .expect("stalled probe collection returns before outer deadline")
+        .expect("stalled probe collection");
+
+        assert_eq!(lane.reconciliation, ExecutionReconciliation::Unknown);
+        assert_eq!(lane.checks, CheckEvidence::NotProduced);
+        let verdict = lane_readiness(&lane).expect("active lane verdict");
+        assert_eq!(verdict.readiness, LaneReadiness::Unknown);
+        assert_eq!(verdict.reasons[0].code, ReasonCode::RemoteUnknown);
+        assert!(
+            !check_counter.exists(),
+            "a failed signature probe must not start inferred checks"
+        );
+
+        // Prime a separate flight to prove unavailable facts bypass both a
+        // prior passing memo and a new runner.
+        let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
+        let stale_target = CheckTarget {
+            path: root_path.clone(),
+            head_sha: "old-head".to_string(),
+            dirty: false,
+        };
+        let cached = flight
+            .get_or_run(direction.id, vec![stale_target], |_| async {
+                Ok(CheckEvidence::Passed)
+            })
+            .await
+            .expect("prime passing memo");
+        assert_eq!(cached, CheckEvidence::Passed);
+        let runner_calls = Arc::new(AtomicUsize::new(0));
+        let attempted_calls = Arc::clone(&runner_calls);
+        let unavailable = vec![ProbedWorktree {
+            stored_path: root_path,
+            signature: None,
+        }];
+        let evidence = checks_for_with_runner(
+            &direction,
+            &unavailable,
+            &flight,
+            CheckExecution::RunAllowed,
+            move |_| {
+                attempted_calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(CheckEvidence::Passed) }
+            },
+        )
+        .await
+        .expect("unavailable signature evidence");
+        assert_eq!(evidence, CheckEvidence::NotProduced);
+        assert_eq!(runner_calls.load(Ordering::SeqCst), 0);
+
+        let recorded = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if let Ok(recorded) = std::fs::read_to_string(&pid_file) {
+                    if recorded.split_whitespace().count() == 2 {
+                        return recorded;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stalled git stub records its process group");
+        let pids: Vec<i32> = recorded
+            .split_whitespace()
+            .map(|pid| pid.parse::<i32>().expect("numeric process id"))
+            .collect();
+        assert_eq!(pids.len(), 2, "stub shell and child must be recorded");
+        for _ in 0..40 {
+            if pids.iter().all(|pid| !process_is_live(*pid)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            pids.iter().all(|pid| !process_is_live(*pid)),
+            "stalled git probe must leave no live process in its group: {pids:?}"
+        );
     }
 
     #[tokio::test]
