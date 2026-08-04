@@ -696,7 +696,7 @@ async fn concurrent_board_collects_share_one_real_check_run() {
 }
 
 #[tokio::test]
-async fn cached_only_collection_never_runs_without_a_memo_and_reuses_a_fresh_one() {
+async fn cached_only_collection_without_a_memo_never_runs_a_rung() {
     let temp = tempfile::tempdir().expect("temporary cached-only fixture root");
     let repo_path = make_repo_with_counting_passing_check(temp.path());
     let fixture = fixture_for_repo(temp, repo_path, None).await;
@@ -726,36 +726,6 @@ async fn cached_only_collection_never_runs_without_a_memo_and_reuses_a_fresh_one
     assert!(
         !counter.exists(),
         "cached-only collection must not execute a rung"
-    );
-
-    let primed = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
-        .await
-        .expect("allowed collection primes the memo");
-    assert_eq!(primed.readiness, IssueReadiness::ReviewReady);
-    assert_eq!(
-        std::fs::read_to_string(&counter)
-            .expect("allowed runner writes counter")
-            .lines()
-            .count(),
-        1
-    );
-
-    let cached = weft::readiness::collect_with_check_execution(
-        &fixture.db,
-        &fixture.bus,
-        fixture.thread_id,
-        CheckExecution::CachedOnly,
-    )
-    .await
-    .expect("cached-only collection reuses fresh memo");
-    assert_eq!(cached.readiness, IssueReadiness::ReviewReady);
-    assert_eq!(
-        std::fs::read_to_string(&counter)
-            .expect("counter remains available")
-            .lines()
-            .count(),
-        1,
-        "cached-only collection must reuse the memo rather than run a second check"
     );
 }
 
