@@ -3,6 +3,7 @@
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 use weft::ask::AskRegistry;
@@ -23,6 +24,16 @@ struct Fixture {
     thread_id: i32,
     direction_id: i32,
     repo_id: i32,
+}
+
+const FIXTURE_DIRECTION_ID_BLOCK: i32 = 10_000;
+
+fn next_fixture_direction_id() -> i32 {
+    // CheckFlight and its admission gate are process-global and keyed only by
+    // direction ID. Independent in-memory SQLite fixtures otherwise all begin
+    // at ID 1. Reserve a range because a fixture can add follow-up directions.
+    static NEXT_DIRECTION_ID: AtomicI32 = AtomicI32::new(1_000_000_000);
+    NEXT_DIRECTION_ID.fetch_add(FIXTURE_DIRECTION_ID_BLOCK, Ordering::SeqCst)
 }
 
 struct HostIdentity {
@@ -170,16 +181,24 @@ async fn fixture_for_repo(temp: TempDir, repo_path: PathBuf, plan_status: Option
     let thread = repo::create_thread(&db, workspace.id, "readiness issue", "feature", "claude")
         .await
         .expect("thread");
-    let direction = repo::create_direction(
-        &db,
-        thread.id,
-        "implementation",
-        "claude",
-        repo_ref.id,
-        "implement readiness test fixture",
-        "impl-only",
-        "main",
-    )
+    let direction_id = next_fixture_direction_id();
+    let direction = direction::ActiveModel {
+        id: Set(direction_id),
+        thread_id: Set(thread.id),
+        name: Set("implementation".to_string()),
+        slug: Set("implementation".to_string()),
+        tool: Set("claude".to_string()),
+        branch: Set(format!("feature/readiness-{direction_id}")),
+        status: Set("queued".to_string()),
+        repo_id: Set(repo_ref.id),
+        reason: Set("implement readiness test fixture".to_string()),
+        engine_pinned: Set(false),
+        mandate: Set("impl-only".to_string()),
+        base_branch: Set("main".to_string()),
+        created_at: Set(unix_secs()),
+        ..Default::default()
+    }
+    .insert(&db.0)
     .await
     .expect("direction");
     let worktrees = materialize_direction(&db, direction.id)
