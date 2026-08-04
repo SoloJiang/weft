@@ -3,6 +3,7 @@
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 use tempfile::TempDir;
 use weft::bus::BusRegistry;
 use weft::host::{CiStatus, ConflictStatus, ReviewStatus, ThreadStatus, UpstreamStatus};
@@ -239,6 +240,36 @@ async fn add_counting_build_script(fixture: &Fixture) -> PathBuf {
     counter
 }
 
+async fn add_hanging_counting_build_script(fixture: &Fixture) -> PathBuf {
+    let registered = repo::list_worktrees(&fixture.db, Some(fixture.direction_id))
+        .await
+        .expect("registered worktrees");
+    assert_eq!(registered.len(), 1, "fixture has one registered worktree");
+    let worktree = Path::new(&registered[0].path);
+    let counter = worktree.join(".readiness-hanging-check-count");
+    std::fs::write(
+        worktree.join("readiness-hanging-check.sh"),
+        "#!/bin/sh\nprintf 'run\\n' >> .readiness-hanging-check-count\nsleep 30\n",
+    )
+    .expect("hanging build script");
+    std::fs::write(
+        worktree.join("package.json"),
+        r#"{"scripts":{"build":"sh ./readiness-hanging-check.sh"}}"#,
+    )
+    .expect("hanging package fixture");
+    counter
+}
+
+async fn remove_registered_worktree_directories(fixture: &Fixture) {
+    let registered = repo::list_worktrees(&fixture.db, Some(fixture.direction_id))
+        .await
+        .expect("registered worktrees");
+    assert_eq!(registered.len(), 1, "fixture has one registered worktree");
+    for row in registered {
+        std::fs::remove_dir_all(&row.path).expect("remove materialized worktree directory");
+    }
+}
+
 async fn add_review_direction(fixture: &Fixture, name: &str) -> direction::Model {
     let direction = repo::create_direction(
         &fixture.db,
@@ -335,6 +366,44 @@ async fn insert_unbound_pr(
     .insert(&fixture.db.0)
     .await
     .expect("unbound pr");
+}
+
+async fn insert_direction_pr(fixture: &Fixture, number: i32, lifecycle: &str) {
+    let last_checked_at = if lifecycle == "open" {
+        unix_secs()
+    } else {
+        String::new()
+    };
+    pull_request::ActiveModel {
+        thread_id: Set(fixture.thread_id),
+        direction_id: Set(fixture.direction_id),
+        repo_id: Set(fixture.repo_id),
+        host_kind: Set("github".to_string()),
+        host_base: Set("github.com".to_string()),
+        host_owner: Set("example".to_string()),
+        host_repo: Set("readiness".to_string()),
+        number: Set(number),
+        url: Set(format!(
+            "https://github.com/example/readiness/pull/{number}"
+        )),
+        title: Set("tracked readiness".to_string()),
+        head_sha: Set(String::new()),
+        base_ref: Set("main".to_string()),
+        lifecycle: Set(lifecycle.to_string()),
+        ci_status: Set(serde_json::to_string(&CiStatus::Passing).expect("ci json")),
+        review_status: Set(serde_json::to_string(&ReviewStatus::Approved).expect("review json")),
+        thread_status: Set(serde_json::to_string(&ThreadStatus::AllResolved).expect("thread json")),
+        conflict_status: Set(serde_json::to_string(&ConflictStatus::Clean).expect("conflict json")),
+        merge_readiness: Set(String::new()),
+        last_checked_at: Set(last_checked_at),
+        last_error: Set(String::new()),
+        probe_fail_count: Set(0),
+        created_at: Set("0".to_string()),
+        ..Default::default()
+    }
+    .insert(&fixture.db.0)
+    .await
+    .expect("tracked direction pr");
 }
 
 #[tokio::test]
@@ -480,6 +549,32 @@ async fn working_lane_skips_checks_until_it_claims_completion() {
 }
 
 #[tokio::test]
+async fn open_ask_short_circuits_a_hanging_check_runner() {
+    let fixture = fixture(None).await;
+    let counter = add_hanging_counting_build_script(&fixture).await;
+    fixture.bus.ask_human(
+        fixture.thread_id,
+        &fixture.direction_id.to_string(),
+        "choose the release owner",
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id),
+    )
+    .await
+    .expect("open ask readiness must not wait for the hanging command")
+    .expect("readiness");
+
+    assert_eq!(result.readiness, IssueReadiness::NeedsYou);
+    assert_eq!(result.reasons[0].code, ReasonCode::OpenNeed);
+    assert!(
+        !counter.exists(),
+        "a decisive open ask must not start the readiness check runner"
+    );
+}
+
+#[tokio::test]
 async fn queued_lane_without_worktree_is_vacuously_in_progress() {
     let fixture = fixture(None).await;
     remove_registered_worktrees(&fixture).await;
@@ -592,6 +687,52 @@ async fn mixed_lanes_aggregate_to_the_open_ask_verdict() {
     assert_eq!(result.active_lane_count, 2);
     assert_eq!(result.reasons[0].code, ReasonCode::OpenNeed);
     assert_eq!(result.reasons[0].direction_id, Some(second.id));
+}
+
+#[tokio::test]
+async fn lead_scope_open_ask_blocks_an_otherwise_ready_issue() {
+    let fixture = fixture(None).await;
+    fixture
+        .bus
+        .ask_human(fixture.thread_id, weft::bus::LEAD, "confirm issue scope");
+
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+        .await
+        .expect("readiness");
+
+    assert_eq!(result.readiness, IssueReadiness::NeedsYou);
+    let issue_ask = result
+        .lanes
+        .iter()
+        .find(|lane| lane.name == "issue ask")
+        .expect("issue-level ask lane");
+    assert_eq!(issue_ask.direction_id, 0);
+    assert_eq!(issue_ask.readiness, LaneReadiness::NeedsYou);
+    assert_eq!(issue_ask.reasons[0].code, ReasonCode::OpenNeed);
+    assert_eq!(issue_ask.reasons[0].direction_id, None);
+}
+
+#[tokio::test]
+async fn unmapped_open_ask_scope_is_issue_wide_fail_closed() {
+    let fixture = fixture(None).await;
+    fixture.bus.ask_human(
+        fixture.thread_id,
+        "retired-non-numeric-scope",
+        "recover issue scope",
+    );
+
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+        .await
+        .expect("readiness");
+
+    assert_eq!(result.readiness, IssueReadiness::NeedsYou);
+    assert!(result.lanes.iter().any(|lane| {
+        lane.name == "issue ask"
+            && lane.readiness == LaneReadiness::NeedsYou
+            && lane.reasons.first().is_some_and(|reason| {
+                reason.code == ReasonCode::OpenNeed && reason.direction_id.is_none()
+            })
+    }));
 }
 
 #[tokio::test]
@@ -922,6 +1063,32 @@ async fn persisted_pending_or_unregistered_upstream_blocks_the_consumer() {
 }
 
 #[tokio::test]
+async fn merged_tracked_pr_outranks_an_unmet_upstream() {
+    let (fixture, _) = fixture_with_origin(None).await;
+    let upstream = add_review_direction(&fixture, "upstream implementation").await;
+    repo::set_direction_upstream(&fixture.db, fixture.direction_id, upstream.id)
+        .await
+        .expect("persisted upstream edge");
+    insert_direction_pr(&fixture, 905, "merged").await;
+
+    assert!(matches!(
+        repo::upstream_merge_state(&fixture.db, fixture.direction_id).await,
+        UpstreamStatus::Pending { .. }
+    ));
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+        .await
+        .expect("readiness");
+
+    assert_eq!(result.readiness, IssueReadiness::ReviewReady);
+    let consumer = result
+        .lanes
+        .iter()
+        .find(|lane| lane.direction_id == fixture.direction_id)
+        .expect("consumer lane");
+    assert_eq!(consumer.readiness, LaneReadiness::ReviewReady);
+}
+
+#[tokio::test]
 async fn persisted_dangling_upstream_edge_is_remote_unknown() {
     let (fixture, _) = fixture_with_origin(None).await;
     let _unrelated_direction = add_review_direction(&fixture, "unrelated implementation").await;
@@ -1048,6 +1215,34 @@ async fn merged_clear_unbound_pr_does_not_change_ready_issue() {
     assert_eq!(result.readiness, IssueReadiness::ReviewReady);
     assert_eq!(result.active_lane_count, 1);
     assert!(result.lanes.iter().all(|lane| lane.direction_id != 0));
+}
+
+#[tokio::test]
+async fn merged_tracked_pr_keeps_a_reclaimed_done_lane_review_ready() {
+    let fixture = fixture(None).await;
+    repo::set_direction_status(&fixture.db, fixture.direction_id, "done")
+        .await
+        .expect("done status");
+    insert_direction_pr(&fixture, 904, "merged").await;
+    // Done-card cleanup keeps the worktree row but deletes the checkout. That
+    // is unknown reconciliation evidence, which terminal merge must outrank.
+    remove_registered_worktree_directories(&fixture).await;
+
+    let ready = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+        .await
+        .expect("readiness after worktree reclaim");
+    assert_eq!(ready.readiness, IssueReadiness::ReviewReady);
+
+    fixture.bus.ask_human(
+        fixture.thread_id,
+        &fixture.direction_id.to_string(),
+        "acknowledge post-merge follow-up",
+    );
+    let needs_you = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
+        .await
+        .expect("readiness with post-merge ask");
+    assert_eq!(needs_you.readiness, IssueReadiness::NeedsYou);
+    assert_eq!(needs_you.reasons[0].code, ReasonCode::OpenNeed);
 }
 
 #[tokio::test]

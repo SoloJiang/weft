@@ -42,7 +42,11 @@
 //! When their same deterministic PR reduction is non-clear, collection adds a
 //! virtual `unbound PR` lane to issue aggregation. Its reason carries no
 //! `direction_id`; an all-clear unbound PR adds no lane and cannot make an
-//! issue ready on its own.
+//! issue ready on its own. Likewise, an open bus ask whose scope cannot be
+//! mapped to a persisted direction is collected as one virtual `issue ask`
+//! lane. `lead` and the legacy empty scope are durable issue-level identities;
+//! an unknown non-numeric or dangling numeric scope is treated the same way
+//! fail-closed, rather than being dropped.
 //!
 //! | Lane facts, evaluated in this exact first-match order | Lane readiness | Reason |
 //! | --- | --- | --- |
@@ -50,11 +54,11 @@
 //! | most recent worker turn ended `error` | Failed | WorkerFailed |
 //! | answerable bus ask is open for the direction | NeedsYou | OpenNeed |
 //! | policy needs a human gate | NeedsYou | PolicyGatePending |
+//! | any tracked PR lifecycle is `merged` | ReviewReady | — |
 //! | worktree/branch reconciliation drifted | Blocked | ExecutionDrifted |
 //! | an inferred check failed for a claimed-complete lane | Blocked | ChecksFailing |
 //! | upstream evidence is Unmet (including a pending or unregistered upstream PR) | Blocked | UpstreamUnmet |
 //! | upstream evidence is Unknown | Unknown | RemoteUnknown |
-//! | tracked PR lifecycle is `merged` | continue; terminal merge evidence clears every PR axis | — |
 //! | tracked PR probe failed or lifecycle is unknown | Unknown | RemoteUnknown |
 //! | tracked open PR has no valid successful timestamp, its snapshot is older than its TTL, or PR sweeping is disabled | Unknown | RemoteUnknown |
 //! | tracked PR is closed without merge | Blocked | PrClosedUnmerged |
@@ -76,15 +80,21 @@
 //! A CLI-reported `review`/`done` state is intentionally last: it cannot
 //! override drift, remote uncertainty, or missing checks. A lane without a PR
 //! skips the PR rows entirely; a PR is not a prerequisite for single-repo
-//! review readiness.
+//! review readiness. A merged tracked PR is different: after the three human
+//! gates above, merge is terminal delivery evidence and makes the lane
+//! `ReviewReady` even when its old worktree has been reclaimed or a predecessor
+//! remains pending. An unresolved worker failure, open ask, or policy gate is
+//! still reported first because it needs a human response.
 //!
 //! Check collection is intentionally gated by claimed completion: only
 //! `review` and `done` lanes invoke inferred checks. The collector records
 //! `NotApplicable` for `queued`, `planning`, and `working` lanes; that evidence
-//! skips both check-failing and check-unknown verdict rows. A reconciliation
-//! drift also records `NotApplicable` and never starts checks: its
-//! `ExecutionDrifted` verdict has already won, and a mismatched checkout is not
-//! a safe target for build/test work. This retains check.rs's
+//! skips both check-failing and check-unknown verdict rows. Before it invokes a
+//! check runner, collection also short-circuits every decisive first-match gate:
+//! worker failure, an open direction ask, a policy gate, a merged PR, or
+//! reconciliation drift. It records `NotApplicable` for those lanes, because
+//! the winner is already known and a mismatched checkout is not a safe target
+//! for build/test work. This retains check.rs's
 //! worker-done-means-checks-green contract without turning ordinary in-progress
 //! work into automatic build/test execution.
 //!
@@ -94,7 +104,9 @@
 //! that whole group before returning `NotProduced`; non-Unix platforms retain
 //! the direct-child kill-on-drop fallback. A completed failing rung remains
 //! `Failing` even if a later rung times out or cannot be awaited. Completed
-//! output uses the same combined-output, 2000-byte tail convention as
+//! stdout and stderr are read continuously into one bounded 2000-byte tail
+//! buffer, so a noisy check cannot accumulate unbounded output before its
+//! deadline. Completed output uses the same combined-output tail convention as
 //! `CheckResult`.
 //! The process-local single-flight cache is valid for at most 10 minutes and
 //! only while its sorted worktree-path, HEAD-SHA, and clean-worktree signatures
@@ -103,7 +115,8 @@
 //! uncacheable, so uncommitted changes can never inherit a previously passing
 //! result. Requests that observed the same dirty signature while its one
 //! execution is still in flight share that execution only; its result is
-//! discarded as soon as the flight completes.
+//! discarded as soon as the flight completes. HEAD and dirty-state sampling are
+//! performed in a blocking task, never on a Tokio executor worker.
 //!
 //! Upstream evidence is collected from the established
 //! `repo::upstream_merge_state` contract:
@@ -160,13 +173,14 @@ use anyhow::{anyhow, Result};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tokio::io::AsyncReadExt;
 use tokio::sync::{watch, Mutex as AsyncMutex, Semaphore};
 
 /// Whether a direction is admitted to delivery work by the settled policy.
@@ -458,6 +472,12 @@ fn pull_request_verdict(
     selected.map(|(_, readiness, reason)| (readiness, reason))
 }
 
+fn has_merged_pull_request(pull_requests: &[PullRequestFacts]) -> bool {
+    pull_requests
+        .iter()
+        .any(|pr| pr.lifecycle == Some(PrLifecycle::Merged))
+}
+
 /// Decide one active lane. A policy-denied or inactive lane returns `None` so
 /// aggregation cannot accidentally make a cancelled/denied lane block or
 /// satisfy an issue.
@@ -485,6 +505,13 @@ pub fn lane_readiness(facts: &LaneFacts) -> Option<LaneReadinessDto> {
             LaneReadiness::NeedsYou,
             Some(ReasonCode::PolicyGatePending),
         ));
+    }
+    // Merge is terminal delivery evidence. It intentionally comes after the
+    // human-action gates above, but before local execution, predecessor, and
+    // live-host evidence that may disappear after an official Done card has
+    // reclaimed its worktree.
+    if has_merged_pull_request(&facts.pull_requests) {
+        return Some(lane_verdict(facts, LaneReadiness::ReviewReady, None));
     }
     if facts.reconciliation == ExecutionReconciliation::Drifted {
         return Some(lane_verdict(
@@ -714,6 +741,8 @@ fn virtual_lane_facts(
 const CHECK_EVIDENCE_TTL: Duration = Duration::from_secs(10 * 60);
 const READINESS_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_CONCURRENT_CHECK_RUNNERS: usize = 2;
+const CHECK_OUTPUT_TAIL_BYTES: usize = 2_000;
+const CHECK_OUTPUT_READ_BUFFER_BYTES: usize = 8 * 1024;
 // Keep this aligned with host::monitor's private default. The readiness
 // collector uses commands::env_secs too, so malformed values resolve exactly
 // like the monitor's cadence configuration.
@@ -1111,7 +1140,7 @@ async fn reconciliation_for(
 /// Read the inexpensive tracked/untracked worktree signal used by the check
 /// cache. This mirrors the existing `git.rs` read-only command convention and
 /// intentionally treats a probe failure as unavailable evidence at the caller.
-fn worktree_is_dirty(path: &Path) -> Result<bool> {
+fn worktree_is_dirty_blocking(path: &Path) -> Result<bool> {
     let output = std::process::Command::new("git")
         .env("PATH", crate::detect::tool_path())
         .args(["status", "--porcelain"])
@@ -1133,14 +1162,26 @@ fn worktree_is_dirty(path: &Path) -> Result<bool> {
     Ok(!output.stdout.is_empty())
 }
 
-fn check_target_for_worktree(path: &Path, stored_path: String) -> Result<CheckTarget> {
+fn check_target_for_worktree_blocking(path: &Path, stored_path: String) -> Result<CheckTarget> {
     let head_sha = crate::git::head_commit_full(path)
         .ok_or_else(|| anyhow!("could not resolve worktree HEAD at {}", path.display()))?;
     Ok(CheckTarget {
         path: stored_path,
         head_sha,
-        dirty: worktree_is_dirty(path)?,
+        dirty: worktree_is_dirty_blocking(path)?,
     })
+}
+
+/// HEAD and porcelain status both use synchronous read-only Git helpers. Keep
+/// that potentially slow filesystem work off the async executor so concurrent
+/// board refreshes do not stall unrelated Tokio tasks.
+async fn check_target_for_worktree(path: &Path, stored_path: String) -> Result<CheckTarget> {
+    let path = PathBuf::from(path);
+    tokio::task::spawn_blocking(move || {
+        check_target_for_worktree_blocking(path.as_path(), stored_path)
+    })
+    .await
+    .map_err(|error| anyhow!("readiness worktree signature task failed: {error}"))?
 }
 
 async fn checks_for_with_runner<F, Fut>(
@@ -1164,7 +1205,7 @@ where
         if !path.is_dir() {
             continue;
         }
-        let target = match check_target_for_worktree(path, worktree.path.clone()) {
+        let target = match check_target_for_worktree(path, worktree.path.clone()).await {
             Ok(target) => target,
             Err(_) => {
                 // A worktree whose cheap read-only state cannot be inspected
@@ -1181,20 +1222,114 @@ where
     flight.get_or_run(direction.id, targets, runner).await
 }
 
-fn check_output_tail(output: &str, max: usize) -> String {
-    if output.len() <= max {
-        return output.trim_end().to_string();
+/// A single, bounded combined stdout/stderr tail. Readers append as bytes
+/// arrive; exact cross-pipe ordering is not observable from separate pipes,
+/// but the captured content and memory bound are stable.
+struct OutputTailBuffer {
+    bytes: VecDeque<u8>,
+    max_bytes: usize,
+    truncated: bool,
+}
+
+impl OutputTailBuffer {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: VecDeque::with_capacity(max_bytes),
+            max_bytes,
+            truncated: false,
+        }
     }
-    let mut start = output.len() - max;
-    while start < output.len() && !output.is_char_boundary(start) {
-        start += 1;
+
+    fn append(&mut self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+        if self.max_bytes == 0 {
+            self.truncated = true;
+            return;
+        }
+        if chunk.len() >= self.max_bytes {
+            let discarded = chunk.len() > self.max_bytes || !self.bytes.is_empty();
+            self.bytes.clear();
+            let retained = &chunk[chunk.len() - self.max_bytes..];
+            self.bytes.extend(retained.iter().copied());
+            self.truncated |= discarded;
+            return;
+        }
+
+        let overflow = self
+            .bytes
+            .len()
+            .saturating_add(chunk.len())
+            .saturating_sub(self.max_bytes);
+        if overflow > 0 {
+            self.truncated = true;
+            for _ in 0..overflow {
+                let _ = self.bytes.pop_front();
+            }
+        }
+        self.bytes.extend(chunk.iter().copied());
     }
-    let slice = &output[start..];
-    let slice = slice
-        .find('\n')
-        .map(|index| &slice[index + 1..])
-        .unwrap_or(slice);
-    format!("…\n{}", slice.trim_end())
+
+    fn render(&self) -> String {
+        let bytes: Vec<u8> = self.bytes.iter().copied().collect();
+        let output = String::from_utf8_lossy(&bytes);
+        if self.truncated {
+            // Match CheckResult's old tail convention: do not surface a
+            // leading fragment of a line when the ring has discarded bytes.
+            let complete_line = output
+                .find('\n')
+                .map(|index| &output[index + 1..])
+                .unwrap_or(output.as_ref());
+            return format!("…\n{}", complete_line.trim_end());
+        }
+        output.trim_end().to_string()
+    }
+}
+
+type SharedOutputTail = Arc<Mutex<OutputTailBuffer>>;
+
+async fn drain_check_output<R>(mut reader: R, output_tail: SharedOutputTail) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let mut buffer = [0_u8; CHECK_OUTPUT_READ_BUFFER_BYTES];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|error| anyhow!("could not read readiness check output: {error}"))?;
+        if read == 0 {
+            return Ok(());
+        }
+        {
+            let mut output_tail = output_tail
+                .lock()
+                .map_err(|_| anyhow!("readiness check output buffer lock poisoned"))?;
+            output_tail.append(&buffer[..read]);
+        }
+    }
+}
+
+async fn wait_for_check_output(
+    reader: &mut tokio::task::JoinHandle<Result<()>>,
+    stream: &str,
+) -> Result<()> {
+    reader
+        .await
+        .map_err(|error| anyhow!("readiness check {stream} reader task failed: {error}"))?
+}
+
+fn rendered_check_output_tail(output_tail: &SharedOutputTail) -> Result<String> {
+    let output_tail = output_tail
+        .lock()
+        .map_err(|_| anyhow!("readiness check output buffer lock poisoned"))?;
+    Ok(output_tail.render())
+}
+
+enum BoundedCheckOutcome {
+    Completed(crate::check::CheckResult),
+    NotProduced { output_tail: String },
 }
 
 /// A Unix check command owns a fresh process group. Keep the group armed until
@@ -1216,14 +1351,19 @@ impl BoundedCheckProcessGroup {
     fn disarm(&mut self) {
         self.pgid = None;
     }
+
+    fn kill(&mut self) {
+        let Some(pgid) = self.pgid.take() else {
+            return;
+        };
+        crate::proc_registry::kill_group(pgid);
+    }
 }
 
 #[cfg(unix)]
 impl Drop for BoundedCheckProcessGroup {
     fn drop(&mut self) {
-        if let Some(pgid) = self.pgid.take() {
-            crate::proc_registry::kill_group(pgid);
-        }
+        self.kill();
     }
 }
 
@@ -1231,7 +1371,7 @@ async fn run_bounded_check(
     cwd: &Path,
     check: &crate::check::Check,
     timeout: Duration,
-) -> Result<Option<crate::check::CheckResult>> {
+) -> Result<BoundedCheckOutcome> {
     let mut command = tokio::process::Command::new(&check.program);
     command
         .args(&check.args)
@@ -1248,10 +1388,10 @@ async fn run_bounded_check(
         // rather than leaving them alive after the direct child is dropped.
         command.process_group(0);
     }
-    let child = match command.spawn() {
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            return Ok(Some(crate::check::CheckResult {
+            return Ok(BoundedCheckOutcome::Completed(crate::check::CheckResult {
                 name: check.name.clone(),
                 status: "fail".to_string(),
                 code: -1,
@@ -1263,34 +1403,70 @@ async fn run_bounded_check(
     // process_group(0) makes the direct child the group leader. The guard
     // remains armed if this future is abandoned before the wait completes.
     let mut process_group = BoundedCheckProcessGroup::from_child_id(child.id());
-    // `wait_with_output` owns the child. When this deadline elapses, dropping
-    // that future drops the kill-on-drop child. On Unix, sweep that child's
-    // dedicated process group too, so descendants cannot retain a CheckFlight
-    // direction lock or global runner permit.
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => {
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            return Ok(BoundedCheckOutcome::NotProduced {
+                output_tail: String::new(),
+            });
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            return Ok(BoundedCheckOutcome::NotProduced {
+                output_tail: String::new(),
+            });
+        }
+    };
+    let output_tail = Arc::new(Mutex::new(OutputTailBuffer::new(CHECK_OUTPUT_TAIL_BYTES)));
+    let mut stdout_reader = tokio::spawn(drain_check_output(stdout, Arc::clone(&output_tail)));
+    let mut stderr_reader = tokio::spawn(drain_check_output(stderr, Arc::clone(&output_tail)));
+
+    // The wait and both pipe drains share one deadline. A background child may
+    // keep a pipe open after its shell exits, so waiting for only `child.wait`
+    // would still let readers outlive the check and retain its output stream.
+    let waited = tokio::time::timeout(timeout, async {
+        let status = child
+            .wait()
+            .await
+            .map_err(|error| anyhow!("could not wait for readiness check: {error}"))?;
+        wait_for_check_output(&mut stdout_reader, "stdout").await?;
+        wait_for_check_output(&mut stderr_reader, "stderr").await?;
+        Ok::<std::process::ExitStatus, anyhow::Error>(status)
+    })
+    .await;
+
+    match waited {
+        Ok(Ok(status)) => {
             #[cfg(unix)]
             process_group.disarm();
-            output
+            let output_tail = rendered_check_output_tail(&output_tail)?;
+            Ok(BoundedCheckOutcome::Completed(crate::check::CheckResult {
+                name: check.name.clone(),
+                status: if status.success() { "pass" } else { "fail" }.to_string(),
+                code: status.code().unwrap_or(-1),
+                output_tail,
+            }))
         }
-        // Returning drops the armed Unix group guard after kill_on_drop
-        // disposes of the direct child. That covers both timeout and outer
-        // future cancellation without relying on a best-effort child wait.
-        Ok(Err(_)) | Err(_) => return Ok(None),
-    };
-    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-    combined.push_str(&String::from_utf8_lossy(&output.stderr));
-    Ok(Some(crate::check::CheckResult {
-        name: check.name.clone(),
-        status: if output.status.success() {
-            "pass"
-        } else {
-            "fail"
+        Ok(Err(_)) | Err(_) => {
+            // Kill the group before returning its partial tail. `kill_on_drop`
+            // remains the non-Unix fallback for a direct child; Unix gets the
+            // stronger group kill so compilers and test servers cannot outlive
+            // this check's semaphore permit.
+            #[cfg(unix)]
+            process_group.kill();
+            #[cfg(not(unix))]
+            {
+                let _ = child.start_kill();
+            }
+            stdout_reader.abort();
+            stderr_reader.abort();
+            Ok(BoundedCheckOutcome::NotProduced {
+                output_tail: rendered_check_output_tail(&output_tail)?,
+            })
         }
-        .to_string(),
-        code: output.status.code().unwrap_or(-1),
-        output_tail: check_output_tail(&combined, 2_000),
-    }))
+    }
 }
 
 async fn run_checks_with_timeout(
@@ -1302,9 +1478,16 @@ async fn run_checks_with_timeout(
     let mut saw_failure = false;
     for check in checks {
         match run_bounded_check(cwd, check, timeout).await? {
-            Some(result) if result.status == "fail" => saw_failure = true,
-            Some(_) => {}
-            None => saw_not_produced = true,
+            BoundedCheckOutcome::Completed(result) if result.status == "fail" => {
+                saw_failure = true;
+            }
+            BoundedCheckOutcome::Completed(_) => {}
+            BoundedCheckOutcome::NotProduced { output_tail } => {
+                // CheckEvidence intentionally carries only a verdict, but the
+                // bounded executor retains this tail for direct diagnostics.
+                let _retained_output_tail = output_tail;
+                saw_not_produced = true;
+            }
         }
     }
     if saw_failure {
@@ -1344,15 +1527,39 @@ async fn checks_for(db: &Db, direction: &direction::Model) -> Result<CheckEviden
     .await
 }
 
-async fn checks_after_reconciliation<F, Fut>(
+fn checks_are_preempted(
+    worker_failed: bool,
+    has_open_ask: bool,
+    policy: PolicyDecision,
     reconciliation: ExecutionReconciliation,
+    pull_requests: &[PullRequestFacts],
+) -> bool {
+    worker_failed
+        || has_open_ask
+        || policy == PolicyDecision::NeedsGate
+        || has_merged_pull_request(pull_requests)
+        || reconciliation == ExecutionReconciliation::Drifted
+}
+
+async fn checks_after_decisive_gates<F, Fut>(
+    worker_failed: bool,
+    has_open_ask: bool,
+    policy: PolicyDecision,
+    reconciliation: ExecutionReconciliation,
+    pull_requests: &[PullRequestFacts],
     collect_checks: F,
 ) -> Result<CheckEvidence>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<CheckEvidence>>,
 {
-    if reconciliation == ExecutionReconciliation::Drifted {
+    if checks_are_preempted(
+        worker_failed,
+        has_open_ask,
+        policy,
+        reconciliation,
+        pull_requests,
+    ) {
         return Ok(CheckEvidence::NotApplicable);
     }
     collect_checks().await
@@ -1419,18 +1626,32 @@ async fn collect_lane(
             direction_status: direction.status.clone(),
         });
     }
+    let worker_failed = latest_worker_failed(db, direction.id).await?;
+    let has_open_ask = open_ask_direction_ids.contains(&direction.id);
     let mut pull_requests = repo::list_pull_requests_for_direction(db, direction.id).await?;
     pull_requests.sort_by_key(|row| row.id);
-    let pull_requests = pull_requests.iter().map(pull_request_facts).collect();
+    let pull_requests: Vec<PullRequestFacts> =
+        pull_requests.iter().map(pull_request_facts).collect();
     let reconciliation = reconciliation_for(db, direction).await?;
-    let checks = checks_after_reconciliation(reconciliation, || checks_for(db, direction)).await?;
+    // Keep collection's cost aligned with `lane_readiness` first-match order.
+    // Once a human-action, terminal merge, or drift gate decides the outcome,
+    // starting a build/test process cannot add useful delivery evidence.
+    let checks = checks_after_decisive_gates(
+        worker_failed,
+        has_open_ask,
+        policy,
+        reconciliation,
+        &pull_requests,
+        || checks_for(db, direction),
+    )
+    .await?;
     Ok(LaneFacts {
         direction_id: direction.id,
         name: direction.name.clone(),
         active,
         policy,
-        worker_failed: latest_worker_failed(db, direction.id).await?,
-        has_open_ask: open_ask_direction_ids.contains(&direction.id),
+        worker_failed,
+        has_open_ask,
         reconciliation,
         checks,
         upstream: upstream_evidence(repo::upstream_merge_state(db, direction.id).await),
@@ -1438,6 +1659,19 @@ async fn collect_lane(
         pull_requests,
         direction_status: direction.status.clone(),
     })
+}
+
+fn virtual_issue_ask_lane(open_pr_snapshot_freshness: OpenPrSnapshotFreshness) -> LaneFacts {
+    let mut facts = virtual_lane_facts(
+        0,
+        "issue ask".to_string(),
+        PolicyDecision::AllowedByPolicy,
+        ExecutionReconciliation::Matched,
+        Vec::new(),
+        open_pr_snapshot_freshness,
+    );
+    facts.has_open_ask = true;
+    facts
 }
 
 async fn collect_unbound_pr_lane(
@@ -1473,15 +1707,28 @@ pub async fn collect(db: &Db, bus: &BusRegistry, thread_id: i32) -> Result<Issue
         return Err(anyhow!("thread {thread_id} not found"));
     }
     let plan = repo::get_plan(db, thread_id).await?;
-    let open_ask_direction_ids: Vec<i32> = bus
-        .open_asks(thread_id)
-        .into_iter()
-        .filter_map(|ask| ask.from.parse::<i32>().ok())
-        .collect();
     let mut directions = repo::list_directions(db, thread_id).await?;
     directions.sort_by_key(|direction| direction.id);
+    let direction_ids: HashSet<i32> = directions.iter().map(|direction| direction.id).collect();
+    let mut open_ask_direction_ids = Vec::new();
+    let mut has_issue_open_ask = false;
+    for ask in bus.open_asks(thread_id) {
+        match ask.from.parse::<i32>() {
+            Ok(direction_id) if direction_ids.contains(&direction_id) => {
+                open_ask_direction_ids.push(direction_id);
+            }
+            _ => {
+                // `crate::bus::LEAD` is the durable non-numeric "lead"
+                // identity, while repo::create_human_request also accepts the
+                // legacy empty scope for direction_id 0. An unknown scope (or
+                // a numeric id no longer in this thread) cannot safely be
+                // assigned to a lane, so it remains issue-wide fail-closed.
+                has_issue_open_ask = true;
+            }
+        }
+    }
     let open_pr_snapshot_freshness = current_open_pr_snapshot_freshness()?;
-    let mut facts = Vec::with_capacity(directions.len() + 1);
+    let mut facts = Vec::with_capacity(directions.len() + 2);
 
     match planned_lane_source(plan.as_ref()) {
         PlannedLaneSource::Legacy => {
@@ -1609,6 +1856,9 @@ pub async fn collect(db: &Db, bus: &BusRegistry, thread_id: i32) -> Result<Issue
         collect_unbound_pr_lane(db, thread_id, open_pr_snapshot_freshness).await?
     {
         facts.push(unbound_pr_lane);
+    }
+    if has_issue_open_ask {
+        facts.push(virtual_issue_ask_lane(open_pr_snapshot_freshness));
     }
     Ok(issue_readiness(&facts))
 }
@@ -1916,6 +2166,24 @@ mod tests {
         lane.pull_requests = vec![merged];
 
         assert_eq!(verdict(&lane), (LaneReadiness::ReviewReady, None));
+    }
+
+    #[test]
+    fn merged_pr_is_terminal_after_human_gates() {
+        let mut lane = facts();
+        let mut merged = pr();
+        merged.lifecycle = Some(PrLifecycle::Merged);
+        lane.pull_requests = vec![merged];
+        lane.reconciliation = ExecutionReconciliation::Drifted;
+        lane.checks = CheckEvidence::NotProduced;
+        lane.upstream = UpstreamEvidence::Unmet;
+        assert_eq!(verdict(&lane), (LaneReadiness::ReviewReady, None));
+
+        lane.has_open_ask = true;
+        assert_eq!(
+            verdict(&lane),
+            (LaneReadiness::NeedsYou, Some(ReasonCode::OpenNeed))
+        );
     }
 
     #[test]
@@ -2283,8 +2551,9 @@ mod tests {
         git_in(root.path(), &["commit", "--quiet", "-m", "fixture"]);
 
         let stored_path = root.path().display().to_string();
-        let clean_target =
-            check_target_for_worktree(root.path(), stored_path.clone()).expect("clean target");
+        let clean_target = check_target_for_worktree(root.path(), stored_path.clone())
+            .await
+            .expect("clean target");
         assert!(!clean_target.dirty, "freshly committed worktree is clean");
         let clean_head = clean_target.head_sha.clone();
 
@@ -2304,8 +2573,9 @@ mod tests {
         assert_eq!(initial, CheckEvidence::Passed);
 
         std::fs::write(root.path().join("README.md"), "red\n").expect("make uncommitted change");
-        let dirty_target =
-            check_target_for_worktree(root.path(), stored_path.clone()).expect("dirty target");
+        let dirty_target = check_target_for_worktree(root.path(), stored_path.clone())
+            .await
+            .expect("dirty target");
         assert_eq!(
             dirty_target.head_sha, clean_head,
             "uncommitted changes preserve HEAD"
@@ -2330,8 +2600,9 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 2);
 
         std::fs::write(root.path().join("README.md"), "green\n").expect("restore tracked file");
-        let restored_target =
-            check_target_for_worktree(root.path(), stored_path).expect("restored clean target");
+        let restored_target = check_target_for_worktree(root.path(), stored_path)
+            .await
+            .expect("restored clean target");
         assert!(!restored_target.dirty, "restored worktree is clean");
         let restored_runs = Arc::clone(&runs);
         let restored = flight
@@ -2456,6 +2727,43 @@ mod tests {
         assert_eq!(released, CheckEvidence::Passed);
     }
 
+    #[tokio::test]
+    async fn noisy_check_streams_a_bounded_tail_before_its_deadline() {
+        let root = tempfile::tempdir().expect("temporary noisy check fixture");
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_bounded_check(
+                root.path(),
+                &shell_check(
+                    "noisy",
+                    "while :; do printf 'readiness-output-readiness-output-readiness-output\\n'; done",
+                ),
+                Duration::from_millis(50),
+            ),
+        )
+        .await
+        .expect("noisy check returns after its deadline")
+        .expect("noisy check execution");
+        let output_tail = match outcome {
+            BoundedCheckOutcome::NotProduced { output_tail } => output_tail,
+            BoundedCheckOutcome::Completed(_) => panic!("noisy check unexpectedly completed"),
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "noisy process must be killed by the bounded deadline"
+        );
+        assert!(
+            output_tail.as_bytes().len() <= CHECK_OUTPUT_TAIL_BYTES + "…\n".len(),
+            "tail must stay bounded, got {} bytes",
+            output_tail.as_bytes().len()
+        );
+        assert!(
+            output_tail.starts_with("…\n"),
+            "large output must report that its retained tail was truncated"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn timed_out_readiness_check_reaps_the_entire_process_group() {
@@ -2509,26 +2817,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drifted_reconciliation_skips_the_check_flight() {
+    async fn decisive_gates_skip_the_check_flight() {
         let flight = Arc::new(CheckFlight::new(Duration::ZERO, 1));
         let runs = Arc::new(AtomicUsize::new(0));
         let skipped_flight = Arc::clone(&flight);
         let skipped_runs = Arc::clone(&runs);
-        let evidence = checks_after_reconciliation(ExecutionReconciliation::Drifted, move || {
-            let flight = Arc::clone(&skipped_flight);
-            let runs = Arc::clone(&skipped_runs);
-            async move {
-                flight
-                    .get_or_run(83, check_targets("/tmp/check-drift", "head-a"), move |_| {
-                        let runs = Arc::clone(&runs);
-                        async move {
-                            runs.fetch_add(1, Ordering::SeqCst);
-                            Ok(CheckEvidence::Passed)
-                        }
-                    })
-                    .await
-            }
-        })
+        let evidence = checks_after_decisive_gates(
+            false,
+            false,
+            PolicyDecision::AllowedByPolicy,
+            ExecutionReconciliation::Drifted,
+            &[],
+            move || {
+                let flight = Arc::clone(&skipped_flight);
+                let runs = Arc::clone(&skipped_runs);
+                async move {
+                    flight
+                        .get_or_run(83, check_targets("/tmp/check-drift", "head-a"), move |_| {
+                            let runs = Arc::clone(&runs);
+                            async move {
+                                runs.fetch_add(1, Ordering::SeqCst);
+                                Ok(CheckEvidence::Passed)
+                            }
+                        })
+                        .await
+                }
+            },
+        )
         .await
         .expect("drift check decision");
         assert_eq!(evidence, CheckEvidence::NotApplicable);
@@ -2543,9 +2858,34 @@ mod tests {
             ),
         )
         .await
-        .expect("drift skip did not retain a runner permit")
+        .expect("decisive skip did not retain a runner permit")
         .expect("post-drift check result");
         assert_eq!(released, CheckEvidence::Passed);
+    }
+
+    #[tokio::test]
+    async fn open_ask_short_circuits_a_never_finishing_check_runner() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let attempted_runs = Arc::clone(&runs);
+        let evidence = tokio::time::timeout(
+            Duration::from_millis(100),
+            checks_after_decisive_gates(
+                false,
+                true,
+                PolicyDecision::AllowedByPolicy,
+                ExecutionReconciliation::Matched,
+                &[],
+                move || {
+                    attempted_runs.fetch_add(1, Ordering::SeqCst);
+                    async { std::future::pending::<Result<CheckEvidence>>().await }
+                },
+            ),
+        )
+        .await
+        .expect("open ask returns without awaiting the runner")
+        .expect("open ask check decision");
+        assert_eq!(evidence, CheckEvidence::NotApplicable);
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
     }
 
     fn record_max(maximum: &AtomicUsize, candidate: usize) {
