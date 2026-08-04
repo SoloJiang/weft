@@ -377,6 +377,18 @@ pub struct MintedBearer {
 /// direction and worktree.
 ///
 /// Revocation is a synchronous map bump, so it is safe to do in `Drop`.
+///
+/// # Drop TIMING is not automatic — the one thing the type cannot enforce
+///
+/// A guard runs at the end of its SCOPE, not at the moment its owner is decided
+/// to be dead. On a path that AWAITS between those two points — tearing a
+/// doomed connection down with `shutdown_and_reap`, `cancel`, `unsubscribe` —
+/// the bearer stays valid for the whole wait, which is exactly the window a
+/// Stop is trying to close. Those paths must `drop(mint)` explicitly, before
+/// the await, and say why. The compiler will not ask.
+///
+/// The rule of thumb: if the code between "this is dead" and the return
+/// contains an `.await`, drop first.
 #[doc(hidden)]
 #[must_use = "an unheld mint is revoked on drop — commit it once a live child               or connection carries the bearer, or drop it deliberately"]
 pub struct MintGuard {

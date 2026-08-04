@@ -4950,8 +4950,10 @@ async fn spawn_codex_turn(
                 // would leak the app-server child (reader/writer tasks hold
                 // clones) alive alongside the exec fallback. Shut it down.
                 if freshly_connected {
-                    // Reaped with the bearer it was spawned carrying; the
-                    // return below drops `mint`, which revokes it.
+                    // Before the await, not at scope end: the reap can take a
+                    // while and the bearer must not outlive the decision that
+                    // this connection is dead.
+                    drop(mint);
                     client.shutdown_and_reap().await;
                 }
                 return Err(e);
@@ -5006,7 +5008,15 @@ async fn spawn_codex_turn(
         // the whole point of the guard. A REUSED client carries no mint at all:
         // the stop took it out of the registry and shut it down itself,
         // revoking on the way through.
-        if !won && freshly_connected {
+        if won {
+            // Drop HERE, inside this lock, rather than letting scope-end do it.
+            // The teardown below AWAITS `shutdown_and_reap`, and a `MintGuard`
+            // runs at the end of the FUNCTION, not at the moment the decision is
+            // made — so the bearer would stay valid for the whole kill/reap
+            // wait, which is precisely the window the Stop is trying to close.
+            // See `MintGuard`'s note on drop timing.
+            drop(mint);
+        } else if freshly_connected {
             g.codex_client = Some(client.clone());
             commit_computer_mint(&mut g, mint);
         }
@@ -5337,11 +5347,13 @@ async fn spawn_acp_turn(
                         // permission events into this engine after the retry
                         // opened a different session, and the surviving route
                         // also pins the pooled client so it can never retire.
+                        // Before the teardown awaits: no consumer will ever
+                        // exist to revoke this mint, the route just torn down
+                        // was never subscribed under it, and scope-end is three
+                        // awaits away.
+                        drop(mint);
                         let _ = client.cancel(&id).await;
                         client.unsubscribe(&id).await;
-                        // The mint dies with the return below: no consumer will
-                        // ever exist to revoke it, and the route just torn down
-                        // was never subscribed under it.
                         clear_acp_native_never_prompted(&app, &db, &eng, sid, thread_id_i).await;
                         return Err(anyhow::anyhow!("acp_session_open_failed"));
                     }
@@ -5470,12 +5482,18 @@ async fn spawn_acp_turn(
         // the delayed force reset — must not publish acp_client or arm prompt.
         let won = g.stopped || g.interrupting || expected_epoch.is_some_and(|e| e != g.reset_epoch);
         // The hand-off is final HERE, not at the route block above: only past
-        // this check is the turn actually going to run. Committing publishes
-        // the generation as the engine's; a stop that won simply does not
-        // commit, and `mint` then drops at the end of this function and
-        // revokes. The route's consumer will also try, reading the cell seeded
-        // above — compare-and-revoke makes whichever lands second inert.
-        if !won {
+        // this check is the turn actually going to run.
+        if won {
+            // Dropped inside this lock, not at scope end. The teardown below
+            // AWAITS cancel and unsubscribe, and a `MintGuard` runs at the end
+            // of the FUNCTION — so the bearer would stay valid across those
+            // waits, exactly the window the Stop is closing. Same rule as the
+            // codex stop-won path; see `MintGuard`'s note on drop timing.
+            //
+            // The route's consumer will also try, reading the cell seeded
+            // earlier; compare-and-revoke makes whichever lands second inert.
+            drop(mint);
+        } else {
             g.acp_client = Some(client.clone());
             if g.native_id.as_deref() != Some(session_id.as_str()) {
                 g.native_id = Some(session_id.clone());
