@@ -115,17 +115,33 @@
 //! check is missing verification evidence rather than proof of delivery.
 //!
 //! Readiness checks reuse `check::infer_checks`, but run each inferred rung in
-//! a kill-on-drop Tokio child with a 120-second per-rung deadline. On Unix each
-//! child leads its own process group, and a timeout or child-wait failure kills
-//! that whole group before returning `NotProduced`. A normally completed child
-//! also gets a best-effort group sweep before its result is returned, so a
-//! background descendant that redirected its pipes cannot outlive a passing or
-//! failing check. Non-Unix platforms retain the direct-child kill-on-drop
-//! fallback. A completed failing rung remains `Failing` even if a later rung
-//! times out or cannot be awaited. Completed stdout and stderr are read
-//! continuously into one bounded 2000-byte tail buffer, so a noisy check cannot
-//! accumulate unbounded output before its deadline. Completed output uses the
-//! same combined-output tail convention as `CheckResult`.
+//! a kill-on-drop Tokio child with a 120-second per-rung deadline. Every check
+//! and Git-signature child is configured and registered with
+//! `proc_registry::Owner::probe`. On Unix, a timeout, child-wait failure, or
+//! output-reader failure while the direct child may still be alive invokes
+//! `proc_registry::reap_bounded`: it snapshots the living descendant tree and
+//! kills every distinct PGID before waiting the root. Its 250ms deadline covers
+//! the blocking process-table scan, tree walk, group signals, and child wait;
+//! a slow platform scan runs off the async executor and returns incomplete
+//! rather than holding a readiness permit indefinitely. A normally completed
+//! direct child instead gets a best-effort sweep of its original process group,
+//! which clears ordinary redirected background helpers. The registration is
+//! dropped immediately after a successful `child.wait`, before any still-open
+//! output pipes are drained. Once the root has exited its descendants may be
+//! reparented, so this normal-completion path deliberately cannot discover an
+//! actively escaped orphan through the old PPID tree; that is a known boundary,
+//! not a zero-orphan guarantee. Drop/future cancellation likewise can only
+//! kill the root group because Drop cannot await tree cleanup. Only a completed
+//! bounded reap disarms the root-group guard. On incomplete cleanup readiness
+//! keeps that guard armed and explicitly tears down the direct child before its
+//! registration is dropped; an escaped PGID is not guaranteed to have been
+//! discovered.
+//! Non-Unix platforms retain the direct-child kill-on-drop fallback. A
+//! completed failing rung remains `Failing` even if a later rung times out or
+//! cannot be awaited. Completed stdout and stderr are read continuously into
+//! one bounded 2000-byte tail buffer, so a noisy check cannot accumulate
+//! unbounded output before its deadline. Completed output uses the same
+//! combined-output tail convention as `CheckResult`.
 //! The process-local single-flight cache is valid for at most 10 minutes and
 //! only while its sorted worktree-path, HEAD-SHA, and clean-worktree signatures
 //! match the newly collected values; any HEAD change immediately reruns checks.
@@ -1553,6 +1569,17 @@ impl BoundedReadinessProcessGroup {
         };
         crate::proc_registry::kill_group(pgid);
     }
+
+    fn kill_but_keep_armed(&self) {
+        let Some(pgid) = self.pgid else {
+            return;
+        };
+        crate::proc_registry::kill_group(pgid);
+    }
+
+    fn disarm(&mut self) {
+        self.pgid = None;
+    }
 }
 
 #[cfg(unix)]
@@ -1562,19 +1589,220 @@ impl Drop for BoundedReadinessProcessGroup {
     }
 }
 
+/// Apply the bounded reaper's ownership result. An incomplete tree cleanup is
+/// deliberately not permission to disarm the root-group fallback: the bounded
+/// registry call may have returned before it could discover an escaped group.
 #[cfg(unix)]
-async fn kill_and_reap_bounded_readiness_process(
+fn settle_bounded_reap_outcome(
+    process_group: &mut BoundedReadinessProcessGroup,
+    outcome: crate::proc_registry::BoundedReapOutcome,
+) -> bool {
+    match outcome {
+        crate::proc_registry::BoundedReapOutcome::Completed => {
+            process_group.disarm();
+            true
+        }
+        crate::proc_registry::BoundedReapOutcome::Incomplete => {
+            // The registry already signalled this group as its mandatory
+            // fallback. Signal again defensively, but keep the guard armed for
+            // future cancellation and this frame's Drop path.
+            process_group.kill_but_keep_armed();
+            false
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn reap_bounded_readiness_process(
     child: &mut tokio::process::Child,
+    registration: &mut Option<crate::proc_registry::Registration>,
     process_group: &mut BoundedReadinessProcessGroup,
 ) {
-    process_group.kill();
-    let _ = tokio::time::timeout(BOUNDED_PROCESS_REAP_TIMEOUT, child.wait()).await;
+    // Keep the registration alive until the bounded reaper has actually waited
+    // the direct child. On an incomplete outcome, direct teardown is explicit
+    // and the armed root group survives until this frame drops.
+    let outcome = match registration.as_ref() {
+        Some(registration) => {
+            crate::proc_registry::reap_bounded(child, registration, BOUNDED_PROCESS_REAP_TIMEOUT)
+                .await
+        }
+        None => {
+            // This is defensive only: all paths that reach tree-aware cleanup
+            // retain their registration until `reap` completes. Preserve the
+            // old root-group/direct-child fallback rather than panicking if
+            // that invariant is ever broken.
+            process_group.kill_but_keep_armed();
+            let _ = child.start_kill();
+            return;
+        }
+    };
+    if settle_bounded_reap_outcome(process_group, outcome) {
+        drop(registration.take());
+    } else {
+        // Keep `registration` in place until this immediate teardown path
+        // explicitly targets the direct child. Its later Drop removes only
+        // metadata; `kill_on_drop` and the still-armed group guard remain the
+        // final cancellation fallbacks.
+        let _ = child.start_kill();
+    }
 }
 
 #[cfg(not(unix))]
-async fn kill_and_reap_bounded_readiness_process(child: &mut tokio::process::Child) {
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(BOUNDED_PROCESS_REAP_TIMEOUT, child.wait()).await;
+async fn reap_bounded_readiness_process(
+    child: &mut tokio::process::Child,
+    registration: &mut Option<crate::proc_registry::Registration>,
+) {
+    let outcome = match registration.as_ref() {
+        Some(registration) => {
+            crate::proc_registry::reap_bounded(child, registration, BOUNDED_PROCESS_REAP_TIMEOUT)
+                .await
+        }
+        None => {
+            let _ = child.start_kill();
+            return;
+        }
+    };
+    if outcome == crate::proc_registry::BoundedReapOutcome::Incomplete {
+        let _ = child.start_kill();
+    }
+    // Either bounded reap waited the root, or this is the established immediate
+    // direct-child teardown path after `start_kill`.
+    drop(registration.take());
+}
+
+struct BoundedProcessFailure {
+    error: anyhow::Error,
+}
+
+enum BoundedReadinessWait {
+    Completed(std::process::ExitStatus),
+    /// The direct child may still be alive, so the caller must invoke the
+    /// tree-aware `proc_registry::reap_bounded` before it tears down readers.
+    ReapRequired(BoundedProcessFailure),
+    /// The direct child was successfully waited already. Its ppid tree may
+    /// have been reparented, so the caller can only sweep the known root group.
+    ChildExited(BoundedProcessFailure),
+}
+
+/// Owns the two pipe-drain tasks for one bounded child. Tokio detaches a task
+/// when its JoinHandle is dropped, so this owner aborts every still-pending
+/// reader on early return or future cancellation. Controlled error paths call
+/// `abort_pending` first to await that cancellation when possible.
+struct BoundedReadinessOutputReaders {
+    stdout: tokio::task::JoinHandle<Result<()>>,
+    stderr: tokio::task::JoinHandle<Result<()>>,
+    stdout_pending: bool,
+    stderr_pending: bool,
+}
+
+impl BoundedReadinessOutputReaders {
+    fn new(
+        stdout: tokio::task::JoinHandle<Result<()>>,
+        stderr: tokio::task::JoinHandle<Result<()>>,
+    ) -> Self {
+        Self {
+            stdout,
+            stderr,
+            stdout_pending: true,
+            stderr_pending: true,
+        }
+    }
+
+    async fn abort_pending(&mut self) {
+        if self.stdout_pending {
+            self.stdout.abort();
+            let _ = (&mut self.stdout).await;
+            self.stdout_pending = false;
+        }
+        if self.stderr_pending {
+            self.stderr.abort();
+            let _ = (&mut self.stderr).await;
+            self.stderr_pending = false;
+        }
+    }
+}
+
+impl Drop for BoundedReadinessOutputReaders {
+    fn drop(&mut self) {
+        if self.stdout_pending {
+            self.stdout.abort();
+        }
+        if self.stderr_pending {
+            self.stderr.abort();
+        }
+    }
+}
+
+/// Wait for the direct child and both bounded stream drains under one deadline.
+/// A stream reader can fail before the child exits; preserve that distinction so
+/// the caller invokes `proc_registry::reap` while the descendant tree is still
+/// observable instead of first killing just its root process group.
+async fn wait_for_bounded_readiness_process(
+    child: &mut tokio::process::Child,
+    registration: &mut Option<crate::proc_registry::Registration>,
+    readers: &mut BoundedReadinessOutputReaders,
+    deadline: tokio::time::Instant,
+    process_label: &str,
+    stdout_label: &str,
+    stderr_label: &str,
+) -> BoundedReadinessWait {
+    let mut child_status = None;
+
+    loop {
+        if !readers.stdout_pending && !readers.stderr_pending {
+            if let Some(status) = child_status.take() {
+                return BoundedReadinessWait::Completed(status);
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                let failure = BoundedProcessFailure {
+                    error: anyhow!("{process_label} timed out"),
+                };
+                if child_status.is_some() {
+                    return BoundedReadinessWait::ChildExited(failure);
+                }
+                return BoundedReadinessWait::ReapRequired(failure);
+            }
+            result = child.wait(), if child_status.is_none() => {
+                match result {
+                    Ok(status) => {
+                        child_status = Some(status);
+                        // The direct child is now reaped. Do not leave its
+                        // registration visible while a background descendant
+                        // keeps an output pipe open and the reader waits.
+                        drop(registration.take());
+                    }
+                    Err(error) => {
+                        return BoundedReadinessWait::ReapRequired(BoundedProcessFailure {
+                            error: anyhow!("could not wait for {process_label}: {error}"),
+                        });
+                    }
+                }
+            }
+            result = wait_for_check_output(&mut readers.stdout, stdout_label), if readers.stdout_pending => {
+                readers.stdout_pending = false;
+                if let Err(error) = result {
+                    let failure = BoundedProcessFailure { error };
+                    if child_status.is_some() {
+                        return BoundedReadinessWait::ChildExited(failure);
+                    }
+                    return BoundedReadinessWait::ReapRequired(failure);
+                }
+            }
+            result = wait_for_check_output(&mut readers.stderr, stderr_label), if readers.stderr_pending => {
+                readers.stderr_pending = false;
+                if let Err(error) = result {
+                    let failure = BoundedProcessFailure { error };
+                    if child_status.is_some() {
+                        return BoundedReadinessWait::ChildExited(failure);
+                    }
+                    return BoundedReadinessWait::ReapRequired(failure);
+                }
+            }
+        }
+    }
 }
 
 struct GitProbeOutput {
@@ -1620,10 +1848,8 @@ async fn run_bounded_git_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    #[cfg(unix)]
-    {
-        command.process_group(0);
-    }
+    let configured =
+        crate::proc_registry::configure(&mut command, crate::proc_registry::Owner::probe());
     let mut child = command.spawn().map_err(|error| {
         anyhow!(
             "could not start readiness git probe {:?} at {}: {error}",
@@ -1631,16 +1857,19 @@ async fn run_bounded_git_command(
             cwd.display()
         )
     })?;
+    let mut registration = Some(configured.register(&child));
     #[cfg(unix)]
-    let mut process_group = BoundedReadinessProcessGroup::from_child_id(child.id());
+    let mut process_group = BoundedReadinessProcessGroup::from_child_id(
+        registration.as_ref().map(|registration| registration.pid()),
+    );
 
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
             #[cfg(unix)]
-            kill_and_reap_bounded_readiness_process(&mut child, &mut process_group).await;
+            reap_bounded_readiness_process(&mut child, &mut registration, &mut process_group).await;
             #[cfg(not(unix))]
-            kill_and_reap_bounded_readiness_process(&mut child).await;
+            reap_bounded_readiness_process(&mut child, &mut registration).await;
             return Err(anyhow!("readiness git probe {:?} has no stdout pipe", args));
         }
     };
@@ -1648,33 +1877,35 @@ async fn run_bounded_git_command(
         Some(stderr) => stderr,
         None => {
             #[cfg(unix)]
-            kill_and_reap_bounded_readiness_process(&mut child, &mut process_group).await;
+            reap_bounded_readiness_process(&mut child, &mut registration, &mut process_group).await;
             #[cfg(not(unix))]
-            kill_and_reap_bounded_readiness_process(&mut child).await;
+            reap_bounded_readiness_process(&mut child, &mut registration).await;
             return Err(anyhow!("readiness git probe {:?} has no stderr pipe", args));
         }
     };
     let stdout_tail = Arc::new(Mutex::new(OutputTailBuffer::new(CHECK_OUTPUT_TAIL_BYTES)));
     let stderr_tail = Arc::new(Mutex::new(OutputTailBuffer::new(CHECK_OUTPUT_TAIL_BYTES)));
-    let mut stdout_reader = tokio::spawn(drain_check_output(stdout, Arc::clone(&stdout_tail)));
-    let mut stderr_reader = tokio::spawn(drain_check_output(stderr, Arc::clone(&stderr_tail)));
+    let mut readers = BoundedReadinessOutputReaders::new(
+        tokio::spawn(drain_check_output(stdout, Arc::clone(&stdout_tail))),
+        tokio::spawn(drain_check_output(stderr, Arc::clone(&stderr_tail))),
+    );
 
-    let waited = tokio::time::timeout_at(deadline, async {
-        let status = child
-            .wait()
-            .await
-            .map_err(|error| anyhow!("could not wait for readiness git probe: {error}"))?;
-        wait_for_check_output(&mut stdout_reader, "git stdout").await?;
-        wait_for_check_output(&mut stderr_reader, "git stderr").await?;
-        Ok::<std::process::ExitStatus, anyhow::Error>(status)
-    })
-    .await;
-
-    match waited {
-        Ok(Ok(status)) => {
+    match wait_for_bounded_readiness_process(
+        &mut child,
+        &mut registration,
+        &mut readers,
+        deadline,
+        "readiness git probe",
+        "git stdout",
+        "git stderr",
+    )
+    .await
+    {
+        BoundedReadinessWait::Completed(status) => {
             #[cfg(unix)]
-            // The direct child was reaped above; this only sweeps a redirected
-            // fsmonitor/helper descendant which escaped the Git process's pipes.
+            // The direct child is already reaped. Its ppid tree may now be
+            // reparented, so this best-effort root-group sweep only handles
+            // ordinary redirected helpers that stayed in the configured group.
             process_group.kill();
             let stdout = rendered_check_output_tail(&stdout_tail)?;
             let stderr = rendered_check_output_tail(&stderr_tail)?;
@@ -1690,34 +1921,31 @@ async fn run_bounded_git_command(
             }
             Ok(GitProbeOutput { stdout })
         }
-        Ok(Err(error)) => {
+        BoundedReadinessWait::ReapRequired(failure) => {
             #[cfg(unix)]
-            kill_and_reap_bounded_readiness_process(&mut child, &mut process_group).await;
+            reap_bounded_readiness_process(&mut child, &mut registration, &mut process_group).await;
             #[cfg(not(unix))]
-            kill_and_reap_bounded_readiness_process(&mut child).await;
-            stdout_reader.abort();
-            stderr_reader.abort();
-            let _ = stdout_reader.await;
-            let _ = stderr_reader.await;
+            reap_bounded_readiness_process(&mut child, &mut registration).await;
+            readers.abort_pending().await;
             Err(anyhow!(
-                "readiness git probe {:?} failed at {}: {error}",
+                "readiness git probe {:?} failed at {}: {}",
                 args,
-                cwd.display()
+                cwd.display(),
+                failure.error,
             ))
         }
-        Err(_) => {
+        BoundedReadinessWait::ChildExited(failure) => {
             #[cfg(unix)]
-            kill_and_reap_bounded_readiness_process(&mut child, &mut process_group).await;
-            #[cfg(not(unix))]
-            kill_and_reap_bounded_readiness_process(&mut child).await;
-            stdout_reader.abort();
-            stderr_reader.abort();
-            let _ = stdout_reader.await;
-            let _ = stderr_reader.await;
+            // The direct child was already waited. Do not call `reap` with a
+            // stale root PID; its ppid tree may have been reparented. The
+            // armed group still clears ordinary same-group descendants.
+            process_group.kill();
+            readers.abort_pending().await;
             Err(anyhow!(
-                "readiness git probe {:?} timed out at {}",
+                "readiness git probe {:?} failed at {}: {}",
                 args,
-                cwd.display()
+                cwd.display(),
+                failure.error,
             ))
         }
     }
@@ -1737,13 +1965,8 @@ async fn run_bounded_check(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    #[cfg(unix)]
-    {
-        // Mirror hook_test_support's bounded-hook runner: a group owned by
-        // this check lets the timeout reap normal shell/compiler descendants,
-        // rather than leaving them alive after the direct child is dropped.
-        command.process_group(0);
-    }
+    let configured =
+        crate::proc_registry::configure(&mut command, crate::proc_registry::Owner::probe());
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -1755,13 +1978,21 @@ async fn run_bounded_check(
             }));
         }
     };
+    let mut registration = Some(configured.register(&child));
     #[cfg(unix)]
-    // process_group(0) makes the direct child the group leader. The guard
-    // remains armed if this future is abandoned before the wait completes.
-    let mut process_group = BoundedReadinessProcessGroup::from_child_id(child.id());
+    // `configure` makes the direct child its own group leader. This guard
+    // remains armed if this future is abandoned before tree-aware reap can
+    // await the child and its descendants.
+    let mut process_group = BoundedReadinessProcessGroup::from_child_id(
+        registration.as_ref().map(|registration| registration.pid()),
+    );
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
+            #[cfg(unix)]
+            reap_bounded_readiness_process(&mut child, &mut registration, &mut process_group).await;
+            #[cfg(not(unix))]
+            reap_bounded_readiness_process(&mut child, &mut registration).await;
             return Ok(BoundedCheckOutcome::NotProduced {
                 output_tail: String::new(),
             });
@@ -1770,36 +2001,44 @@ async fn run_bounded_check(
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
+            #[cfg(unix)]
+            reap_bounded_readiness_process(&mut child, &mut registration, &mut process_group).await;
+            #[cfg(not(unix))]
+            reap_bounded_readiness_process(&mut child, &mut registration).await;
             return Ok(BoundedCheckOutcome::NotProduced {
                 output_tail: String::new(),
             });
         }
     };
     let output_tail = Arc::new(Mutex::new(OutputTailBuffer::new(CHECK_OUTPUT_TAIL_BYTES)));
-    let mut stdout_reader = tokio::spawn(drain_check_output(stdout, Arc::clone(&output_tail)));
-    let mut stderr_reader = tokio::spawn(drain_check_output(stderr, Arc::clone(&output_tail)));
+    let mut readers = BoundedReadinessOutputReaders::new(
+        tokio::spawn(drain_check_output(stdout, Arc::clone(&output_tail))),
+        tokio::spawn(drain_check_output(stderr, Arc::clone(&output_tail))),
+    );
 
     // The wait and both pipe drains share one deadline. A background child may
     // keep a pipe open after its shell exits, so waiting for only `child.wait`
     // would still let readers outlive the check and retain its output stream.
-    let waited = tokio::time::timeout(timeout, async {
-        let status = child
-            .wait()
-            .await
-            .map_err(|error| anyhow!("could not wait for readiness check: {error}"))?;
-        wait_for_check_output(&mut stdout_reader, "stdout").await?;
-        wait_for_check_output(&mut stderr_reader, "stderr").await?;
-        Ok::<std::process::ExitStatus, anyhow::Error>(status)
-    })
-    .await;
-
-    match waited {
-        Ok(Ok(status)) => {
+    let deadline = tokio::time::Instant::now() + timeout;
+    match wait_for_bounded_readiness_process(
+        &mut child,
+        &mut registration,
+        &mut readers,
+        deadline,
+        "readiness check",
+        "stdout",
+        "stderr",
+    )
+    .await
+    {
+        BoundedReadinessWait::Completed(status) => {
             #[cfg(unix)]
             // The direct child is already reaped, so this only sweeps residual
-            // group members (for example `sh -c 'server >/dev/null 2>&1 &'`).
-            // Do this for both pass and fail exits; otherwise a successful
-            // check could leave a background process mutating the checkout.
+            // root-group members (for example `sh -c 'server >/dev/null 2>&1
+            // &'`). A reparented child that actively escaped into another
+            // group is no longer discoverable through the exited root's ppid
+            // tree. Do this for both pass and fail exits so a successful check
+            // cannot leave a background process mutating the checkout.
             process_group.kill();
             let output_tail = rendered_check_output_tail(&output_tail)?;
             Ok(BoundedCheckOutcome::Completed(crate::check::CheckResult {
@@ -1809,19 +2048,22 @@ async fn run_bounded_check(
                 output_tail,
             }))
         }
-        Ok(Err(_)) | Err(_) => {
-            // Kill the group before returning its partial tail. `kill_on_drop`
-            // remains the non-Unix fallback for a direct child; Unix gets the
-            // stronger group kill so compilers and test servers cannot outlive
-            // this check's semaphore permit.
+        BoundedReadinessWait::ReapRequired(_failure) => {
             #[cfg(unix)]
-            process_group.kill();
+            reap_bounded_readiness_process(&mut child, &mut registration, &mut process_group).await;
             #[cfg(not(unix))]
-            {
-                let _ = child.start_kill();
-            }
-            stdout_reader.abort();
-            stderr_reader.abort();
+            reap_bounded_readiness_process(&mut child, &mut registration).await;
+            readers.abort_pending().await;
+            Ok(BoundedCheckOutcome::NotProduced {
+                output_tail: rendered_check_output_tail(&output_tail)?,
+            })
+        }
+        BoundedReadinessWait::ChildExited(_failure) => {
+            #[cfg(unix)]
+            // The root already exited, so only its known process group can be
+            // swept safely. See the normal-completion comment above.
+            process_group.kill();
+            readers.abort_pending().await;
             Ok(BoundedCheckOutcome::NotProduced {
                 output_tail: rendered_check_output_tail(&output_tail)?,
             })
@@ -2287,6 +2529,16 @@ mod tests {
         Arc,
     };
 
+    struct ReaderTaskDropMarker {
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Drop for ReaderTaskDropMarker {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     fn facts() -> LaneFacts {
         LaneFacts {
             direction_id: 7,
@@ -2381,6 +2633,86 @@ mod tests {
         }
         let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
         !state.is_empty() && !state.starts_with('Z')
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn process_group_id(pid: i32) -> Option<i32> {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "pgid=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_bounded_reap_keeps_the_root_group_fallback_armed() {
+        // pgid 0 is deliberately harmless to `kill_group`, while still making
+        // the guard's armed/disarmed ownership transition observable without
+        // spawning a process.
+        let mut process_group = BoundedReadinessProcessGroup::from_child_id(Some(0));
+        assert!(
+            !settle_bounded_reap_outcome(
+                &mut process_group,
+                crate::proc_registry::BoundedReapOutcome::Incomplete,
+            ),
+            "incomplete cleanup must not disarm the root-group fallback"
+        );
+        assert_eq!(process_group.pgid, Some(0));
+
+        assert!(
+            settle_bounded_reap_outcome(
+                &mut process_group,
+                crate::proc_registry::BoundedReapOutcome::Completed,
+            ),
+            "only a fully completed bounded reap may disarm the fallback"
+        );
+        assert_eq!(process_group.pgid, None);
+    }
+
+    #[tokio::test]
+    async fn dropping_output_reader_owner_aborts_pending_reader_tasks() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+
+        let stdout_started = Arc::clone(&started);
+        let stdout_dropped = Arc::clone(&dropped);
+        let stdout = tokio::spawn(async move {
+            let _marker = ReaderTaskDropMarker {
+                dropped: stdout_dropped,
+            };
+            stdout_started.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<()>>().await
+        });
+        let stderr_started = Arc::clone(&started);
+        let stderr_dropped = Arc::clone(&dropped);
+        let stderr = tokio::spawn(async move {
+            let _marker = ReaderTaskDropMarker {
+                dropped: stderr_dropped,
+            };
+            stderr_started.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<()>>().await
+        });
+
+        let readers = BoundedReadinessOutputReaders::new(stdout, stderr);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while started.load(Ordering::SeqCst) != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reader tasks start");
+        drop(readers);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while dropped.load(Ordering::SeqCst) != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dropping the owner aborts both pending reader tasks");
     }
 
     fn verdict(facts: &LaneFacts) -> (LaneReadiness, Option<ReasonCode>) {
@@ -3326,6 +3658,216 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn timed_out_git_probe_reaps_an_escaped_descendant_process_group() {
+        // Keep the same optional-perl convention as proc_registry's own
+        // escape-group coverage: the production cleanup is portable, while
+        // this Unix fixture needs POSIX::setpgid to prove a distinct PGID.
+        let perl_status = std::process::Command::new("perl")
+            .args(["-MPOSIX", "-e", "exit 0"])
+            .status();
+        let Ok(perl_status) = perl_status else {
+            eprintln!("perl unavailable — skipping escaped Git probe test");
+            return;
+        };
+        if !perl_status.success() {
+            eprintln!("perl POSIX unavailable — skipping escaped Git probe test");
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("temporary escaped Git probe fixture");
+        let pid_file = root.path().join("escaped-git-probe.pids");
+        let quoted_pid_file = shell_single_quote(&pid_file.to_string_lossy());
+        let perl_script = r#"my $file = shift; my $pid = fork(); if (!$pid) { POSIX::setpgid(0, 0); open(my $fh, ">>", $file) or die $!; print {$fh} "$$\n"; close($fh); exec("sleep", "30"); } sleep 30;"#;
+        let quoted_perl_script = shell_single_quote(perl_script);
+        let git_stub = root.path().join("git-escape.sh");
+        std::fs::write(
+            &git_stub,
+            format!(
+                "#!/bin/sh\nprintf '%s ' \"$$\" > {quoted_pid_file}\nperl -MPOSIX -e {quoted_perl_script} {quoted_pid_file} &\nwait\n"
+            ),
+        )
+        .expect("write escaped Git stub");
+        let mut permissions = std::fs::metadata(&git_stub)
+            .expect("escaped Git stub metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&git_stub, permissions).expect("make escaped Git stub executable");
+
+        let cwd = root.path().to_path_buf();
+        let program = git_stub.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let probe = tokio::spawn(async move {
+            run_bounded_git_command(
+                cwd.as_path(),
+                program.as_path(),
+                &["status", "--porcelain"],
+                deadline,
+            )
+            .await
+        });
+
+        let recorded = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(recorded) = std::fs::read_to_string(&pid_file) {
+                    if recorded.split_whitespace().count() == 2 {
+                        return recorded;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let recorded = match recorded {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                let _ = probe.await;
+                panic!("escaped Git probe did not record its descendants: {error}");
+            }
+        };
+
+        let pids: Vec<i32> = recorded
+            .split_whitespace()
+            .map(|pid| pid.parse::<i32>().expect("numeric process id"))
+            .collect();
+        assert_eq!(
+            pids.len(),
+            2,
+            "root and escaped descendant must be recorded"
+        );
+        assert!(
+            pids.iter().all(|pid| process_is_live(*pid)),
+            "the direct child and escaped descendant must still be alive before timeout: {pids:?}"
+        );
+        let root_group = process_group_id(pids[0]).expect("root process group");
+        let escaped_group = process_group_id(pids[1]).expect("escaped process group");
+        assert_ne!(
+            root_group, escaped_group,
+            "POSIX::setpgid must move the descendant out of the root group"
+        );
+
+        let outcome = probe.await.expect("escaped Git probe task joins");
+        assert!(outcome.is_err(), "probe must return through its deadline");
+
+        let mut reaped = false;
+        for _ in 0..40 {
+            if pids.iter().all(|pid| !process_is_live(*pid)) {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if !reaped {
+            // Preserve fixture hygiene on a regression without masking the
+            // assertion: tree-aware cleanup itself had already been observed.
+            crate::proc_registry::kill_group(root_group);
+            crate::proc_registry::kill_group(escaped_group);
+        }
+        assert!(
+            reaped,
+            "tree-aware Git timeout cleanup must reap root and escaped PGID: {pids:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn timed_out_readiness_check_reaps_an_escaped_descendant_process_group() {
+        let perl_status = std::process::Command::new("perl")
+            .args(["-MPOSIX", "-e", "exit 0"])
+            .status();
+        let Ok(perl_status) = perl_status else {
+            eprintln!("perl unavailable — skipping escaped readiness check test");
+            return;
+        };
+        if !perl_status.success() {
+            eprintln!("perl POSIX unavailable — skipping escaped readiness check test");
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("temporary escaped readiness check fixture");
+        let pid_file = root.path().join("escaped-readiness-check.pids");
+        let quoted_pid_file = shell_single_quote(&pid_file.to_string_lossy());
+        let perl_script = r#"my $file = shift; my $pid = fork(); if (!$pid) { POSIX::setpgid(0, 0); open(my $fh, ">>", $file) or die $!; print {$fh} "$$\n"; close($fh); exec("sleep", "30"); } sleep 30;"#;
+        let quoted_perl_script = shell_single_quote(perl_script);
+        let script = format!(
+            "printf '%s ' \"$$\" > {quoted_pid_file}\nperl -MPOSIX -e {quoted_perl_script} {quoted_pid_file} &\nwait"
+        );
+        let check = shell_check("escaped-process-group", &script);
+        let cwd = root.path().to_path_buf();
+        let runner = tokio::spawn(async move {
+            run_bounded_check(cwd.as_path(), &check, Duration::from_secs(2)).await
+        });
+
+        let recorded = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(recorded) = std::fs::read_to_string(&pid_file) {
+                    if recorded.split_whitespace().count() == 2 {
+                        return recorded;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let recorded = match recorded {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                let _ = runner.await;
+                panic!("escaped readiness check did not record its descendants: {error}");
+            }
+        };
+
+        let pids: Vec<i32> = recorded
+            .split_whitespace()
+            .map(|pid| pid.parse::<i32>().expect("numeric process id"))
+            .collect();
+        assert_eq!(
+            pids.len(),
+            2,
+            "root and escaped descendant must be recorded"
+        );
+        assert!(
+            pids.iter().all(|pid| process_is_live(*pid)),
+            "the direct check child and escaped descendant must be alive before timeout: {pids:?}"
+        );
+        let root_group = process_group_id(pids[0]).expect("root process group");
+        let escaped_group = process_group_id(pids[1]).expect("escaped process group");
+        assert_ne!(
+            root_group, escaped_group,
+            "POSIX::setpgid must move the check descendant out of the root group"
+        );
+
+        let outcome = tokio::time::timeout(Duration::from_secs(3), runner)
+            .await
+            .expect("escaped readiness check returns before outer deadline")
+            .expect("escaped readiness check task joins")
+            .expect("escaped readiness check execution");
+        match outcome {
+            BoundedCheckOutcome::NotProduced { .. } => {}
+            BoundedCheckOutcome::Completed(_) => {
+                panic!("timed-out escaped readiness check unexpectedly completed")
+            }
+        }
+
+        let mut reaped = false;
+        for _ in 0..40 {
+            if pids.iter().all(|pid| !process_is_live(*pid)) {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if !reaped {
+            crate::proc_registry::kill_group(root_group);
+            crate::proc_registry::kill_group(escaped_group);
+        }
+        assert!(
+            reaped,
+            "tree-aware readiness check timeout cleanup must reap root and escaped PGID: {pids:?}"
+        );
+    }
+
     #[tokio::test]
     async fn check_flight_reruns_after_ttl_expiry() {
         let flight = CheckFlight::new(Duration::ZERO, 2);
@@ -3586,6 +4128,145 @@ mod tests {
         assert!(
             pids.iter().all(|pid| !process_is_live(*pid)),
             "timeout must leave no live process in the check's group: {pids:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_check_runner_aborts_pipe_readers_and_cleans_the_background_holder() {
+        let root = tempfile::tempdir().expect("temporary cancelled-check fixture");
+        let pid_file = root.path().join("cancelled-check-processes.pid");
+        let quoted_pid_file = shell_single_quote(&pid_file.to_string_lossy());
+        // The background child inherits both pipe writers and keeps them open
+        // while the enclosing check future is cancelled.
+        let script = format!(
+            "sleep 30 & child=$!; printf '%s %s\\n' \"$$\" \"$child\" > {quoted_pid_file}; wait"
+        );
+        let check = shell_check("cancelled-pipe-holder", &script);
+        let cwd = root.path().to_path_buf();
+        let runner = tokio::spawn(async move {
+            run_bounded_check(cwd.as_path(), &check, Duration::from_secs(30)).await
+        });
+
+        let recorded = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(recorded) = std::fs::read_to_string(&pid_file) {
+                    if recorded.split_whitespace().count() == 2 {
+                        return recorded;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let recorded = match recorded {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                runner.abort();
+                let _ = runner.await;
+                panic!("cancelled check did not record its pipe holder: {error}");
+            }
+        };
+        let pids: Vec<i32> = recorded
+            .split_whitespace()
+            .map(|pid| pid.parse::<i32>().expect("numeric process id"))
+            .collect();
+        assert_eq!(pids.len(), 2, "shell and pipe holder must be recorded");
+
+        runner.abort();
+        let join = runner.await;
+        let Err(error) = join else {
+            panic!("cancelling the readiness check task must abort it");
+        };
+        assert!(error.is_cancelled(), "outer readiness task is cancelled");
+
+        let mut cleaned = false;
+        for _ in 0..40 {
+            if pids.iter().all(|pid| !process_is_live(*pid)) {
+                cleaned = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if !cleaned {
+            crate::proc_registry::kill_group(pids[0]);
+        }
+        assert!(
+            cleaned,
+            "dropping the check future must not leave a pipe-holding background descendant: {pids:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_check_child_drops_its_registration_before_pipe_drains_finish() {
+        let root = tempfile::tempdir().expect("temporary registration-drop fixture");
+        let pid_file = root.path().join("registration-drop-processes.pid");
+        let quoted_pid_file = shell_single_quote(&pid_file.to_string_lossy());
+        // The shell exits after recording its PID, but its background child
+        // retains the pipe writers so the runner remains in reader-drain work.
+        let script = format!(
+            "sleep 30 & child=$!; printf '%s %s\\n' \"$$\" \"$child\" > {quoted_pid_file}; exit 0"
+        );
+        let check = shell_check("registration-drop-pipe-holder", &script);
+        let cwd = root.path().to_path_buf();
+        let runner = tokio::spawn(async move {
+            run_bounded_check(cwd.as_path(), &check, Duration::from_secs(30)).await
+        });
+
+        let recorded = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(recorded) = std::fs::read_to_string(&pid_file) {
+                    if recorded.split_whitespace().count() == 2 {
+                        return recorded;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let recorded = match recorded {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                runner.abort();
+                let _ = runner.await;
+                panic!("registration-drop check did not record its child: {error}");
+            }
+        };
+        let pids: Vec<i32> = recorded
+            .split_whitespace()
+            .map(|pid| pid.parse::<i32>().expect("numeric process id"))
+            .collect();
+        assert_eq!(pids.len(), 2, "shell and pipe holder must be recorded");
+        let root_pid = pids[0] as u32;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let registered = crate::proc_registry::registered();
+                if !registered
+                    .iter()
+                    .any(|registration| registration.pid == root_pid)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("successful child wait drops its registration before pipe drains finish");
+
+        runner.abort();
+        let _ = runner.await;
+        for _ in 0..40 {
+            if pids.iter().all(|pid| !process_is_live(*pid)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        crate::proc_registry::kill_group(pids[0]);
+        assert!(
+            pids.iter().all(|pid| !process_is_live(*pid)),
+            "registration-drop fixture must not leak its pipe holder: {pids:?}"
         );
     }
 
