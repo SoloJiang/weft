@@ -54,18 +54,18 @@
 //! | Lane facts, evaluated in this exact first-match order | Lane readiness | Reason |
 //! | --- | --- | --- |
 //! | inactive/cancelled, or policy denied | omitted | — |
-//! | most recent worker turn ended `error` | Failed | WorkerFailed |
+//! | any repository slot's latest worker turn ended `error` | Failed | WorkerFailed |
 //! | answerable BusRegistry or AskRegistry ask is open for the direction | NeedsYou | OpenNeed |
 //! | policy needs a human gate | NeedsYou | PolicyGatePending |
-//! | latest worker session is `running`, `starting`, or `stopped` while direction status is `review` or `done` | Unknown | InProgress |
+//! | any repository slot's latest worker session is `running`, `starting`, or `stopped` while direction status is `review` or `done` | Unknown | InProgress |
 //! | at least one tracked PR is `merged`, and the deterministic reduction of every tracked PR is clear | ReviewReady | — |
 //! | worktree/branch reconciliation drifted | Blocked | ExecutionDrifted |
 //! | an inferred check failed for a claimed-complete lane | Blocked | ChecksFailing |
 //! | upstream evidence is Unmet (including a pending or unregistered upstream PR) | Blocked | UpstreamUnmet |
 //! | upstream evidence is Unknown | Unknown | RemoteUnknown |
+//! | tracked PR is closed without merge | Blocked | PrClosedUnmerged |
 //! | tracked PR probe failed or lifecycle is unknown | Unknown | RemoteUnknown |
 //! | tracked open PR has no valid successful timestamp, its snapshot is older than its TTL, or PR sweeping is disabled | Unknown | RemoteUnknown |
-//! | tracked PR is closed without merge | Blocked | PrClosedUnmerged |
 //! | tracked PR CI failed | Blocked | PrCiFailing |
 //! | tracked PR CI is pending | Unknown | PrCiPending |
 //! | tracked PR CI is unknown | Unknown | RemoteUnknown |
@@ -84,10 +84,11 @@
 //! A CLI-reported `review`/`done` state is intentionally last: it cannot
 //! override drift, remote uncertainty, or missing checks. A lane without a PR
 //! skips the PR rows entirely; a PR is not a prerequisite for single-repo
-//! review readiness. A worker session that still occupies a claimed-complete
-//! lane (`running`, `starting`, or terminal-takeover `stopped`) instead yields
-//! `Unknown[InProgress]`: that state is neither a failed check nor missing
-//! remote evidence, and no verifier may read its intermediate checkout. A
+//! review readiness. A latest worker session in any repository slot that still
+//! occupies a claimed-complete lane (`running`, `starting`, or
+//! terminal-takeover `stopped`) instead yields `Unknown[InProgress]`: that
+//! state is neither a failed check nor missing remote evidence, and no verifier
+//! may read its intermediate checkout. A
 //! merged tracked PR is different only when every tracked PR row is clear:
 //! after the three human gates above and with no active worker, that all-clear
 //! merge set is terminal delivery evidence and makes the lane `ReviewReady`
@@ -222,7 +223,7 @@ use crate::host::{
     CiStatus, ConflictStatus, PrLifecycle, ReviewStatus, ThreadStatus, UpstreamStatus,
 };
 use crate::store::{
-    entities::{direction, lead_message, plan, pull_request},
+    entities::{direction, lead_message, plan, pull_request, session},
     repo, Db,
 };
 use anyhow::{anyhow, Result};
@@ -456,6 +457,15 @@ fn one_pull_request_verdict(
         return None;
     }
 
+    // A closed lifecycle is terminal, actionable evidence even when the
+    // partial live probe that refreshed another axis failed. The host monitor
+    // can persist `closed` from its scalar PR probe after its review-thread
+    // probe failed; later sweeps exclude closed rows, so treating that row as
+    // generic RemoteUnknown would otherwise leave it stranded indefinitely.
+    if pr.lifecycle == Some(PrLifecycle::Closed) {
+        return Some((LaneReadiness::Blocked, ReasonCode::PrClosedUnmerged));
+    }
+
     // A failed probe means any prior snapshot is stale. This includes the
     // first-probe case (error + all four stored axes empty) and later
     // failures, which must not silently reuse an old all-clear.
@@ -468,9 +478,6 @@ fn one_pull_request_verdict(
     };
     if lifecycle == PrLifecycle::Open && !open_pr_snapshot_freshness.allows(pr.last_checked_at) {
         return Some((LaneReadiness::Unknown, ReasonCode::RemoteUnknown));
-    }
-    if lifecycle == PrLifecycle::Closed {
-        return Some((LaneReadiness::Blocked, ReasonCode::PrClosedUnmerged));
     }
 
     match &pr.ci {
@@ -1479,30 +1486,50 @@ fn worker_session_occupies_worktree(status: &str) -> bool {
 }
 
 async fn latest_worker_facts(db: &Db, direction_id: i32) -> Result<WorkerSessionFacts> {
-    let Some(session) = repo::latest_session_for_direction(db, direction_id).await? else {
-        return Ok(WorkerSessionFacts::default());
-    };
-    // Match materialize::remove_direction_worktree's exact worktree safety
-    // boundary: a worker can own the checkout while it is starting, running,
-    // or taken over in a human terminal (stopped). `reviving` is a revive
-    // operation label, not a persisted session.status value.
-    let active = worker_session_occupies_worktree(session.status.as_str());
-    // engine::finalize_text_row persists the turn's terminal state by calling
-    // repo::update_lead_message on an assistant/text row. Assistant/tool rows
-    // describe individual tool calls, so their `error` cannot diagnose the
-    // whole worker turn as failed.
-    let latest = lead_message::Entity::find()
-        .filter(lead_message::Column::SessionId.eq(session.id))
-        .filter(lead_message::Column::Role.eq("assistant"))
-        .filter(lead_message::Column::Kind.eq("text"))
-        .order_by_desc(lead_message::Column::TurnId)
-        .order_by_desc(lead_message::Column::Id)
-        .one(&db.0)
+    // A multi-repo direction dispatches one worker per worktree. Sort every
+    // session newest-first, then retain the first row for each repository slot
+    // so an old error is superseded by a later retry in the same repository,
+    // while a current worker in another repository cannot be hidden by the
+    // direction's globally newest session.
+    let sessions = session::Entity::find()
+        .filter(session::Column::DirectionId.eq(direction_id))
+        .order_by_desc(session::Column::Id)
+        .all(&db.0)
         .await?;
-    Ok(WorkerSessionFacts {
-        failed: latest.is_some_and(|message| message.status == "error"),
-        active,
-    })
+    let mut seen_repo_ids = HashSet::new();
+    let mut facts = WorkerSessionFacts::default();
+
+    for session in sessions {
+        if !seen_repo_ids.insert(session.repo_id) {
+            continue;
+        }
+
+        // Match materialize::remove_direction_worktree's exact worktree
+        // safety boundary: a worker can own the checkout while it is starting,
+        // running, or taken over in a human terminal (stopped). `reviving` is
+        // a revive operation label, not a persisted session.status value.
+        if worker_session_occupies_worktree(session.status.as_str()) {
+            facts.active = true;
+        }
+
+        // engine::finalize_text_row persists the turn's terminal state by
+        // calling repo::update_lead_message on an assistant/text row.
+        // Assistant/tool rows describe individual tool calls, so their `error`
+        // cannot diagnose the whole worker turn as failed.
+        let latest = lead_message::Entity::find()
+            .filter(lead_message::Column::SessionId.eq(session.id))
+            .filter(lead_message::Column::Role.eq("assistant"))
+            .filter(lead_message::Column::Kind.eq("text"))
+            .order_by_desc(lead_message::Column::TurnId)
+            .order_by_desc(lead_message::Column::Id)
+            .one(&db.0)
+            .await?;
+        if latest.is_some_and(|message| message.status == "error") {
+            facts.failed = true;
+        }
+    }
+
+    Ok(facts)
 }
 
 /// One bounded source of local Git facts. Branch reconciliation and the
@@ -3084,6 +3111,64 @@ mod tests {
         }
     }
 
+    async fn multi_repo_worker_fixture() -> (Db, direction::Model, i32, i32, i32) {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("memory readiness db");
+        let workspace = repo::create_workspace(&db, "multi-repo worker readiness")
+            .await
+            .expect("workspace");
+        let first_repo = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "first-repo",
+            "/tmp/first-repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .expect("first repo");
+        let second_repo = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "second-repo",
+            "/tmp/second-repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .expect("second repo");
+        let thread = repo::create_thread(
+            &db,
+            workspace.id,
+            "multi-repo worker readiness",
+            "feature/multi-repo-worker-readiness",
+            "claude",
+        )
+        .await
+        .expect("thread");
+        let mut direction = repo::create_direction(
+            &db,
+            thread.id,
+            "implementation",
+            "claude",
+            first_repo.id,
+            "exercise one current session per repository slot",
+            "impl-only",
+            "main",
+        )
+        .await
+        .expect("direction");
+        repo::set_direction_status(&db, direction.id, "review")
+            .await
+            .expect("review direction");
+        direction.status = "review".to_string();
+
+        (db, direction, thread.id, first_repo.id, second_repo.id)
+    }
+
     #[tokio::test]
     async fn admission_target_recheck_refuses_a_worker_that_started_after_collection() {
         let db = Db::connect("sqlite::memory:").await.expect("memory db");
@@ -3146,6 +3231,194 @@ mod tests {
         .await
         .expect_err("active worker must preempt the admitted verification target probe");
         assert!(error.to_string().contains("worker is active"));
+    }
+
+    #[tokio::test]
+    async fn multi_repo_current_worker_statuses_preempt_verification() {
+        let (db, direction, _thread_id, first_repo_id, second_repo_id) =
+            multi_repo_worker_fixture().await;
+        let first_worker = repo::create_session(
+            &db,
+            direction.id,
+            first_repo_id,
+            "claude",
+            "/tmp/first-repo-worker",
+        )
+        .await
+        .expect("first worker");
+        // Insert the other repository's idle session second so it is the
+        // direction-wide newest row. The first slot must still preempt
+        // verification whenever it owns its own worktree.
+        let second_worker = repo::create_session(
+            &db,
+            direction.id,
+            second_repo_id,
+            "claude",
+            "/tmp/second-repo-worker",
+        )
+        .await
+        .expect("second worker");
+        repo::set_session_status(&db, second_worker.id, "idle")
+            .await
+            .expect("second worker idle");
+
+        for status in ["running", "starting", "stopped"] {
+            repo::set_session_status(&db, first_worker.id, status)
+                .await
+                .expect("set first worker status");
+
+            let worker = latest_worker_facts(&db, direction.id)
+                .await
+                .expect("aggregate worker facts");
+            assert!(worker.active, "{status} worker must occupy its repo slot");
+            assert!(!worker.failed, "fixture has no terminal worker error");
+
+            let error = verification_targets_for_direction(
+                &db,
+                direction.id,
+                &GitSignatureProbe::readiness(),
+            )
+            .await
+            .expect_err("an active worker in either repo must preempt verification");
+            assert!(error.to_string().contains("worker is active"), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_repo_current_worker_errors_are_aggregated_without_stale_error_latching() {
+        let (db, direction, thread_id, first_repo_id, second_repo_id) =
+            multi_repo_worker_fixture().await;
+        let stale_first = repo::create_session(
+            &db,
+            direction.id,
+            first_repo_id,
+            "claude",
+            "/tmp/first-repo-stale",
+        )
+        .await
+        .expect("stale first worker");
+        repo::set_session_status(&db, stale_first.id, "idle")
+            .await
+            .expect("stale first worker idle");
+        repo::insert_lead_message(
+            &db,
+            thread_id,
+            Some(stale_first.id),
+            1,
+            "assistant",
+            "text",
+            r#"{"text":"first attempt failed"}"#,
+            "error",
+        )
+        .await
+        .expect("stale first worker error");
+
+        let failing_second = repo::create_session(
+            &db,
+            direction.id,
+            second_repo_id,
+            "claude",
+            "/tmp/second-repo-failing",
+        )
+        .await
+        .expect("failing second worker");
+        repo::set_session_status(&db, failing_second.id, "idle")
+            .await
+            .expect("failing second worker idle");
+        repo::insert_lead_message(
+            &db,
+            thread_id,
+            Some(failing_second.id),
+            1,
+            "assistant",
+            "text",
+            r#"{"text":"second attempt failed"}"#,
+            "error",
+        )
+        .await
+        .expect("failing second worker error");
+
+        let replacement_first = repo::create_session(
+            &db,
+            direction.id,
+            first_repo_id,
+            "claude",
+            "/tmp/first-repo-retry",
+        )
+        .await
+        .expect("replacement first worker");
+        repo::set_session_status(&db, replacement_first.id, "idle")
+            .await
+            .expect("replacement first worker idle");
+        repo::insert_lead_message(
+            &db,
+            thread_id,
+            Some(replacement_first.id),
+            2,
+            "assistant",
+            "text",
+            r#"{"text":"first retry completed"}"#,
+            "complete",
+        )
+        .await
+        .expect("replacement first worker completion");
+
+        // The globally newest session is the successful first-repo retry, but
+        // the second repository's current terminal error remains actionable.
+        let worker = latest_worker_facts(&db, direction.id)
+            .await
+            .expect("aggregate worker facts");
+        assert!(worker.failed);
+        let open_asks = HashSet::new();
+        let lane = collect_lane(
+            &db,
+            &direction,
+            PolicyDecision::AllowedByPolicy,
+            &open_asks,
+            open_pr_snapshot_freshness(1_000, 60),
+            CheckExecution::RunAllowed,
+            &GitSignatureProbe::readiness(),
+        )
+        .await
+        .expect("worker failure must preempt lane collection");
+        assert_eq!(
+            verdict(&lane),
+            (LaneReadiness::Failed, Some(ReasonCode::WorkerFailed))
+        );
+
+        let replacement_second = repo::create_session(
+            &db,
+            direction.id,
+            second_repo_id,
+            "claude",
+            "/tmp/second-repo-retry",
+        )
+        .await
+        .expect("replacement second worker");
+        repo::set_session_status(&db, replacement_second.id, "idle")
+            .await
+            .expect("replacement second worker idle");
+        repo::insert_lead_message(
+            &db,
+            thread_id,
+            Some(replacement_second.id),
+            2,
+            "assistant",
+            "text",
+            r#"{"text":"second retry completed"}"#,
+            "complete",
+        )
+        .await
+        .expect("replacement second worker completion");
+
+        let recovered = latest_worker_facts(&db, direction.id)
+            .await
+            .expect("aggregate recovered worker facts");
+        assert!(!recovered.active);
+        assert!(
+            !recovered.failed,
+            "errors from replaced repository sessions must not latch forever"
+        );
     }
 
     fn pr() -> PullRequestFacts {
@@ -3531,6 +3804,23 @@ mod tests {
             lane.pull_requests = vec![pr];
             assert_eq!(verdict(&lane), (readiness, Some(reason)));
         }
+    }
+
+    #[test]
+    fn closed_pr_precedes_partial_probe_failure() {
+        let mut closed = pr();
+        closed.lifecycle = Some(PrLifecycle::Closed);
+        closed.probe_failed = true;
+        closed.threads = ThreadStatus::Unknown {
+            reason: "review-thread probe failed".to_string(),
+        };
+
+        let mut lane = facts();
+        lane.pull_requests = vec![closed];
+        assert_eq!(
+            verdict(&lane),
+            (LaneReadiness::Blocked, Some(ReasonCode::PrClosedUnmerged))
+        );
     }
 
     #[test]
