@@ -113,17 +113,19 @@ goal is to ask only when a real decision is needed.
 
 ### Evidence, not confident narration
 
-The local filesystem and Git are authoritative for code facts. The code host is
-authoritative for PR, CI, review, conflict, and merge facts. Weft reconciles those
-sources after execution and fails closed when it cannot establish what happened.
+In the target model, the local filesystem and Git are authoritative for code
+facts, while the code host is authoritative for PR, CI, review, conflict, and
+merge facts. Weft will reconcile those sources after execution and fail closed
+when it cannot establish what happened.
 
 ### Native tools, native repositories
 
 - **Your agents:** Weft drives the native Claude Code, Codex, and OpenCode CLIs.
 - **Your repositories:** worktrees and branches follow each repository's own
   layout and naming conventions; Weft does not replace Git hosting.
-- **Your practices:** personal, project, and repository Skills and Rules remain
-  inspectable, versioned where possible, and resolved before a Run starts.
+- **Your practices:** personal, Project, and repository Skills, plus personal and
+  repository Rules, remain inspectable. Versioned sources keep their revisions,
+  and the effective set is resolved before a Run starts.
 
 ### Local-first, but reachable
 
