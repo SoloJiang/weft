@@ -6,6 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tempfile::TempDir;
 use weft::ask::AskRegistry;
@@ -26,6 +27,11 @@ struct Fixture {
     thread_id: i32,
     direction_id: i32,
     repo_id: i32,
+    // Readiness uses process-global probe limits and single-flight state. Keep
+    // one integration fixture alive at a time so unrelated tests cannot spend
+    // another fixture's bounded probe budget. This drops after `_temp`, so the
+    // repository and worktrees are also cleaned up before the next test starts.
+    _serial: tokio::sync::OwnedMutexGuard<()>,
 }
 
 const FIXTURE_DIRECTION_ID_BLOCK: i32 = 10_000;
@@ -36,6 +42,11 @@ fn next_fixture_direction_id() -> i32 {
     // at ID 1. Reserve a range because a fixture can add follow-up directions.
     static NEXT_DIRECTION_ID: AtomicI32 = AtomicI32::new(1_000_000_000);
     NEXT_DIRECTION_ID.fetch_add(FIXTURE_DIRECTION_ID_BLOCK, Ordering::SeqCst)
+}
+
+fn readiness_fixture_lock() -> Arc<tokio::sync::Mutex<()>> {
+    static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    Arc::clone(LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
 }
 
 struct HostIdentity {
@@ -165,6 +176,7 @@ fn make_repo_with_origin(root: &Path) -> (PathBuf, HostIdentity) {
 }
 
 async fn fixture_for_repo(temp: TempDir, repo_path: PathBuf, plan_status: Option<&str>) -> Fixture {
+    let serial = readiness_fixture_lock().lock_owned().await;
     let db = Db::connect("sqlite::memory:").await.expect("memory db");
     let workspace = repo::create_workspace(&db, "readiness workspace")
         .await
@@ -229,6 +241,7 @@ async fn fixture_for_repo(temp: TempDir, repo_path: PathBuf, plan_status: Option
         thread_id: thread.id,
         direction_id: direction.id,
         repo_id: repo_ref.id,
+        _serial: serial,
     }
 }
 
