@@ -2854,8 +2854,8 @@ fn build_args(inner: &EngineInner) -> Vec<String> {
 /// is spawned, replacing [`EngineInner::computer_args`]/`computer_env`.
 ///
 /// Why every respawn needs this: `bus::inject::inject_computer` ROTATES the
-/// identity's bearer generation, and `stop_admitted` now revokes it too
-/// (`computer_srv::revoke_computer_session_tokens`). A resident
+/// identity's bearer generation, and every teardown revokes it too
+/// (see [`release_child_slot`] / [`revoke_engine_bearer`]). A resident
 /// engine respawns from the argv/env captured when it was CONSTRUCTED, so
 /// without a refresh the new child would carry a bearer that was already
 /// invalidated — every computer call from a resumed session would 401.
@@ -8393,11 +8393,16 @@ async fn stop_quiet_admitted(eng: &EngineRef) -> StopQuietOutcome {
     // stop, switch teardown, restart), and resume stays safe because every
     // respawn path re-mints first (`refresh_computer_injection`).
     //
-    // Deliberately AFTER the re-lock rather than at the top of this function.
-    // The lock is dropped for the ACP cancel above, and this teardown does not
-    // set `stopped` until it returns — so a send admitted in that window can
-    // reach `spawn_turn` and mint a fresh bearer for a child that the clears
-    // right here then kill. Revoking early would miss exactly that mint.
+    // The SECOND of this teardown's two revokes, and not redundant with the
+    // one before the lock was dropped for the ACP cancel. That window does not
+    // set `stopped` until this function returns, so a send admitted inside it
+    // reaches `spawn_turn` and mints a REPLACEMENT bearer — which this Stop
+    // must kill too. The early revoke can't see that mint; this one can't
+    // protect the ACP child during the cancel await. Both are needed.
+    //
+    // Safe to repeat because `revoke_engine_bearer` consumes the stamp: with
+    // no new mint in between this is inert, and it can never reach past its
+    // own generation into a bearer that now belongs to somebody else.
     release_child_slot(&mut inner);
     inner.stdin = None;
     inner.turn = TurnState::default();
