@@ -757,6 +757,43 @@ async fn concurrent_board_collects_share_one_real_check_run() {
     assert_eq!(executions, 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_verification_and_readiness_share_one_real_check_run() {
+    let fixture = fixture(None).await;
+    let counter = add_counting_build_script(&fixture).await;
+
+    let (readiness, explicit) = tokio::join!(
+        weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id),
+        weft::readiness::verify_direction(&fixture.db, fixture.direction_id),
+    );
+
+    assert_eq!(
+        readiness.expect("readiness collection").readiness,
+        IssueReadiness::ReviewReady
+    );
+    let reports = explicit.expect("explicit verification report");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].checks.len(), 1);
+    assert_eq!(reports[0].checks[0].status, "pass");
+
+    let executions = std::fs::read_to_string(counter)
+        .expect("check execution counter")
+        .lines()
+        .count();
+    assert_eq!(executions, 1);
+}
+
+#[tokio::test]
+async fn explicit_verification_errors_when_no_checks_are_produced() {
+    let fixture = fixture(None).await;
+
+    let error = weft::readiness::verify_direction(&fixture.db, fixture.direction_id)
+        .await
+        .expect_err("zero-rung explicit verification must not return empty success");
+
+    assert!(error.to_string().contains("verification was not produced"));
+}
+
 #[tokio::test]
 async fn cached_only_collection_without_a_memo_never_runs_a_rung() {
     let temp = tempfile::tempdir().expect("temporary cached-only fixture root");

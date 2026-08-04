@@ -235,7 +235,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::io::AsyncReadExt;
-use tokio::sync::{watch, Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{watch, Mutex as AsyncMutex, OwnedMutexGuard, Semaphore};
 
 /// Whether a direction is admitted to delivery work by the settled policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -887,23 +887,60 @@ fn current_open_pr_snapshot_freshness() -> Result<OpenPrSnapshotFreshness> {
     Ok(open_pr_snapshot_freshness(now_secs, sweep_secs))
 }
 
+/// Executable verification results per write repo of a direction (§4.13).
+///
+/// This stays serializable because the explicit `verify_direction` IPC command
+/// returns it directly. Readiness and explicit verification share this report
+/// shape so one bounded execution can satisfy both callers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RepoChecks {
+    pub repo: String,
+    pub worktree: String,
+    pub checks: Vec<crate::check::CheckResult>,
+}
+
 #[derive(Clone)]
 struct CachedCheckEvidence {
     collected_at: Instant,
     path_signature: Vec<String>,
+    branch_signature: Vec<String>,
     head_signature: Vec<String>,
     dirty_signature: Vec<bool>,
-    evidence: CheckEvidence,
+    report: VerificationReport,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CheckTarget {
+    repo: String,
     path: String,
+    branch: String,
     head_sha: String,
     dirty: bool,
 }
 
-type SharedCheckResult = std::result::Result<CheckEvidence, String>;
+/// The complete local verification publication shared by explicit verification
+/// and readiness. `evidence` keeps readiness's fail-closed reduction while
+/// `repo_checks` preserves the established explicit-command IPC payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerificationReport {
+    evidence: CheckEvidence,
+    repo_checks: Vec<RepoChecks>,
+}
+
+impl VerificationReport {
+    fn from_evidence(evidence: CheckEvidence) -> Self {
+        Self {
+            evidence,
+            repo_checks: Vec::new(),
+        }
+    }
+
+    fn not_produced() -> Self {
+        Self::from_evidence(CheckEvidence::NotProduced)
+    }
+}
+
+type SharedCheckResult = std::result::Result<VerificationReport, String>;
 
 struct InflightCheck {
     targets: Vec<CheckTarget>,
@@ -924,6 +961,12 @@ struct CheckFlightLeader<'a> {
     direction_id: i32,
     targets: Vec<CheckTarget>,
     sender: Option<watch::Sender<Option<SharedCheckResult>>>,
+}
+
+/// Holds the per-direction verification admission gate. A later engine-start
+/// phase can acquire this guard without depending on runner internals.
+pub struct VerificationAdmission {
+    _guard: OwnedMutexGuard<()>,
 }
 
 impl CheckFlightLeader<'_> {
@@ -950,10 +993,10 @@ impl Drop for CheckFlightLeader<'_> {
     }
 }
 
-/// Process-local coordination for readiness-triggered verification. The cache
-/// is keyed by direction id, but also records the worktree path and HEAD-SHA
-/// signatures that produced it so a recreated or newly committed checkout
-/// cannot inherit prior evidence.
+/// Process-local coordination for every local verification caller. The cache
+/// is keyed by direction id and records the worktree path, branch, HEAD-SHA,
+/// and dirty signatures that produced it so a recreated, switched, or newly
+/// committed checkout cannot inherit prior evidence.
 struct CheckFlight {
     cache: Mutex<HashMap<i32, CachedCheckEvidence>>,
     inflight: Mutex<HashMap<i32, InflightCheck>>,
@@ -973,49 +1016,72 @@ impl CheckFlight {
         }
     }
 
-    fn signatures(targets: &[CheckTarget]) -> (Vec<String>, Vec<String>, Vec<bool>) {
+    fn signatures(targets: &[CheckTarget]) -> (Vec<String>, Vec<String>, Vec<String>, Vec<bool>) {
         let paths = targets.iter().map(|target| target.path.clone()).collect();
+        let branches = targets.iter().map(|target| target.branch.clone()).collect();
         let heads = targets
             .iter()
             .map(|target| target.head_sha.clone())
             .collect();
         let dirty = targets.iter().map(|target| target.dirty).collect();
-        (paths, heads, dirty)
+        (paths, branches, heads, dirty)
     }
 
     fn sort_targets(targets: &mut [CheckTarget]) {
         targets.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
+                .then(left.branch.cmp(&right.branch))
                 .then(left.head_sha.cmp(&right.head_sha))
                 .then(left.dirty.cmp(&right.dirty))
+                .then(left.repo.cmp(&right.repo))
         });
     }
 
-    fn matching_cached_evidence(
+    /// Repo display names are not verification identity. They may be renamed
+    /// without changing the checkout a runner touched; path/branch/HEAD/dirty
+    /// are the complete publish and cache boundary.
+    fn targets_match(left: &[CheckTarget], right: &[CheckTarget]) -> bool {
+        left.len() == right.len()
+            && left.iter().zip(right).all(|(left, right)| {
+                left.path == right.path
+                    && left.branch == right.branch
+                    && left.head_sha == right.head_sha
+                    && left.dirty == right.dirty
+            })
+    }
+
+    fn matching_cached_report(
         entry: &CachedCheckEvidence,
         path_signature: &[String],
+        branch_signature: &[String],
         head_signature: &[String],
         dirty_signature: &[bool],
         ttl: Duration,
-    ) -> Option<CheckEvidence> {
+    ) -> Option<VerificationReport> {
         let is_fresh = Instant::now().saturating_duration_since(entry.collected_at) < ttl;
         if entry.path_signature == path_signature
+            && entry.branch_signature == branch_signature
             && entry.head_signature == head_signature
             && entry.dirty_signature == dirty_signature
             && is_fresh
         {
-            return Some(entry.evidence);
+            return Some(entry.report.clone());
         }
         None
     }
 
-    fn cached(&self, direction_id: i32, targets: &[CheckTarget]) -> Result<Option<CheckEvidence>> {
+    fn cached(
+        &self,
+        direction_id: i32,
+        targets: &[CheckTarget],
+    ) -> Result<Option<VerificationReport>> {
         let mut cache = self
             .cache
             .lock()
             .map_err(|_| anyhow!("readiness check cache lock poisoned"))?;
-        let (path_signature, head_signature, dirty_signature) = Self::signatures(targets);
+        let (path_signature, branch_signature, head_signature, dirty_signature) =
+            Self::signatures(targets);
         // A dirty worktree may have changed after the cached pass, even when
         // HEAD did not. Invalidate rather than merely skip it so a later clean
         // status cannot resurrect evidence from before the dirty interval.
@@ -1026,9 +1092,10 @@ impl CheckFlight {
         let Some(entry) = cache.get(&direction_id) else {
             return Ok(None);
         };
-        Ok(Self::matching_cached_evidence(
+        Ok(Self::matching_cached_report(
             entry,
             &path_signature,
+            &branch_signature,
             &head_signature,
             &dirty_signature,
             self.ttl,
@@ -1042,21 +1109,23 @@ impl CheckFlight {
         &self,
         direction_id: i32,
         targets: &[CheckTarget],
-    ) -> Result<Option<CheckEvidence>> {
+    ) -> Result<Option<VerificationReport>> {
         let cache = self
             .cache
             .lock()
             .map_err(|_| anyhow!("readiness check cache lock poisoned"))?;
-        let (path_signature, head_signature, dirty_signature) = Self::signatures(targets);
+        let (path_signature, branch_signature, head_signature, dirty_signature) =
+            Self::signatures(targets);
         if dirty_signature.iter().any(|dirty| *dirty) {
             return Ok(None);
         }
         let Some(entry) = cache.get(&direction_id) else {
             return Ok(None);
         };
-        Ok(Self::matching_cached_evidence(
+        Ok(Self::matching_cached_report(
             entry,
             &path_signature,
+            &branch_signature,
             &head_signature,
             &dirty_signature,
             self.ttl,
@@ -1085,7 +1154,7 @@ impl CheckFlight {
             .lock()
             .map_err(|_| anyhow!("readiness check flight map lock poisoned"))?;
         if let Some(existing) = inflight.get(&direction_id) {
-            if existing.targets == targets {
+            if Self::targets_match(&existing.targets, targets) {
                 return Ok(CheckFlightClaim::Follower(existing.receiver.clone()));
             }
             return Ok(CheckFlightClaim::WaitForDifferentTargets(
@@ -1116,14 +1185,14 @@ impl CheckFlight {
             .map_err(|_| anyhow!("readiness check flight map lock poisoned"))?;
         let should_remove = inflight
             .get(&direction_id)
-            .is_some_and(|existing| existing.targets == targets);
+            .is_some_and(|existing| Self::targets_match(&existing.targets, targets));
         if should_remove {
             inflight.remove(&direction_id);
         }
         Ok(())
     }
 
-    fn shared_result(result: SharedCheckResult) -> Result<CheckEvidence> {
+    fn shared_result(result: SharedCheckResult) -> Result<VerificationReport> {
         match result {
             Ok(evidence) => Ok(evidence),
             Err(message) => Err(anyhow!(message)),
@@ -1132,7 +1201,7 @@ impl CheckFlight {
 
     async fn wait_for_inflight(
         mut receiver: watch::Receiver<Option<SharedCheckResult>>,
-    ) -> Result<CheckEvidence> {
+    ) -> Result<VerificationReport> {
         loop {
             if let Some(result) = receiver.borrow().clone() {
                 return Self::shared_result(result);
@@ -1159,18 +1228,31 @@ impl CheckFlight {
             .clone())
     }
 
+    async fn acquire_admission(&self, direction_id: i32) -> Result<VerificationAdmission> {
+        let direction_lock = self.direction_lock(direction_id)?;
+        Ok(VerificationAdmission {
+            _guard: direction_lock.lock_owned().await,
+        })
+    }
+
     fn cache_result(
         &self,
         direction_id: i32,
         targets: &[CheckTarget],
-        evidence: CheckEvidence,
+        report: &VerificationReport,
     ) -> Result<()> {
         let mut cache = self
             .cache
             .lock()
             .map_err(|_| anyhow!("readiness check cache lock poisoned"))?;
-        let (path_signature, head_signature, dirty_signature) = Self::signatures(targets);
-        if dirty_signature.iter().any(|dirty| *dirty) {
+        let (path_signature, branch_signature, head_signature, dirty_signature) =
+            Self::signatures(targets);
+        if dirty_signature.iter().any(|dirty| *dirty)
+            || matches!(
+                report.evidence,
+                CheckEvidence::NotProduced | CheckEvidence::NotApplicable
+            )
+        {
             cache.remove(&direction_id);
             return Ok(());
         }
@@ -1179,9 +1261,10 @@ impl CheckFlight {
             CachedCheckEvidence {
                 collected_at: Instant::now(),
                 path_signature,
+                branch_signature,
                 head_signature,
                 dirty_signature,
-                evidence,
+                report: report.clone(),
             },
         );
         Ok(())
@@ -1205,14 +1288,12 @@ impl CheckFlight {
         .await
     }
 
-    /// Run checks under the direction lock, then validate that every target is
-    /// still the exact path/HEAD/dirty signature the runner observed. The
-    /// runner permit intentionally lives only inside the execution block so
-    /// bounded Git re-sampling cannot consume one of the two execution slots.
+    /// Test-facing verdict wrapper around the shared report runner.
+    #[cfg(test)]
     async fn get_or_run_with_post_targets<F, Fut, S, SFut>(
         &self,
         direction_id: i32,
-        mut targets: Vec<CheckTarget>,
+        targets: Vec<CheckTarget>,
         runner: F,
         post_targets: S,
     ) -> Result<CheckEvidence>
@@ -1222,11 +1303,54 @@ impl CheckFlight {
         S: FnOnce(Vec<CheckTarget>) -> SFut,
         SFut: Future<Output = Result<Vec<CheckTarget>>>,
     {
-        Self::sort_targets(&mut targets);
-        if let Some(evidence) = self.cached(direction_id, &targets)? {
-            return Ok(evidence);
-        }
+        let admission_targets = targets.clone();
+        let report = self
+            .get_or_run_report_with_admission_and_post_targets(
+                direction_id,
+                targets,
+                move |targets| {
+                    let paths = targets
+                        .into_iter()
+                        .map(|target| target.path)
+                        .collect::<Vec<_>>();
+                    async move {
+                        runner(paths)
+                            .await
+                            .map(VerificationReport::from_evidence)
+                    }
+                },
+                move |_| async move { Ok(admission_targets) },
+                post_targets,
+            )
+            .await?;
+        Ok(report.evidence)
+    }
 
+    /// Run verification under the per-direction admission gate, then validate
+    /// that every target is still the exact path/branch/HEAD/dirty signature
+    /// the runner observed. The runner permit intentionally lives only inside
+    /// the execution block so bounded Git re-sampling cannot consume one of
+    /// the two execution slots.
+    async fn get_or_run_report_with_admission_and_post_targets<F, Fut, A, AFut, S, SFut>(
+        &self,
+        direction_id: i32,
+        mut targets: Vec<CheckTarget>,
+        runner: F,
+        admission_targets: A,
+        post_targets: S,
+    ) -> Result<VerificationReport>
+    where
+        F: FnOnce(Vec<CheckTarget>) -> Fut,
+        Fut: Future<Output = Result<VerificationReport>>,
+        A: FnOnce(Vec<CheckTarget>) -> AFut,
+        AFut: Future<Output = Result<Vec<CheckTarget>>>,
+        S: FnOnce(Vec<CheckTarget>) -> SFut,
+        SFut: Future<Output = Result<Vec<CheckTarget>>>,
+    {
+        Self::sort_targets(&mut targets);
+        if let Some(report) = self.cached(direction_id, &targets)? {
+            return Ok(report);
+        }
         loop {
             match self.claim_inflight(direction_id, &targets)? {
                 CheckFlightClaim::Follower(receiver) => {
@@ -1238,17 +1362,37 @@ impl CheckFlight {
                     // caller, but waiting preserves the per-direction runner
                     // serialization before this caller samples its own result.
                     let _ = Self::wait_for_inflight(receiver).await;
-                    if let Some(evidence) = self.cached(direction_id, &targets)? {
-                        return Ok(evidence);
+                    if let Some(report) = self.cached(direction_id, &targets)? {
+                        return Ok(report);
                     }
                 }
                 CheckFlightClaim::Leader(leader) => {
-                    let direction_lock = self.direction_lock(direction_id)?;
-                    let _direction_guard = direction_lock.lock().await;
-                    if let Some(evidence) = self.cached(direction_id, &targets)? {
-                        let shared_result = Ok(evidence);
+                    let _admission = self.acquire_admission(direction_id).await?;
+                    if let Some(report) = self.cached(direction_id, &targets)? {
+                        let shared_result = Ok(report.clone());
                         leader.finish(shared_result)?;
-                        return Ok(evidence);
+                        return Ok(report);
+                    }
+
+                    let mut admitted_targets = match admission_targets(targets.clone()).await {
+                        Ok(targets) => targets,
+                        Err(_) => {
+                            let shared_result = match self.invalidate_cached(direction_id) {
+                                Ok(()) => Ok(VerificationReport::not_produced()),
+                                Err(error) => Err(error.to_string()),
+                            };
+                            leader.finish(shared_result.clone())?;
+                            return Self::shared_result(shared_result);
+                        }
+                    };
+                    Self::sort_targets(&mut admitted_targets);
+                    if !Self::targets_match(&admitted_targets, &targets) {
+                        let shared_result = match self.invalidate_cached(direction_id) {
+                            Ok(()) => Ok(VerificationReport::not_produced()),
+                            Err(error) => Err(error.to_string()),
+                        };
+                        leader.finish(shared_result.clone())?;
+                        return Self::shared_result(shared_result);
                     }
 
                     let runner_result = {
@@ -1257,27 +1401,26 @@ impl CheckFlight {
                             .acquire()
                             .await
                             .map_err(|_| anyhow!("readiness check runner semaphore closed"))?;
-                        let paths = targets.iter().map(|target| target.path.clone()).collect();
-                        runner(paths).await
+                        runner(targets.clone()).await
                     };
                     let shared_result = match runner_result {
-                        Ok(evidence) => match post_targets(targets.clone()).await {
+                        Ok(report) => match post_targets(targets.clone()).await {
                             Ok(mut observed_targets) => {
                                 Self::sort_targets(&mut observed_targets);
-                                if observed_targets == targets {
-                                    match self.cache_result(direction_id, &targets, evidence) {
-                                        Ok(()) => Ok(evidence),
+                                if Self::targets_match(&observed_targets, &targets) {
+                                    match self.cache_result(direction_id, &targets, &report) {
+                                        Ok(()) => Ok(report),
                                         Err(error) => Err(error.to_string()),
                                     }
                                 } else {
                                     match self.invalidate_cached(direction_id) {
-                                        Ok(()) => Ok(CheckEvidence::NotProduced),
+                                        Ok(()) => Ok(VerificationReport::not_produced()),
                                         Err(error) => Err(error.to_string()),
                                     }
                                 }
                             }
                             Err(_) => match self.invalidate_cached(direction_id) {
-                                Ok(()) => Ok(CheckEvidence::NotProduced),
+                                Ok(()) => Ok(VerificationReport::not_produced()),
                                 Err(error) => Err(error.to_string()),
                             },
                         },
@@ -1294,6 +1437,24 @@ impl CheckFlight {
 fn check_flight() -> &'static CheckFlight {
     static CHECK_FLIGHT: OnceLock<CheckFlight> = OnceLock::new();
     CHECK_FLIGHT.get_or_init(|| CheckFlight::new(CHECK_EVIDENCE_TTL, MAX_CONCURRENT_CHECK_RUNNERS))
+}
+
+/// Acquire the shared per-direction verification admission gate.
+///
+/// This is intentionally independent of `lead_chat::engine`: the next phase
+/// can use the same gate to prevent a worker start from racing verification.
+pub async fn acquire_verification_admission(
+    direction_id: i32,
+) -> Result<VerificationAdmission> {
+    check_flight().acquire_admission(direction_id).await
+}
+
+/// Drop cached verification evidence for one direction.
+///
+/// Callers that mutate a verification target can invalidate before a later
+/// `RunAllowed` collection establishes fresh evidence.
+pub fn invalidate_verification_memo(direction_id: i32) -> Result<()> {
+    check_flight().invalidate_cached(direction_id)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1401,6 +1562,7 @@ struct GitWorktreeSignature {
 
 #[derive(Clone, Debug)]
 struct ProbedWorktree {
+    repo: String,
     stored_path: String,
     signature: Option<GitWorktreeSignature>,
 }
@@ -1413,9 +1575,14 @@ async fn probe_worktrees_for_direction(
     let worktrees = repo::list_worktrees(db, Some(direction_id)).await?;
     let mut probed = Vec::with_capacity(worktrees.len());
     for worktree in worktrees {
+        let repo_name = repo::get_repo(db, worktree.repo_id)
+            .await?
+            .map(|repo| repo.name)
+            .unwrap_or_else(|| format!("repo {}", worktree.repo_id));
         let stored_path = worktree.path;
         let signature = git_probe.sample(Path::new(&stored_path)).await.ok();
         probed.push(ProbedWorktree {
+            repo: repo_name,
             stored_path,
             signature,
         });
@@ -1467,7 +1634,9 @@ fn check_targets_for_worktrees(worktrees: &[ProbedWorktree]) -> Option<Vec<Check
             return None;
         };
         targets.push(CheckTarget {
+            repo: worktree.repo.clone(),
             path: worktree.stored_path.clone(),
+            branch: signature.branch.clone(),
             head_sha: signature.head_sha.clone(),
             dirty: signature.dirty,
         });
@@ -1475,19 +1644,40 @@ fn check_targets_for_worktrees(worktrees: &[ProbedWorktree]) -> Option<Vec<Check
     Some(targets)
 }
 
-/// Re-sample every path that a readiness runner just touched. The resulting
-/// signature deliberately excludes branch because CheckFlight evidence is
-/// keyed by its path, HEAD, and dirty state; reconciliation owns branch drift.
+/// Fetch the currently registered worktrees and sample their live Git
+/// signatures. Leaders call this while holding the admission gate, so a
+/// queued verification cannot run against a target that changed before it
+/// acquired the per-direction turn.
+async fn verification_targets_for_direction(
+    db: &Db,
+    direction_id: i32,
+    git_probe: &GitSignatureProbe,
+) -> Result<Vec<CheckTarget>> {
+    let worktrees = probe_worktrees_for_direction(db, direction_id, git_probe).await?;
+    check_targets_for_worktrees(&worktrees).ok_or_else(|| {
+        anyhow!(
+            "verification was not produced for direction {direction_id}: \
+             worktree target is unavailable"
+        )
+    })
+}
+
+/// Re-sample every target that a readiness runner just touched. A result is
+/// publishable only when path, branch, HEAD, and dirty state still match.
+#[cfg(test)]
 async fn resample_check_targets(
     targets: Vec<CheckTarget>,
     git_probe: &GitSignatureProbe,
 ) -> Result<Vec<CheckTarget>> {
     let mut observed = Vec::with_capacity(targets.len());
     for target in targets {
+        let repo = target.repo;
         let path = target.path;
         let signature = git_probe.sample(Path::new(&path)).await?;
         observed.push(CheckTarget {
+            repo,
             path,
+            branch: signature.branch,
             head_sha: signature.head_sha,
             dirty: signature.dirty,
         });
@@ -1518,6 +1708,7 @@ where
     .await
 }
 
+#[cfg(test)]
 async fn checks_for_with_runner_and_post_targets<F, Fut, S, SFut>(
     direction: &direction::Model,
     worktrees: &[ProbedWorktree],
@@ -1577,6 +1768,7 @@ where
     .await
 }
 
+#[cfg(test)]
 async fn checks_for_targets_with_runner_and_post_targets<F, Fut, S, SFut>(
     flight: &CheckFlight,
     execution: CheckExecution,
@@ -1600,6 +1792,7 @@ where
         }
         CheckExecution::CachedOnly => Ok(flight
             .cached_read_only(direction_id, &targets)?
+            .map(|report| report.evidence)
             .unwrap_or(CheckEvidence::NotProduced)),
     }
 }
@@ -2238,42 +2431,65 @@ async fn run_bounded_check(
     }
 }
 
+async fn run_checks_with_timeout_report(
+    cwd: &Path,
+    checks: &[crate::check::Check],
+    timeout: Duration,
+) -> Result<(CheckEvidence, Vec<crate::check::CheckResult>)> {
+    if checks.is_empty() {
+        // `infer_checks` deliberately declines to invent a runner. That is no
+        // verification evidence for a claimed-complete lane, not a vacuous
+        // passing suite.
+        return Ok((CheckEvidence::NotProduced, Vec::new()));
+    }
+    let mut saw_not_produced = false;
+    let mut saw_failure = false;
+    let mut results = Vec::with_capacity(checks.len());
+    for check in checks {
+        match run_bounded_check(cwd, check, timeout).await? {
+            BoundedCheckOutcome::Completed(result) => {
+                if result.status == "fail" {
+                    saw_failure = true;
+                }
+                results.push(result);
+            }
+            BoundedCheckOutcome::NotProduced { output_tail } => {
+                saw_not_produced = true;
+                results.push(crate::check::CheckResult {
+                    name: check.name.clone(),
+                    status: "fail".to_string(),
+                    code: -1,
+                    output_tail: if output_tail.is_empty() {
+                        "verification did not produce a bounded check result".to_string()
+                    } else {
+                        format!(
+                            "verification did not produce a bounded check result: {output_tail}"
+                        )
+                    },
+                });
+            }
+        }
+    }
+    if saw_failure {
+        return Ok((CheckEvidence::Failing, results));
+    }
+    if saw_not_produced {
+        return Ok((CheckEvidence::NotProduced, results));
+    }
+    Ok((CheckEvidence::Passed, results))
+}
+
+#[cfg(test)]
 async fn run_checks_with_timeout(
     cwd: &Path,
     checks: &[crate::check::Check],
     timeout: Duration,
 ) -> Result<CheckEvidence> {
-    if checks.is_empty() {
-        // `infer_checks` deliberately declines to invent a runner. That is no
-        // verification evidence for a claimed-complete lane, not a vacuous
-        // passing suite.
-        return Ok(CheckEvidence::NotProduced);
-    }
-    let mut saw_not_produced = false;
-    let mut saw_failure = false;
-    for check in checks {
-        match run_bounded_check(cwd, check, timeout).await? {
-            BoundedCheckOutcome::Completed(result) if result.status == "fail" => {
-                saw_failure = true;
-            }
-            BoundedCheckOutcome::Completed(_) => {}
-            BoundedCheckOutcome::NotProduced { output_tail } => {
-                // CheckEvidence intentionally carries only a verdict, but the
-                // bounded executor retains this tail for direct diagnostics.
-                let _retained_output_tail = output_tail;
-                saw_not_produced = true;
-            }
-        }
-    }
-    if saw_failure {
-        return Ok(CheckEvidence::Failing);
-    }
-    if saw_not_produced {
-        return Ok(CheckEvidence::NotProduced);
-    }
-    Ok(CheckEvidence::Passed)
+    let (evidence, _) = run_checks_with_timeout_report(cwd, checks, timeout).await?;
+    Ok(evidence)
 }
 
+#[cfg(test)]
 async fn run_readiness_checks(paths: Vec<String>, timeout: Duration) -> Result<CheckEvidence> {
     let mut saw_not_produced = false;
     let mut saw_failure = false;
@@ -2295,21 +2511,118 @@ async fn run_readiness_checks(paths: Vec<String>, timeout: Duration) -> Result<C
     Ok(CheckEvidence::Passed)
 }
 
+async fn run_verification_checks(
+    targets: Vec<CheckTarget>,
+    timeout: Duration,
+) -> Result<VerificationReport> {
+    if targets.is_empty() {
+        return Ok(VerificationReport::not_produced());
+    }
+
+    let mut saw_not_produced = false;
+    let mut saw_failure = false;
+    let mut repo_checks = Vec::with_capacity(targets.len());
+    for target in targets {
+        let repo = target.repo;
+        let worktree = target.path;
+        let checks = crate::check::infer_checks(Path::new(&worktree));
+        let (evidence, checks) =
+            run_checks_with_timeout_report(Path::new(&worktree), &checks, timeout).await?;
+        if evidence == CheckEvidence::Failing {
+            saw_failure = true;
+        } else if evidence == CheckEvidence::NotProduced {
+            saw_not_produced = true;
+        }
+        repo_checks.push(RepoChecks {
+            repo,
+            worktree,
+            checks,
+        });
+    }
+
+    let evidence = if saw_failure {
+        CheckEvidence::Failing
+    } else if saw_not_produced {
+        CheckEvidence::NotProduced
+    } else {
+        CheckEvidence::Passed
+    };
+    Ok(VerificationReport {
+        evidence,
+        repo_checks,
+    })
+}
+
+async fn run_shared_verification(
+    db: &Db,
+    direction_id: i32,
+    targets: Vec<CheckTarget>,
+    git_probe: &GitSignatureProbe,
+) -> Result<VerificationReport> {
+    let admission_probe = git_probe.clone();
+    let post_probe = git_probe.clone();
+    check_flight()
+        .get_or_run_report_with_admission_and_post_targets(
+            direction_id,
+            targets,
+            |targets| async move {
+                run_verification_checks(targets, READINESS_CHECK_TIMEOUT).await
+            },
+            move |_| async move {
+                verification_targets_for_direction(db, direction_id, &admission_probe).await
+            },
+            move |_| async move {
+                verification_targets_for_direction(db, direction_id, &post_probe).await
+            },
+        )
+        .await
+}
+
 async fn checks_for(
+    db: &Db,
     direction: &direction::Model,
     worktrees: &[ProbedWorktree],
     execution: CheckExecution,
     git_probe: &GitSignatureProbe,
 ) -> Result<CheckEvidence> {
-    checks_for_with_runner_and_post_targets(
-        direction,
-        worktrees,
-        check_flight(),
-        execution,
-        |paths| async move { run_readiness_checks(paths, READINESS_CHECK_TIMEOUT).await },
-        move |targets| async move { resample_check_targets(targets, git_probe).await },
-    )
-    .await
+    if !direction_claimed_completion(direction.status.as_str()) {
+        return Ok(CheckEvidence::NotApplicable);
+    }
+
+    let Some(mut targets) = check_targets_for_worktrees(worktrees) else {
+        return Ok(CheckEvidence::NotProduced);
+    };
+    CheckFlight::sort_targets(&mut targets);
+    match execution {
+        CheckExecution::RunAllowed => Ok(
+            run_shared_verification(db, direction.id, targets, git_probe)
+                .await?
+                .evidence,
+        ),
+        CheckExecution::CachedOnly => Ok(check_flight()
+            .cached_read_only(direction.id, &targets)?
+            .map(|report| report.evidence)
+            .unwrap_or(CheckEvidence::NotProduced)),
+    }
+}
+
+/// Run bounded local verification for one direction and return the established
+/// explicit-command report shape. Missing/deferred evidence is an error rather
+/// than a misleading empty successful response.
+pub async fn verify_direction(db: &Db, direction_id: i32) -> Result<Vec<RepoChecks>> {
+    let git_probe = GitSignatureProbe::readiness();
+    let targets = verification_targets_for_direction(db, direction_id, &git_probe).await?;
+    let report = run_shared_verification(db, direction_id, targets, &git_probe).await?;
+    if matches!(
+        report.evidence,
+        CheckEvidence::NotProduced | CheckEvidence::NotApplicable
+    ) || report.repo_checks.is_empty()
+    {
+        return Err(anyhow!(
+            "verification was not produced for direction {direction_id}"
+        ));
+    }
+    Ok(report.repo_checks)
 }
 
 fn checks_are_preempted(facts: &LaneFacts) -> bool {
@@ -2466,7 +2779,7 @@ async fn collect_lane(
     // gate decides the outcome, starting a build/test process cannot add useful
     // delivery evidence or may race a changing checkout.
     let checks = checks_after_decisive_gates(&facts, || {
-        checks_for(direction, &worktrees, check_execution, git_probe)
+        checks_for(db, direction, &worktrees, check_execution, git_probe)
     })
     .await?;
     facts.checks = checks;
@@ -2764,7 +3077,9 @@ mod tests {
 
     fn check_targets_with_dirty(path: &str, head_sha: &str, dirty: bool) -> Vec<CheckTarget> {
         vec![CheckTarget {
+            repo: "test-repo".to_string(),
             path: path.to_string(),
+            branch: "main".to_string(),
             head_sha: head_sha.to_string(),
             dirty,
         }]
@@ -2789,7 +3104,9 @@ mod tests {
             .await
             .expect("sample test worktree signature");
         CheckTarget {
+            repo: "test-repo".to_string(),
             path: stored_path,
+            branch: signature.branch,
             head_sha: signature.head_sha,
             dirty: signature.dirty,
         }
@@ -3753,6 +4070,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_head_branch_switch_is_not_published_or_cached() {
+        let root = tempfile::tempdir().expect("temporary branch-switch fixture");
+        std::fs::write(root.path().join("README.md"), "green\n").expect("write initial file");
+        git_in(root.path(), &["init", "--quiet"]);
+        git_in(
+            root.path(),
+            &["config", "user.email", "readiness@example.invalid"],
+        );
+        git_in(root.path(), &["config", "user.name", "Readiness Test"]);
+        git_in(root.path(), &["add", "README.md"]);
+        git_in(root.path(), &["commit", "--quiet", "-m", "fixture"]);
+
+        let stored_path = root.path().display().to_string();
+        let pre_targets = vec![sampled_check_target(root.path(), stored_path).await];
+        let pre_head = pre_targets[0].head_sha.clone();
+        let pre_branch = pre_targets[0].branch.clone();
+        let switched_path = root.path().to_path_buf();
+        let probe = GitSignatureProbe::readiness();
+        let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
+
+        let evidence = checks_for_targets_with_runner_and_post_targets(
+            &flight,
+            CheckExecution::RunAllowed,
+            881,
+            pre_targets.clone(),
+            move |_| async move {
+                git_in(&switched_path, &["checkout", "--quiet", "-b", "same-head-switch"]);
+                Ok(CheckEvidence::Passed)
+            },
+            move |targets| async move { resample_check_targets(targets, &probe).await },
+        )
+        .await
+        .expect("same-HEAD branch-switch result");
+
+        let after = GitSignatureProbe::readiness()
+            .sample(root.path())
+            .await
+            .expect("sample switched branch");
+        assert_eq!(after.head_sha, pre_head, "branch switch keeps the same HEAD");
+        assert_ne!(after.branch, pre_branch, "fixture must change branches");
+        assert_eq!(evidence, CheckEvidence::NotProduced);
+        assert_eq!(
+            flight
+                .cached_read_only(881, &pre_targets)
+                .expect("cache lookup after branch switch"),
+            None,
+            "same-HEAD branch switches must not publish pre-switch evidence"
+        );
+    }
+
+    #[tokio::test]
     async fn failed_post_run_probe_invalidates_existing_memo_and_returns_not_produced() {
         let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
         let old_targets = check_targets("/tmp/post-run-probe", "old-head");
@@ -3831,7 +4199,8 @@ mod tests {
         assert_eq!(
             CheckFlight::wait_for_inflight(follower)
                 .await
-                .expect("follower publication"),
+                .expect("follower publication")
+                .evidence,
             CheckEvidence::NotProduced
         );
     }
@@ -4287,7 +4656,9 @@ mod tests {
         // prior passing memo and a new runner.
         let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
         let stale_target = CheckTarget {
+            repo: "test-repo".to_string(),
             path: root_path.clone(),
+            branch: "main".to_string(),
             head_sha: "old-head".to_string(),
             dirty: false,
         };
@@ -4301,6 +4672,7 @@ mod tests {
         let runner_calls = Arc::new(AtomicUsize::new(0));
         let attempted_calls = Arc::clone(&runner_calls);
         let unavailable = vec![ProbedWorktree {
+            repo: "test-repo".to_string(),
             stored_path: root_path,
             signature: None,
         }];
@@ -4584,8 +4956,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_only_checks_never_start_a_runner_and_reuse_a_fresh_memo() {
+    async fn not_produced_evidence_is_not_cached_and_recovery_reruns() {
         let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
+        let targets = check_targets("/tmp/not-produced-recovery", "head-a");
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let first_runs = Arc::clone(&runs);
+        let first = flight
+            .get_or_run(421, targets.clone(), move |_| {
+                first_runs.fetch_add(1, Ordering::SeqCst);
+                async { Ok(CheckEvidence::NotProduced) }
+            })
+            .await
+            .expect("not-produced verification result");
+        assert_eq!(first, CheckEvidence::NotProduced);
+        assert_eq!(
+            flight
+                .cached_read_only(421, &targets)
+                .expect("not-produced cache lookup"),
+            None,
+            "not-produced verification must not occupy the ten-minute cache"
+        );
+
+        let recovery_runs = Arc::clone(&runs);
+        let recovered = flight
+            .get_or_run(421, targets, move |_| {
+                recovery_runs.fetch_add(1, Ordering::SeqCst);
+                async { Ok(CheckEvidence::Passed) }
+            })
+            .await
+            .expect("recovered verification reruns");
+        assert_eq!(recovered, CheckEvidence::Passed);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cached_only_checks_never_start_a_runner_and_reuse_a_fresh_memo() {
+        let flight = Arc::new(CheckFlight::new(CHECK_EVIDENCE_TTL, 1));
         let runs = Arc::new(AtomicUsize::new(0));
         let post_samples = Arc::new(AtomicUsize::new(0));
         let without_cache_runs = Arc::clone(&runs);
@@ -4612,6 +5019,61 @@ mod tests {
             post_samples.load(Ordering::SeqCst),
             0,
             "cached-only must not re-sample targets"
+        );
+
+        let inflight_runs = Arc::new(AtomicUsize::new(0));
+        let runner_started = Arc::new(tokio::sync::Notify::new());
+        let allow_runner = Arc::new(tokio::sync::Notify::new());
+        let inflight_flight = Arc::clone(&flight);
+        let started = Arc::clone(&runner_started);
+        let allow = Arc::clone(&allow_runner);
+        let active_runs = Arc::clone(&inflight_runs);
+        let active = tokio::spawn(async move {
+            inflight_flight
+                .get_or_run(
+                    58,
+                    check_targets("/tmp/cached-only-inflight", "head-a"),
+                    move |_| async move {
+                        active_runs.fetch_add(1, Ordering::SeqCst);
+                        started.notify_one();
+                        allow.notified().await;
+                        Ok(CheckEvidence::Passed)
+                    },
+                )
+                .await
+        });
+        runner_started.notified().await;
+
+        let cached_only_runs = Arc::clone(&inflight_runs);
+        let during_inflight = tokio::time::timeout(
+            Duration::from_millis(100),
+            checks_for_targets_with_runner(
+                &flight,
+                CheckExecution::CachedOnly,
+                58,
+                check_targets("/tmp/cached-only-inflight", "head-a"),
+                move |_| async move {
+                    cached_only_runs.fetch_add(1, Ordering::SeqCst);
+                    Ok(CheckEvidence::Failing)
+                },
+            ),
+        )
+        .await
+        .expect("cached-only must not wait for an in-flight runner")
+        .expect("cached-only in-flight result");
+        assert_eq!(during_inflight, CheckEvidence::NotProduced);
+        assert_eq!(
+            inflight_runs.load(Ordering::SeqCst),
+            1,
+            "cached-only must not start a second runner while a matching flight is pending"
+        );
+        allow_runner.notify_one();
+        assert_eq!(
+            active
+                .await
+                .expect("in-flight runner task joins")
+                .expect("in-flight runner result"),
+            CheckEvidence::Passed
         );
 
         let initial_runs = Arc::clone(&runs);

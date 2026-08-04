@@ -2564,45 +2564,17 @@ pub async fn preview_brief(db: State<'_, Db>, direction_id: i32) -> R<String> {
     crate::brief::assemble(&db, direction_id).await.map_err(e)
 }
 
-/// Executable verification results per write repo of a direction (§4.13).
-#[derive(serde::Serialize)]
-pub struct RepoChecks {
-    pub repo: String,
-    pub worktree: String,
-    pub checks: Vec<crate::check::CheckResult>,
-}
+pub use crate::readiness::RepoChecks;
 
 /// Run the inferred check rungs in each of a direction's write worktrees.
-/// "worker done = checks green, not self-report." Runs off the async runtime.
+/// "worker done = checks green, not self-report." This delegates to the
+/// shared bounded readiness runner so explicit verification cannot race its
+/// cache, single-flight, or target-validation contract.
 #[tauri::command]
 pub async fn verify_direction(db: State<'_, Db>, direction_id: i32) -> R<Vec<RepoChecks>> {
-    let wts = repo::list_worktrees(&db, Some(direction_id))
+    crate::readiness::verify_direction(&db, direction_id)
         .await
-        .map_err(e)?;
-    let mut targets: Vec<(String, String)> = Vec::new();
-    for w in wts {
-        let name = repo::get_repo(&db, w.repo_id)
-            .await
-            .map_err(e)?
-            .map(|r| r.name)
-            .unwrap_or_else(|| format!("repo {}", w.repo_id));
-        targets.push((name, w.path));
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        targets
-            .into_iter()
-            .map(|(repo, worktree)| {
-                let checks = crate::check::run_checks(std::path::Path::new(&worktree));
-                RepoChecks {
-                    repo,
-                    worktree,
-                    checks,
-                }
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    .map_err(e)
+        .map_err(e)
 }
 
 // The built-in review-agent rung is gone: review now runs as the user's global
