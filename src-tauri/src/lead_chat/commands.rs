@@ -269,6 +269,40 @@ pub async fn lead_engine(
     // the tool child (today: only the codex computer-use bearer) — see
     // `bus::inject::Injection::env` / `engine::EngineInner::extra_env`.
     let mut extra_env: Vec<(String, String)> = vec![];
+    // Built BEFORE the injections below, and the ordering is load-bearing: this
+    // is the only fallible work left in this constructor, and the issue-lead
+    // branch below MINTS a computer bearer (rotating the identity's generation
+    // and, for claude, writing its config to disk). A `?` after that mint would
+    // return with no engine ever constructed — so nothing exists to tear down,
+    // and no teardown path can revoke what was just handed out. Failing first
+    // makes that unreachable instead of compensated for.
+    let system_prompt = if is_concierge {
+        concierge_prompt(lang)
+    } else if is_curator {
+        let repo_state =
+            crate::lead_chat::repo_state::render_repo_state(db, Some(t.workspace_id)).await?;
+        format!(
+            "{}{}\n\n{}",
+            curator_prompt(),
+            lang_directive(lang),
+            repo_state
+        )
+    } else {
+        let repos = repo::list_repos(db, t.workspace_id).await?;
+        let repo_state =
+            crate::lead_chat::repo_state::render_repo_state_from(Some(t.workspace_id), &repos);
+        format!(
+            "{}{}\n\n{}",
+            lead_prompt_for(needs_list_repos_directives(repos.len())),
+            lang_directive(lang),
+            repo_state
+        )
+    };
+    // Populated ONLY on the issue-lead branch below — concierge/curator must
+    // never receive computer use (see `EngineInner::computer_args`).
+    let mut computer_args: Vec<String> = vec![];
+    let mut computer_env: Vec<(String, String)> = vec![];
+    let mut computer_gen: Option<u64> = None;
     if is_concierge {
         // Concierge is the IM-scoped global helper, not a thread participant: it
         // gets weft_global, never the per-thread bus.
@@ -328,37 +362,21 @@ pub async fn lead_engine(
             // so it never has a `wt` to pin — always `None`.
             None,
         );
-        extra.extend(comp.args);
-        extra_env.extend(comp.env);
+        computer_args = comp.args;
+        computer_env = comp.env;
+        // The ownership stamp over a shared identity — see
+        // `EngineInner::computer_gen` for why a teardown needs it.
+        computer_gen = comp.computer_generation;
     }
-    // Deep-merge any duplicate OPENCODE_CONFIG_CONTENT entries the
-    // accumulated injections produced — `Command::envs` is last-wins per
-    // key, which would silently drop an earlier server's config (see
-    // `bus::inject::coalesce_env`).
+    // The computer halves stay in their OWN fields rather than being folded
+    // in here — they have to be replaceable at respawn (see
+    // `EngineInner::computer_args`). Concierge and curator leads never enter
+    // the branch above, so theirs stay empty, which is exactly what stops
+    // `refresh_computer_injection` from ever granting them the tool.
+    // `coalesce_env`'s OPENCODE_CONFIG_CONTENT deep-merge now runs at spawn
+    // assembly (`engine::spawn_env`) instead, where both halves are in hand.
     let extra_env = crate::bus::inject::coalesce_env(extra_env);
     push_model_arg(&mut extra, t.lead_model.as_deref());
-    let system_prompt = if is_concierge {
-        concierge_prompt(lang)
-    } else if is_curator {
-        let repo_state =
-            crate::lead_chat::repo_state::render_repo_state(db, Some(t.workspace_id)).await?;
-        format!(
-            "{}{}\n\n{}",
-            curator_prompt(),
-            lang_directive(lang),
-            repo_state
-        )
-    } else {
-        let repos = repo::list_repos(db, t.workspace_id).await?;
-        let repo_state =
-            crate::lead_chat::repo_state::render_repo_state_from(Some(t.workspace_id), &repos);
-        format!(
-            "{}{}\n\n{}",
-            lead_prompt_for(needs_list_repos_directives(repos.len())),
-            lang_directive(lang),
-            repo_state
-        )
-    };
     let stopped = matches!(
         repo::lead_status(db, thread_id)
             .await
@@ -375,6 +393,10 @@ pub async fn lead_engine(
         cwd,
         extra_args: extra,
         extra_env,
+        computer_args,
+        computer_env,
+        computer_gen,
+        acp_route_gen: None,
         system_prompt,
         native_id: repo::lead_native_id(db, thread_id).await.ok().flatten(),
         pending_context_digest: None,
@@ -1681,12 +1703,17 @@ pub(crate) async fn chat_open_worker_impl(
                 // multi-repo direction would otherwise fall back to.
                 Some(wt.id),
             );
-            extra.extend(comp.args);
-            extra_env.extend(comp.env);
-            // An opencode worker's session bus AND computer server BOTH ride
-            // OPENCODE_CONFIG_CONTENT — deep-merge the duplicate entries or
-            // `Command::envs`' last-wins drops the bus (see
-            // `bus::inject::coalesce_env`).
+            // Held in their OWN fields, not folded into extra/extra_env:
+            // a respawn has to be able to replace them (see
+            // `EngineInner::computer_args`). An opencode worker's session bus
+            // AND computer server both ride OPENCODE_CONFIG_CONTENT, so the
+            // `coalesce_env` deep-merge that used to run here now runs at
+            // spawn assembly (`engine::spawn_env`), where both halves are in
+            // hand — merging only `extra_env` here would leave the computer
+            // entry to clobber the bus one via `Command::envs`' last-wins.
+            let computer_args = comp.args;
+            let computer_env = comp.env;
+            let computer_gen = comp.computer_generation;
             let extra_env = crate::bus::inject::coalesce_env(extra_env);
             let mut inner = engine::EngineInner {
                 thread_id: dir.thread_id,
@@ -1696,6 +1723,10 @@ pub(crate) async fn chat_open_worker_impl(
                 cwd,
                 extra_args: extra,
                 extra_env,
+                computer_args,
+                computer_env,
+                computer_gen,
+                acp_route_gen: None,
                 system_prompt: String::new(),
                 native_id: native.clone(),
                 pending_context_digest: None,
@@ -1870,7 +1901,7 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
     // must fail closed: skip the computer injection entirely — this session
     // simply has no computer tool until a rebuild resolves its worktree —
     // rather than gambling on whichever worktree happens to sort first.
-    let (comp_args, comp_env) = match worktree_id {
+    let (comp_args, comp_env, comp_gen) = match worktree_id {
         Some(_) => {
             let comp = crate::bus::inject::inject_computer(
                 &base,
@@ -1879,15 +1910,19 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
                 &sess.tool,
                 worktree_id,
             );
-            (comp.args, comp.env)
+            (comp.args, comp.env, comp.computer_generation)
         }
-        None => (Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new(), None),
     };
-    extra.extend(comp_args);
-    extra_env.extend(comp_env);
-    // Same as the spawn path above — deep-merge the bus's and the computer
-    // server's OPENCODE_CONFIG_CONTENT entries (see
-    // `bus::inject::coalesce_env`).
+    // Same as the spawn path above: the computer halves stay in their own
+    // fields so a respawn can replace them, and the shared
+    // OPENCODE_CONFIG_CONTENT deep-merge moves to spawn assembly
+    // (`engine::spawn_env`). An unresolved worktree leaves both empty, which
+    // also permanently opts this session out of `refresh_computer_injection`
+    // — matching the fail-closed rule above rather than letting a later
+    // respawn quietly resolve a worktree and grant the tool.
+    let computer_args = comp_args;
+    let computer_env = comp_env;
     let extra_env = crate::bus::inject::coalesce_env(extra_env);
     push_model_arg(&mut extra, sess.model.as_deref());
     let mut inner = engine::EngineInner {
@@ -1898,6 +1933,10 @@ async fn worker_engine(app: &AppHandle, db: &Db, session_id: i32) -> anyhow::Res
         cwd,
         extra_args: extra,
         extra_env,
+        computer_args,
+        computer_env,
+        computer_gen: comp_gen,
+        acp_route_gen: None,
         system_prompt: String::new(),
         native_id: sess.native_session_id.clone(),
         pending_context_digest: None,

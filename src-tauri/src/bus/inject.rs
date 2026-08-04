@@ -32,6 +32,20 @@ pub struct Injection {
     /// `Command::envs` applies duplicate keys last-wins, which would silently
     /// drop the earlier server's config.
     pub env: Vec<(String, String)>,
+    /// The computer-use bearer generation this injection was minted at — set
+    /// ONLY by [`inject_computer`], `None` for every other producer.
+    ///
+    /// The spawn site records it so a later teardown can revoke the bearer it
+    /// handed to THIS child rather than whatever is current for the identity;
+    /// `computer_srv::revoke_computer_session_token_generation` documents the
+    /// false-revoke that distinction prevents. Returned here (rather than
+    /// re-read from the generation map afterwards) because a re-read races a
+    /// concurrent injection for the same identity.
+    ///
+    /// Set even when `args`/`env` came back EMPTY: the rotation happened
+    /// regardless, and a mint whose config could not be written is exactly the
+    /// one nothing else will ever clean up.
+    pub computer_generation: Option<u64>,
 }
 
 /// The one environment variable two different injections can both target —
@@ -107,13 +121,13 @@ impl Injection {
     /// The empty injection — no args, no env. The overwhelmingly common
     /// fallback shape in this module.
     fn none() -> Injection {
-        Injection { args: vec![], env: vec![] }
+        Injection { args: vec![], env: vec![], computer_generation: None }
     }
 
     /// An args-only injection (no env) — every producer that carries no env
     /// entry (most of this module).
     fn args_only(args: Vec<String>) -> Injection {
-        Injection { args, env: vec![] }
+        Injection { args, env: vec![], computer_generation: None }
     }
 }
 
@@ -221,8 +235,9 @@ pub fn acp_mcp_servers(
     include_curator: bool,
     include_computer: bool,
     computer_wt: Option<i32>,
-) -> Vec<crate::acp::McpServerSpec> {
+) -> AcpMcpInjection {
     let mut out = Vec::new();
+    let mut computer_generation = None;
     // Concierge is global-only (no per-thread bus) — same as inject_global path.
     if include_bus {
         out.push(crate::acp::McpServerSpec {
@@ -254,14 +269,35 @@ pub fn acp_mcp_servers(
         // to the predecessor and pins THIS injection's URL to its own bump
         // (see `computer_srv::rotate_and_mint_computer_session_token`), same
         // as `inject_computer` does for the non-ACP engines.
-        let key =
-            crate::bus::computer_srv::rotate_and_mint_computer_session_token(thread, dir, computer_wt);
+        let minted = crate::bus::computer_srv::rotate_and_mint_computer_session_token(
+            thread,
+            dir,
+            computer_wt,
+        );
         out.push(crate::acp::McpServerSpec {
             name: "weft_computer".into(),
-            url: computer_url_with_key(base, thread, dir, computer_wt, &key),
+            url: computer_url_with_key(base, thread, dir, computer_wt, &minted.token),
         });
+        computer_generation = Some(minted.generation);
     }
-    out
+    AcpMcpInjection {
+        servers: out,
+        computer_generation,
+    }
+}
+
+/// What [`acp_mcp_servers`] built: the MCP servers to hand the ACP session, and
+/// the computer-use bearer generation minted for it (`None` when
+/// `include_computer` was false).
+///
+/// ACP is the one engine shape whose computer bearer does NOT travel through
+/// [`Injection`] — MCP is supplied on `session/new|resume`, so `inject_computer`
+/// returns nothing for it. The generation still has to reach the engine, or its
+/// teardown has no bearer to revoke; this is the ACP analogue of
+/// [`Injection::computer_generation`], and carries it for the same reason.
+pub struct AcpMcpInjection {
+    pub servers: Vec<crate::acp::McpServerSpec>,
+    pub computer_generation: Option<u64>,
 }
 
 /// The shared, FAIL-CLOSED tail of both bash ask-hook scripts — claude's
@@ -502,6 +538,7 @@ fn opencode_env_config_injection(server: &str, url: &str) -> Injection {
         return Injection {
             args: vec![],
             env: vec![],
+            computer_generation: None,
         };
     };
     let mcp = root_obj
@@ -519,6 +556,7 @@ fn opencode_env_config_injection(server: &str, url: &str) -> Injection {
     Injection {
         args: vec![],
         env: vec![(OPENCODE_CONFIG_CONTENT_VAR.to_string(), root.to_string())],
+        computer_generation: None,
     }
 }
 
@@ -594,9 +632,10 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, wt: Optio
     // because bump and render share one critical section — can never hand
     // two overlapping injections the same latest-generation bearer (see
     // `computer_srv::rotate_and_mint_computer_session_token`).
-    let key = crate::bus::computer_srv::rotate_and_mint_computer_session_token(thread, dir, wt);
+    let minted = crate::bus::computer_srv::rotate_and_mint_computer_session_token(thread, dir, wt);
+    let key = minted.token;
     let url = computer_url_with_key(base, thread, dir, wt, &key);
-    match tool {
+    let mut injection = match tool {
         "claude" => inject_computer_claude(thread, dir, wt, &url),
         // codex is the ONE tool
         // whose injection rides argv (`-c` flags), and argv is world-readable
@@ -628,6 +667,7 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, wt: Optio
                 // produced above — never a separate re-read, which could
                 // render a LATER overlapping injection's generation.
                 env: vec![(COMPUTER_TOKEN_ENV_VAR.to_string(), key.clone())],
+                computer_generation: None,
             }
         }
         // The bearer-carrying URL rides the OPENCODE_CONFIG_CONTENT
@@ -646,7 +686,13 @@ pub fn inject_computer(base: &str, thread: i32, dir: &str, tool: &str, wt: Optio
         // env-carried secret (`Injection::env`'s codex bearer note).
         "opencode" => opencode_env_config_injection("weft_computer", &url),
         _ => Injection::none(),
-    }
+    };
+    // Stamped AFTER the match so no arm can forget it, and stamped even when
+    // the arm produced an empty injection — the rotation above already
+    // happened, and the caller needs the generation to revoke a bearer whose
+    // child never started. See `Injection::computer_generation`.
+    injection.computer_generation = Some(minted.generation);
+    injection
 }
 
 /// The environment variable name the codex computer-use injection routes the
@@ -1792,8 +1838,13 @@ mod tests {
         // Captured AFTER the call — the computer arm rotates this identity's
         // token generation before minting, so only the current render matches.
         let key = crate::bus::computer_srv::computer_session_token(631, "10", None);
-        assert!(with_computer.iter().any(|s| s.name == "weft_computer"
+        assert!(with_computer.servers.iter().any(|s| s.name == "weft_computer"
             && s.url == format!("http://127.0.0.1:9/computer/631/10/mcp?key={key}")));
+        assert!(
+            with_computer.computer_generation.is_some(),
+            "an ACP session that gets the computer server must report the generation \
+             it minted — that stamp is the engine's only way to revoke it later"
+        );
 
         let without_computer = acp_mcp_servers(
             "http://127.0.0.1:9",
@@ -1807,7 +1858,11 @@ mod tests {
             false,
             None,
         );
-        assert!(!without_computer.iter().any(|s| s.name == "weft_computer"));
+        assert!(!without_computer.servers.iter().any(|s| s.name == "weft_computer"));
+        assert!(
+            without_computer.computer_generation.is_none(),
+            "no computer server means nothing was minted, so there is no stamp"
+        );
     }
 
     /// `computer_wt` forwards into the injected
@@ -1829,7 +1884,7 @@ mod tests {
         // Captured AFTER the call — the computer arm rotates the identity's
         // token generation before minting.
         let key = crate::bus::computer_srv::computer_session_token(632, "10", Some(7));
-        assert!(with_wt.iter().any(|s| s.name == "weft_computer"
+        assert!(with_wt.servers.iter().any(|s| s.name == "weft_computer"
             && s.url == format!("http://127.0.0.1:9/computer/632/10/mcp?wt=7&key={key}")));
     }
 

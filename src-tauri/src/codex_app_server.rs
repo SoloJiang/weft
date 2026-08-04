@@ -728,6 +728,15 @@ impl Client {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    /// A handle with no connection behind it, for tests that only need
+    /// `codex_client: Some(..)` to stand for "an app-server connection is
+    /// live" — engine teardown decisions branch on the field's presence, not
+    /// on the connection's state.
+    #[cfg(test)]
+    pub fn disconnected_for_test() -> Client {
+        Client(Arc::new(Mutex::new(None)))
+    }
+
     /// Decline a non-approval server request so the turn doesn't hang, using the
     /// `decline_response` shape (or a JSON-RPC error when there's no in-protocol
     /// decline).
