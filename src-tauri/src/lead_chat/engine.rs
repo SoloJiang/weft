@@ -2926,6 +2926,21 @@ fn refresh_computer_injection(
     // nothing else would clean up). Dropping `fresh` here would revoke it —
     // correct, but the CALLER is the one that knows whether a child took it.
     let mint = fresh.computer_guard.take();
+    // PUBLISH the pending generation immediately, before returning to a caller
+    // that may await a long handshake before it can commit. The guard is a
+    // LOCAL and a concurrent Stop cannot see it; `computer_gen` is what
+    // `stop_quiet` reaches. Without this, a Stop landing during a codex
+    // connect or an ACP session open could only revoke the PREDECESSOR, while
+    // the bearer this mint already handed the backend through its environment
+    // stayed valid for the rest of the handshake.
+    //
+    // The two halves cover different failures and compose because revocation is
+    // compare-and-revoke — whichever fires second is inert:
+    //   * the stamp is reachable by a Stop that races the hand-off;
+    //   * the guard covers a path that returns with no Stop involved at all.
+    if let Some(mint) = &mint {
+        inner.computer_gen = Some(mint.generation());
+    }
     if fresh.args.is_empty() && fresh.env.is_empty() {
         return mint;
     }
@@ -2947,6 +2962,10 @@ fn commit_computer_mint(
     mint: Option<crate::bus::computer_srv::MintGuard>,
 ) {
     if let Some(mint) = mint {
+        // The stamp is normally already published (at mint time, so a racing
+        // Stop could reach it); re-asserting it keeps this the single place a
+        // caller has to think about, and covers the ACP path whose mint does
+        // not go through `refresh_computer_injection`.
         inner.computer_gen = Some(mint.commit());
     }
 }
@@ -5307,11 +5326,22 @@ async fn spawn_acp_turn(
         // rotated a fresh, VALID bearer for an engine the user just stopped,
         // undoing that revoke; the codex connect arm re-checks for the identical
         // reason.
-        let g = eng.lock().await;
+        let mut g = eng.lock().await;
         let cancelled =
             g.stopped || g.interrupting || expected_epoch.is_some_and(|e| e != g.reset_epoch);
         if cancelled {
             return Err(anyhow::anyhow!("engine stopped; not starting an ACP turn"));
+        }
+        // Publish the pending generation before the session open below, which
+        // awaits `session/new` or `session/resume` — a request that can sit
+        // through long flush and reply budgets. The guard is a local and a Stop
+        // landing in that window cannot see it; `computer_gen` is what
+        // `stop_quiet` revokes. `refresh_computer_injection` does the same for
+        // the three non-ACP shapes; ACP mints in `acp_mcp_servers` instead, so
+        // it has to publish here. Compare-and-revoke makes the guard's own
+        // later drop inert if the Stop got there first.
+        if let Some(mint) = &mint {
+            g.computer_gen = Some(mint.generation());
         }
     }
     let mcp = mcp.servers;

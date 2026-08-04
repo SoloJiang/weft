@@ -389,6 +389,20 @@ pub struct MintedBearer {
 ///
 /// The rule of thumb: if the code between "this is dead" and the return
 /// contains an `.await`, drop first.
+///
+/// # A guard is not reachable by anyone else
+///
+/// It is a LOCAL. A concurrent Stop, running on another task, cannot see it and
+/// cannot revoke through it. So a mint that will be held across a long
+/// hand-off — a codex app-server handshake, an ACP `session/new` — must ALSO
+/// publish its generation where a Stop looks (`EngineInner::computer_gen`),
+/// before entering that wait. The backend already has the bearer by then; the
+/// guard alone would only revoke once the wait finally returns.
+///
+/// The two are complementary, not redundant: the stamp covers a Stop that races
+/// the hand-off, the guard covers a path that returns with no Stop at all. They
+/// compose because revocation is compare-and-revoke — whichever fires second
+/// changes nothing.
 #[doc(hidden)]
 #[must_use = "an unheld mint is revoked on drop — commit it once a live child               or connection carries the bearer, or drop it deliberately"]
 pub struct MintGuard {
