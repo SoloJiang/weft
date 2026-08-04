@@ -269,6 +269,35 @@ pub async fn lead_engine(
     // the tool child (today: only the codex computer-use bearer) — see
     // `bus::inject::Injection::env` / `engine::EngineInner::extra_env`.
     let mut extra_env: Vec<(String, String)> = vec![];
+    // Built BEFORE the injections below, and the ordering is load-bearing: this
+    // is the only fallible work left in this constructor, and the issue-lead
+    // branch below MINTS a computer bearer (rotating the identity's generation
+    // and, for claude, writing its config to disk). A `?` after that mint would
+    // return with no engine ever constructed — so nothing exists to tear down,
+    // and no teardown path can revoke what was just handed out. Failing first
+    // makes that unreachable instead of compensated for.
+    let system_prompt = if is_concierge {
+        concierge_prompt(lang)
+    } else if is_curator {
+        let repo_state =
+            crate::lead_chat::repo_state::render_repo_state(db, Some(t.workspace_id)).await?;
+        format!(
+            "{}{}\n\n{}",
+            curator_prompt(),
+            lang_directive(lang),
+            repo_state
+        )
+    } else {
+        let repos = repo::list_repos(db, t.workspace_id).await?;
+        let repo_state =
+            crate::lead_chat::repo_state::render_repo_state_from(Some(t.workspace_id), &repos);
+        format!(
+            "{}{}\n\n{}",
+            lead_prompt_for(needs_list_repos_directives(repos.len())),
+            lang_directive(lang),
+            repo_state
+        )
+    };
     // Populated ONLY on the issue-lead branch below — concierge/curator must
     // never receive computer use (see `EngineInner::computer_args`).
     let mut computer_args: Vec<String> = vec![];
@@ -348,28 +377,6 @@ pub async fn lead_engine(
     // assembly (`engine::spawn_env`) instead, where both halves are in hand.
     let extra_env = crate::bus::inject::coalesce_env(extra_env);
     push_model_arg(&mut extra, t.lead_model.as_deref());
-    let system_prompt = if is_concierge {
-        concierge_prompt(lang)
-    } else if is_curator {
-        let repo_state =
-            crate::lead_chat::repo_state::render_repo_state(db, Some(t.workspace_id)).await?;
-        format!(
-            "{}{}\n\n{}",
-            curator_prompt(),
-            lang_directive(lang),
-            repo_state
-        )
-    } else {
-        let repos = repo::list_repos(db, t.workspace_id).await?;
-        let repo_state =
-            crate::lead_chat::repo_state::render_repo_state_from(Some(t.workspace_id), &repos);
-        format!(
-            "{}{}\n\n{}",
-            lead_prompt_for(needs_list_repos_directives(repos.len())),
-            lang_directive(lang),
-            repo_state
-        )
-    };
     let stopped = matches!(
         repo::lead_status(db, thread_id)
             .await

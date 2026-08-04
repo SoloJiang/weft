@@ -3146,12 +3146,23 @@ async fn ensure_running_locked(
         }
     }
     crate::process_quota::admit_new_work(app)?;
-    // A resident engine respawns from the argv/env it was CONSTRUCTED with,
-    // so the computer bearer in there may already have been revoked by a
-    // Stop. Re-mint it here, immediately before the spawn, so
-    // the new child starts with a live one.
-    let _ = refresh_computer_injection(app, inner);
     crate::claude::ensure_trusted(&inner.cwd);
+    // 先还旧槽,再排队要新的。走到这里 `child` 要么是 None、要么已被上面的
+    // try_wait 判定为死进程,它的 permit 是陈的;若留着不放就去 await 新槽,gate
+    // 打满时这个会话会卡在等一个它自己占着的槽上(自锁),得等别的会话结束才解开。
+    //
+    // 走 `release_child_slot`(而非裸释放):此刻还没有重铸,所以撤销打掉的正是
+    // 那个已死子进程的 bearer——它本该随进程一起死,而下面的排队可能很久。
+    release_child_slot(inner);
+    // 活跃会话软上限:拿一个会话槽,已满则在此排队等某个在跑的会话结束(与上面
+    // admit_new_work 的总进程数硬闸互补——那个拒绝、这个排队,不丢会话)。
+    let session_permit = crate::session_gate::acquire_session_slot().await;
+    // 重铸放在拿到槽位之后,不能提前。这个 await 在 gate 打满时可以阻塞任意久,
+    // 而 `ensure_running_locked` 全程握着引擎锁——期间 Stop 连锁都拿不到,更谈不上
+    // 撤销。若先铸币,一个全新的、有效的 bearer(claude 还会把它写进磁盘上的 MCP
+    // 配置)就会在没有任何子进程的情况下一直有效,同 uid 的进程读到即可用。
+    // 铸币必须紧贴 spawn,中间不留可阻塞的等待。
+    let _ = refresh_computer_injection(app, inner);
     // Resolve the actual binary: a per-session pin, else the global override for
     // "claude" (e.g. a user-aliased `cc-claude`), else "claude" itself.
     let program = crate::tool_command::effective(inner.command.as_deref(), &inner.tool);
@@ -3174,17 +3185,6 @@ async fn ensure_running_locked(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    // 先还旧槽,再排队要新的。走到这里 `child` 要么是 None、要么已被上面的
-    // try_wait 判定为死进程,它的 permit 是陈的;若留着不放就去 await 新槽,gate
-    // 打满时这个会话会卡在等一个它自己占着的槽上(自锁),得等别的会话结束才解开。
-    //
-    // 裸释放,不走 `release_child_slot`:上面的 `refresh_computer_injection`
-    // 已经重铸并轮转过 generation(死进程的 bearer 就此作废),而 command 也已
-    // 用新 env 建好;此处再撤销会把新子进程即将带走的令牌一起打掉。见该 helper 文档。
-    inner.child_permit = None;
-    // 活跃会话软上限:拿一个会话槽,已满则在此排队等某个在跑的会话结束(与上面
-    // admit_new_work 的总进程数硬闸互补——那个拒绝、这个排队,不丢会话)。
-    let session_permit = crate::session_gate::acquire_session_slot().await;
     // T1: own process group + marker before spawn, register PAIRED with the child.
     let configured = crate::proc_registry::configure(&mut command, owner);
     let spawned = command.spawn();
@@ -7468,6 +7468,13 @@ async fn spawn_turn(
     let adapter = crate::adapters::adapter_for(&inner.tool)
         .ok_or_else(|| anyhow::anyhow!("unknown per-turn lead tool {}", inner.tool))?;
     adapter.prepare(&inner.cwd);
+    // 活跃会话软上限:拿一个会话槽,已满则排队(与 admit_new_work 硬闸互补)。
+    // Hoisted ABOVE the re-mint: this await can block for as long as the gate
+    // stays saturated, and `spawn_turn` holds the engine lock across it — so a
+    // bearer minted first would be live, with no child and no way for Stop to
+    // acquire the lock and revoke it, for the whole queue wait. The mint must
+    // sit flush against the spawn, with nothing blocking in between.
+    let session_permit = crate::session_gate::acquire_session_slot().await;
     // Re-mint the computer bearer before this turn's child — a per-turn tool
     // spawns from the engine's stored injection just like the resident path,
     // so a Stop-revoked bearer would otherwise ride into the new process
@@ -7508,8 +7515,6 @@ async fn spawn_turn(
         // stderr → app log: a per-turn CLI that dies prints its reason there.
         .stderr(std::process::Stdio::inherit())
         .kill_on_drop(true);
-    // 活跃会话软上限:拿一个会话槽,已满则排队(与 admit_new_work 硬闸互补)。
-    let session_permit = crate::session_gate::acquire_session_slot().await;
     // T1: own process group + marker before spawn, register PAIRED with the child.
     let configured = crate::proc_registry::configure(&mut command, owner);
     let spawned = command.spawn();
