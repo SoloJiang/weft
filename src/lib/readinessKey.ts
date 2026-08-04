@@ -7,6 +7,13 @@ export interface ReadinessDirectionSignature {
 
 export interface ReadinessWorktreeSignature {
   directionId: number;
+  /** Stable row identity; avoids placing a local filesystem path in the key. */
+  worktreeId?: number;
+  exists: boolean;
+}
+
+export interface ReadinessWorktreeRow {
+  id: number;
   exists: boolean;
 }
 
@@ -58,6 +65,44 @@ const URGENT_LANE_READINESS: Record<LaneReadiness, boolean> = {
   failed: true,
 };
 
+function compareReadinessWorktrees(
+  left: ReadinessWorktreeSignature,
+  right: ReadinessWorktreeSignature,
+): number {
+  const directionOrder = left.directionId - right.directionId;
+  if (directionOrder !== 0) {
+    return directionOrder;
+  }
+  const leftWorktreeId = left.worktreeId ?? left.directionId;
+  const rightWorktreeId = right.worktreeId ?? right.directionId;
+  const worktreeOrder = leftWorktreeId - rightWorktreeId;
+  if (worktreeOrder !== 0) {
+    return worktreeOrder;
+  }
+  return Number(left.exists) - Number(right.exists);
+}
+
+function readinessWorktreeIdentity(worktree: ReadinessWorktreeSignature): string {
+  if (worktree.worktreeId == null) {
+    return String(worktree.directionId);
+  }
+  return `${worktree.directionId}:${worktree.worktreeId}`;
+}
+
+/** Preserve every registered worktree row while omitting irrelevant metadata. */
+export function buildReadinessWorktreeSignatures(
+  directions: ReadinessDirectionSignature[],
+  worktreesByDirection: Record<number, ReadinessWorktreeRow[]>,
+): ReadinessWorktreeSignature[] {
+  return directions.flatMap((direction) =>
+    (worktreesByDirection[direction.id] ?? []).map((worktree) => ({
+      directionId: direction.id,
+      worktreeId: worktree.id,
+      exists: worktree.exists,
+    })),
+  );
+}
+
 /** The newest known session per relevant direction, in deterministic order. */
 export function latestWorkerSessionSignatures(
   directionIds: number[],
@@ -87,8 +132,8 @@ export function buildReadinessKey(input: ReadinessKeyInput): string {
     .join(",");
   const attentionIds = [...input.attentionIds].sort().join(",");
   const worktrees = [...input.worktrees]
-    .sort((left, right) => left.directionId - right.directionId)
-    .map((worktree) => `${worktree.directionId}:${worktree.exists}`)
+    .sort(compareReadinessWorktrees)
+    .map((worktree) => `${readinessWorktreeIdentity(worktree)}:${worktree.exists}`)
     .join(",");
   const workerSessions = latestWorkerSessionSignatures(
     input.directions.map((direction) => direction.id),

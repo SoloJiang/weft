@@ -27,10 +27,14 @@ type ReadinessChipComponent = (props: {
 
 let componentPromise: Promise<ReadinessChipComponent> | undefined;
 type ReadinessKeyModule = {
+  buildReadinessWorktreeSignatures(
+    directions: { id: number; status: string }[],
+    worktreesByDirection: Record<number, { id: number; exists: boolean }[]>,
+  ): { directionId: number; worktreeId?: number; exists: boolean }[];
   buildReadinessKey(input: {
     directions: { id: number; status: string }[];
     attentionIds: string[];
-    worktrees: { directionId: number; exists: boolean }[];
+    worktrees: { directionId: number; worktreeId?: number; exists: boolean }[];
     workerSessions: { directionId: number; sessionId: number; status: string }[];
     planStatus: string | null;
     prRevision: number;
@@ -340,6 +344,71 @@ test("worktree removal synchronously hides an otherwise ready verdict", async ()
     selectVisibleReadiness(stored, 17, removedKey),
     { kind: "loading" },
     "the prior review-ready result is hidden before the refresh effect runs",
+  );
+});
+
+test("reclaiming one of two worktrees invalidates readiness deterministically", async () => {
+  const {
+    buildReadinessKey,
+    buildReadinessWorktreeSignatures,
+    selectVisibleReadiness,
+  } = await loadReadinessKey();
+  const base = {
+    directions: [{ id: 17, status: "review" }],
+    attentionIds: [],
+    workerSessions: [],
+    planStatus: null,
+    prRevision: 0,
+  };
+  const existingWorktrees = {
+    17: [
+      { id: 101, exists: true, path: "/private/repo-a" },
+      { id: 102, exists: true, path: "/private/repo-b" },
+    ],
+  };
+  const liveWorktreeSignatures = buildReadinessWorktreeSignatures(
+    base.directions,
+    existingWorktrees,
+  );
+  const liveKey = buildReadinessKey({ ...base, worktrees: liveWorktreeSignatures });
+  const reorderedLiveKey = buildReadinessKey({
+    ...base,
+    worktrees: buildReadinessWorktreeSignatures(base.directions, {
+      17: [...existingWorktrees[17]].reverse(),
+    }),
+  });
+  const reclaimedKey = buildReadinessKey({
+    ...base,
+    worktrees: buildReadinessWorktreeSignatures(base.directions, {
+      17: [
+        { id: 102, exists: false, path: "/private/repo-b" },
+        { id: 101, exists: true, path: "/private/repo-a" },
+      ],
+    }),
+  });
+  const ready = { kind: "ready" as const, dto: { readiness: "review_ready", reasons: [] } };
+  const stored = { threadId: 17, key: liveKey, state: ready };
+
+  assert.equal(
+    liveKey,
+    reorderedLiveKey,
+    "worktree row ordering does not change the refresh key",
+  );
+  assert.deepEqual(liveWorktreeSignatures, [
+    { directionId: 17, worktreeId: 101, exists: true },
+    { directionId: 17, worktreeId: 102, exists: true },
+  ]);
+  assert.match(liveKey, /worktrees:17:101:true,17:102:true/);
+  assert.doesNotMatch(liveKey, /private/);
+  assert.notEqual(
+    liveKey,
+    reclaimedKey,
+    "reclaiming one worktree changes the key even while another remains",
+  );
+  assert.deepEqual(
+    selectVisibleReadiness(stored, 17, reclaimedKey),
+    { kind: "loading" },
+    "the old review-ready verdict is hidden while the reclaimed row refreshes",
   );
 });
 

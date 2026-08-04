@@ -42,6 +42,7 @@ import { LeadTab } from "../session/LeadTab";
 import { cn } from "../lib/cn";
 import {
   beginReadinessRefresh,
+  buildReadinessWorktreeSignatures,
   buildReadinessKey,
   completeReadinessRefresh,
   failReadinessRefresh,
@@ -113,10 +114,10 @@ export function ThreadBoard() {
   const attentionIds = attentionItems
     .filter((item) => attentionThreadId(item) === activeThreadId)
     .map((item) => item.id);
-  const worktreeSignatures = activeDirections.map((direction) => ({
-    directionId: direction.id,
-    exists: (worktreesByDirection[direction.id] ?? []).some((worktree) => worktree.exists),
-  }));
+  const worktreeSignatures = buildReadinessWorktreeSignatures(
+    activeDirections,
+    worktreesByDirection,
+  );
   const readinessKey = buildReadinessKey({
     directions: activeDirections,
     attentionIds,
