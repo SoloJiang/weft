@@ -89,13 +89,21 @@
 //! work into automatic build/test execution.
 //!
 //! Readiness checks reuse `check::infer_checks`, but run each inferred rung in
-//! a kill-on-drop Tokio child with a 120-second per-rung deadline. A timeout or
-//! child-wait failure is `NotProduced`, so the result remains fail-closed while
-//! the direction lock and global runner permit are released. Completed output
-//! uses the same combined-output, 2000-byte tail convention as `CheckResult`.
+//! a kill-on-drop Tokio child with a 120-second per-rung deadline. On Unix each
+//! child leads its own process group, and a timeout or child-wait failure kills
+//! that whole group before returning `NotProduced`; non-Unix platforms retain
+//! the direct-child kill-on-drop fallback. A completed failing rung remains
+//! `Failing` even if a later rung times out or cannot be awaited. Completed
+//! output uses the same combined-output, 2000-byte tail convention as
+//! `CheckResult`.
 //! The process-local single-flight cache is valid for at most 10 minutes and
-//! only while its sorted worktree-path signature and every worktree HEAD SHA
+//! only while its sorted worktree-path, HEAD-SHA, and clean-worktree signatures
 //! match the newly collected values; any HEAD change immediately reruns checks.
+//! A dirty worktree invalidates any prior entry and is intentionally
+//! uncacheable, so uncommitted changes can never inherit a previously passing
+//! result. Requests that observed the same dirty signature while its one
+//! execution is still in flight share that execution only; its result is
+//! discarded as soon as the flight completes.
 //!
 //! Upstream evidence is collected from the established
 //! `repo::upstream_merge_state` contract:
@@ -159,7 +167,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{watch, Mutex as AsyncMutex, Semaphore};
 
 /// Whether a direction is admitted to delivery work by the settled policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -743,6 +751,7 @@ struct CachedCheckEvidence {
     collected_at: Instant,
     path_signature: Vec<String>,
     head_signature: Vec<String>,
+    dirty_signature: Vec<bool>,
     evidence: CheckEvidence,
 }
 
@@ -750,6 +759,54 @@ struct CachedCheckEvidence {
 struct CheckTarget {
     path: String,
     head_sha: String,
+    dirty: bool,
+}
+
+type SharedCheckResult = std::result::Result<CheckEvidence, String>;
+
+struct InflightCheck {
+    targets: Vec<CheckTarget>,
+    receiver: watch::Receiver<Option<SharedCheckResult>>,
+}
+
+enum CheckFlightClaim<'a> {
+    Leader(CheckFlightLeader<'a>),
+    Follower(watch::Receiver<Option<SharedCheckResult>>),
+    WaitForDifferentTargets(watch::Receiver<Option<SharedCheckResult>>),
+}
+
+/// Removes and resolves a claimed flight if its owner is cancelled. The
+/// bounded child runner handles process cleanup; this guard makes sure peers
+/// are not left waiting on a direction flight that will never publish.
+struct CheckFlightLeader<'a> {
+    flight: &'a CheckFlight,
+    direction_id: i32,
+    targets: Vec<CheckTarget>,
+    sender: Option<watch::Sender<Option<SharedCheckResult>>>,
+}
+
+impl CheckFlightLeader<'_> {
+    fn finish(mut self, result: SharedCheckResult) -> Result<()> {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(Some(result));
+        }
+        self.flight
+            .remove_inflight(self.direction_id, &self.targets)
+    }
+}
+
+impl Drop for CheckFlightLeader<'_> {
+    fn drop(&mut self) {
+        let Some(sender) = self.sender.take() else {
+            return;
+        };
+        let _ = sender.send(Some(Err(
+            "readiness check flight was cancelled before publishing evidence".to_string(),
+        )));
+        let _ = self
+            .flight
+            .remove_inflight(self.direction_id, &self.targets);
+    }
 }
 
 /// Process-local coordination for readiness-triggered verification. The cache
@@ -758,6 +815,7 @@ struct CheckTarget {
 /// cannot inherit prior evidence.
 struct CheckFlight {
     cache: Mutex<HashMap<i32, CachedCheckEvidence>>,
+    inflight: Mutex<HashMap<i32, InflightCheck>>,
     direction_locks: Mutex<HashMap<i32, Arc<AsyncMutex<()>>>>,
     runner_limit: Semaphore,
     ttl: Duration,
@@ -767,38 +825,121 @@ impl CheckFlight {
     fn new(ttl: Duration, max_concurrent_runners: usize) -> Self {
         Self {
             cache: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
             direction_locks: Mutex::new(HashMap::new()),
             runner_limit: Semaphore::new(max_concurrent_runners),
             ttl,
         }
     }
 
-    fn signatures(targets: &[CheckTarget]) -> (Vec<String>, Vec<String>) {
+    fn signatures(targets: &[CheckTarget]) -> (Vec<String>, Vec<String>, Vec<bool>) {
         let paths = targets.iter().map(|target| target.path.clone()).collect();
         let heads = targets
             .iter()
             .map(|target| target.head_sha.clone())
             .collect();
-        (paths, heads)
+        let dirty = targets.iter().map(|target| target.dirty).collect();
+        (paths, heads, dirty)
     }
 
     fn cached(&self, direction_id: i32, targets: &[CheckTarget]) -> Result<Option<CheckEvidence>> {
-        let cache = self
+        let mut cache = self
             .cache
             .lock()
             .map_err(|_| anyhow!("readiness check cache lock poisoned"))?;
+        let (path_signature, head_signature, dirty_signature) = Self::signatures(targets);
+        // A dirty worktree may have changed after the cached pass, even when
+        // HEAD did not. Invalidate rather than merely skip it so a later clean
+        // status cannot resurrect evidence from before the dirty interval.
+        if dirty_signature.iter().any(|dirty| *dirty) {
+            cache.remove(&direction_id);
+            return Ok(None);
+        }
         let Some(entry) = cache.get(&direction_id) else {
             return Ok(None);
         };
         let is_fresh = Instant::now().saturating_duration_since(entry.collected_at) < self.ttl;
-        let (path_signature, head_signature) = Self::signatures(targets);
         if entry.path_signature == path_signature
             && entry.head_signature == head_signature
+            && entry.dirty_signature == dirty_signature
             && is_fresh
         {
             return Ok(Some(entry.evidence));
         }
         Ok(None)
+    }
+
+    fn claim_inflight(
+        &self,
+        direction_id: i32,
+        targets: &[CheckTarget],
+    ) -> Result<CheckFlightClaim<'_>> {
+        let mut inflight = self
+            .inflight
+            .lock()
+            .map_err(|_| anyhow!("readiness check flight map lock poisoned"))?;
+        if let Some(existing) = inflight.get(&direction_id) {
+            if existing.targets == targets {
+                return Ok(CheckFlightClaim::Follower(existing.receiver.clone()));
+            }
+            return Ok(CheckFlightClaim::WaitForDifferentTargets(
+                existing.receiver.clone(),
+            ));
+        }
+
+        let (sender, receiver) = watch::channel::<Option<SharedCheckResult>>(None);
+        inflight.insert(
+            direction_id,
+            InflightCheck {
+                targets: targets.to_vec(),
+                receiver,
+            },
+        );
+        Ok(CheckFlightClaim::Leader(CheckFlightLeader {
+            flight: self,
+            direction_id,
+            targets: targets.to_vec(),
+            sender: Some(sender),
+        }))
+    }
+
+    fn remove_inflight(&self, direction_id: i32, targets: &[CheckTarget]) -> Result<()> {
+        let mut inflight = self
+            .inflight
+            .lock()
+            .map_err(|_| anyhow!("readiness check flight map lock poisoned"))?;
+        let should_remove = inflight
+            .get(&direction_id)
+            .is_some_and(|existing| existing.targets == targets);
+        if should_remove {
+            inflight.remove(&direction_id);
+        }
+        Ok(())
+    }
+
+    fn shared_result(result: SharedCheckResult) -> Result<CheckEvidence> {
+        match result {
+            Ok(evidence) => Ok(evidence),
+            Err(message) => Err(anyhow!(message)),
+        }
+    }
+
+    async fn wait_for_inflight(
+        mut receiver: watch::Receiver<Option<SharedCheckResult>>,
+    ) -> Result<CheckEvidence> {
+        loop {
+            if let Some(result) = receiver.borrow().clone() {
+                return Self::shared_result(result);
+            }
+            if receiver.changed().await.is_err() {
+                if let Some(result) = receiver.borrow().clone() {
+                    return Self::shared_result(result);
+                }
+                return Err(anyhow!(
+                    "readiness check flight ended without publishing evidence"
+                ));
+            }
+        }
     }
 
     fn direction_lock(&self, direction_id: i32) -> Result<Arc<AsyncMutex<()>>> {
@@ -822,13 +963,18 @@ impl CheckFlight {
             .cache
             .lock()
             .map_err(|_| anyhow!("readiness check cache lock poisoned"))?;
-        let (path_signature, head_signature) = Self::signatures(targets);
+        let (path_signature, head_signature, dirty_signature) = Self::signatures(targets);
+        if dirty_signature.iter().any(|dirty| *dirty) {
+            cache.remove(&direction_id);
+            return Ok(());
+        }
         cache.insert(
             direction_id,
             CachedCheckEvidence {
                 collected_at: Instant::now(),
                 path_signature,
                 head_signature,
+                dirty_signature,
                 evidence,
             },
         );
@@ -849,26 +995,54 @@ impl CheckFlight {
             left.path
                 .cmp(&right.path)
                 .then(left.head_sha.cmp(&right.head_sha))
+                .then(left.dirty.cmp(&right.dirty))
         });
         if let Some(evidence) = self.cached(direction_id, &targets)? {
             return Ok(evidence);
         }
 
-        let direction_lock = self.direction_lock(direction_id)?;
-        let _direction_guard = direction_lock.lock().await;
-        if let Some(evidence) = self.cached(direction_id, &targets)? {
-            return Ok(evidence);
-        }
+        loop {
+            match self.claim_inflight(direction_id, &targets)? {
+                CheckFlightClaim::Follower(receiver) => {
+                    return Self::wait_for_inflight(receiver).await;
+                }
+                CheckFlightClaim::WaitForDifferentTargets(receiver) => {
+                    // A different worktree signature is currently running for
+                    // this direction. It cannot contribute evidence to this
+                    // caller, but waiting preserves the per-direction runner
+                    // serialization before this caller samples its own result.
+                    let _ = Self::wait_for_inflight(receiver).await;
+                    if let Some(evidence) = self.cached(direction_id, &targets)? {
+                        return Ok(evidence);
+                    }
+                }
+                CheckFlightClaim::Leader(leader) => {
+                    let direction_lock = self.direction_lock(direction_id)?;
+                    let _direction_guard = direction_lock.lock().await;
+                    if let Some(evidence) = self.cached(direction_id, &targets)? {
+                        let shared_result = Ok(evidence);
+                        leader.finish(shared_result)?;
+                        return Ok(evidence);
+                    }
 
-        let _runner_permit = self
-            .runner_limit
-            .acquire()
-            .await
-            .map_err(|_| anyhow!("readiness check runner semaphore closed"))?;
-        let paths = targets.iter().map(|target| target.path.clone()).collect();
-        let evidence = runner(paths).await?;
-        self.cache_result(direction_id, &targets, evidence)?;
-        Ok(evidence)
+                    let _runner_permit = self
+                        .runner_limit
+                        .acquire()
+                        .await
+                        .map_err(|_| anyhow!("readiness check runner semaphore closed"))?;
+                    let paths = targets.iter().map(|target| target.path.clone()).collect();
+                    let shared_result = match runner(paths).await {
+                        Ok(evidence) => match self.cache_result(direction_id, &targets, evidence) {
+                            Ok(()) => Ok(evidence),
+                            Err(error) => Err(error.to_string()),
+                        },
+                        Err(error) => Err(error.to_string()),
+                    };
+                    leader.finish(shared_result.clone())?;
+                    return Self::shared_result(shared_result);
+                }
+            }
+        }
     }
 }
 
@@ -934,6 +1108,41 @@ async fn reconciliation_for(
     Ok(ExecutionReconciliation::Matched)
 }
 
+/// Read the inexpensive tracked/untracked worktree signal used by the check
+/// cache. This mirrors the existing `git.rs` read-only command convention and
+/// intentionally treats a probe failure as unavailable evidence at the caller.
+fn worktree_is_dirty(path: &Path) -> Result<bool> {
+    let output = std::process::Command::new("git")
+        .env("PATH", crate::detect::tool_path())
+        .args(["status", "--porcelain"])
+        .current_dir(path)
+        .output()
+        .map_err(|error| {
+            anyhow!(
+                "could not inspect worktree status at {}: {error}",
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git status failed at {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(!output.stdout.is_empty())
+}
+
+fn check_target_for_worktree(path: &Path, stored_path: String) -> Result<CheckTarget> {
+    let head_sha = crate::git::head_commit_full(path)
+        .ok_or_else(|| anyhow!("could not resolve worktree HEAD at {}", path.display()))?;
+    Ok(CheckTarget {
+        path: stored_path,
+        head_sha,
+        dirty: worktree_is_dirty(path)?,
+    })
+}
+
 async fn checks_for_with_runner<F, Fut>(
     db: &Db,
     direction: &direction::Model,
@@ -955,13 +1164,15 @@ where
         if !path.is_dir() {
             continue;
         }
-        let Some(head_sha) = crate::git::head_commit_full(path) else {
-            return Ok(CheckEvidence::NotProduced);
+        let target = match check_target_for_worktree(path, worktree.path.clone()) {
+            Ok(target) => target,
+            Err(_) => {
+                // A worktree whose cheap read-only state cannot be inspected
+                // cannot safely inherit cached verification evidence.
+                return Ok(CheckEvidence::NotProduced);
+            }
         };
-        targets.push(CheckTarget {
-            path: worktree.path,
-            head_sha,
-        });
+        targets.push(target);
     }
     if targets.is_empty() {
         return Ok(CheckEvidence::NotProduced);
@@ -986,6 +1197,36 @@ fn check_output_tail(output: &str, max: usize) -> String {
     format!("…\n{}", slice.trim_end())
 }
 
+/// A Unix check command owns a fresh process group. Keep the group armed until
+/// the direct child has been reaped successfully so cancellation, timeout, or a
+/// child-wait error cannot strand ordinary descendants such as compilers.
+#[cfg(unix)]
+struct BoundedCheckProcessGroup {
+    pgid: Option<i32>,
+}
+
+#[cfg(unix)]
+impl BoundedCheckProcessGroup {
+    fn from_child_id(child_id: Option<u32>) -> Self {
+        Self {
+            pgid: child_id.map(|pid| pid as i32),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.pgid = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BoundedCheckProcessGroup {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid.take() {
+            crate::proc_registry::kill_group(pgid);
+        }
+    }
+}
+
 async fn run_bounded_check(
     cwd: &Path,
     check: &crate::check::Check,
@@ -1000,6 +1241,13 @@ async fn run_bounded_check(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        // Mirror hook_test_support's bounded-hook runner: a group owned by
+        // this check lets the timeout reap normal shell/compiler descendants,
+        // rather than leaving them alive after the direct child is dropped.
+        command.process_group(0);
+    }
     let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -1011,11 +1259,23 @@ async fn run_bounded_check(
             }));
         }
     };
+    #[cfg(unix)]
+    // process_group(0) makes the direct child the group leader. The guard
+    // remains armed if this future is abandoned before the wait completes.
+    let mut process_group = BoundedCheckProcessGroup::from_child_id(child.id());
     // `wait_with_output` owns the child. When this deadline elapses, dropping
-    // that future drops the kill-on-drop child; the unknown result must never
-    // retain a CheckFlight direction lock or global runner permit.
+    // that future drops the kill-on-drop child. On Unix, sweep that child's
+    // dedicated process group too, so descendants cannot retain a CheckFlight
+    // direction lock or global runner permit.
     let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => output,
+        Ok(Ok(output)) => {
+            #[cfg(unix)]
+            process_group.disarm();
+            output
+        }
+        // Returning drops the armed Unix group guard after kill_on_drop
+        // disposes of the direct child. That covers both timeout and outer
+        // future cancellation without relying on a best-effort child wait.
         Ok(Err(_)) | Err(_) => return Ok(None),
     };
     let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -1038,35 +1298,43 @@ async fn run_checks_with_timeout(
     checks: &[crate::check::Check],
     timeout: Duration,
 ) -> Result<CheckEvidence> {
-    let mut evidence = CheckEvidence::Passed;
+    let mut saw_not_produced = false;
+    let mut saw_failure = false;
     for check in checks {
-        let Some(result) = run_bounded_check(cwd, check, timeout).await? else {
-            return Ok(CheckEvidence::NotProduced);
-        };
-        if result.status == "fail" {
-            evidence = CheckEvidence::Failing;
+        match run_bounded_check(cwd, check, timeout).await? {
+            Some(result) if result.status == "fail" => saw_failure = true,
+            Some(_) => {}
+            None => saw_not_produced = true,
         }
     }
-    Ok(evidence)
+    if saw_failure {
+        return Ok(CheckEvidence::Failing);
+    }
+    if saw_not_produced {
+        return Ok(CheckEvidence::NotProduced);
+    }
+    Ok(CheckEvidence::Passed)
 }
 
 async fn run_readiness_checks(paths: Vec<String>, timeout: Duration) -> Result<CheckEvidence> {
-    let mut evidence = CheckEvidence::Passed;
+    let mut saw_not_produced = false;
+    let mut saw_failure = false;
     for path in paths {
         let checks = crate::check::infer_checks(Path::new(&path));
         let path_evidence = run_checks_with_timeout(Path::new(&path), &checks, timeout).await?;
-        if path_evidence == CheckEvidence::NotProduced {
-            return Ok(CheckEvidence::NotProduced);
-        }
         if path_evidence == CheckEvidence::Failing {
-            evidence = CheckEvidence::Failing;
-            continue;
-        }
-        if path_evidence == CheckEvidence::NotProduced && evidence != CheckEvidence::Failing {
-            evidence = CheckEvidence::NotProduced;
+            saw_failure = true;
+        } else if path_evidence == CheckEvidence::NotProduced {
+            saw_not_produced = true;
         }
     }
-    Ok(evidence)
+    if saw_failure {
+        return Ok(CheckEvidence::Failing);
+    }
+    if saw_not_produced {
+        return Ok(CheckEvidence::NotProduced);
+    }
+    Ok(CheckEvidence::Passed)
 }
 
 async fn checks_for(db: &Db, direction: &direction::Model) -> Result<CheckEvidence> {
@@ -1384,10 +1652,56 @@ mod tests {
     }
 
     fn check_targets(path: &str, head_sha: &str) -> Vec<CheckTarget> {
+        check_targets_with_dirty(path, head_sha, false)
+    }
+
+    fn check_targets_with_dirty(path: &str, head_sha: &str, dirty: bool) -> Vec<CheckTarget> {
         vec![CheckTarget {
             path: path.to_string(),
             head_sha: head_sha.to_string(),
+            dirty,
         }]
+    }
+
+    fn git_in(path: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .expect("run git test fixture command");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn shell_check(name: &str, script: &str) -> crate::check::Check {
+        crate::check::Check {
+            name: name.to_string(),
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+        }
+    }
+
+    #[cfg(unix)]
+    fn shell_single_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+
+    #[cfg(unix)]
+    fn process_is_live(pid: i32) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output();
+        let Ok(output) = output else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        !state.is_empty() && !state.starts_with('Z')
     }
 
     fn verdict(facts: &LaneFacts) -> (LaneReadiness, Option<ReasonCode>) {
@@ -1956,6 +2270,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_flight_invalidates_passing_evidence_for_uncommitted_worktree_changes() {
+        let root = tempfile::tempdir().expect("temporary git worktree fixture");
+        std::fs::write(root.path().join("README.md"), "green\n").expect("write initial file");
+        git_in(root.path(), &["init", "--quiet"]);
+        git_in(
+            root.path(),
+            &["config", "user.email", "readiness@example.invalid"],
+        );
+        git_in(root.path(), &["config", "user.name", "Readiness Test"]);
+        git_in(root.path(), &["add", "README.md"]);
+        git_in(root.path(), &["commit", "--quiet", "-m", "fixture"]);
+
+        let stored_path = root.path().display().to_string();
+        let clean_target =
+            check_target_for_worktree(root.path(), stored_path.clone()).expect("clean target");
+        assert!(!clean_target.dirty, "freshly committed worktree is clean");
+        let clean_head = clean_target.head_sha.clone();
+
+        let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let initial_runs = Arc::clone(&runs);
+        let initial = flight
+            .get_or_run(43, vec![clean_target], move |_| {
+                let initial_runs = Arc::clone(&initial_runs);
+                async move {
+                    initial_runs.fetch_add(1, Ordering::SeqCst);
+                    Ok(CheckEvidence::Passed)
+                }
+            })
+            .await
+            .expect("initial clean check");
+        assert_eq!(initial, CheckEvidence::Passed);
+
+        std::fs::write(root.path().join("README.md"), "red\n").expect("make uncommitted change");
+        let dirty_target =
+            check_target_for_worktree(root.path(), stored_path.clone()).expect("dirty target");
+        assert_eq!(
+            dirty_target.head_sha, clean_head,
+            "uncommitted changes preserve HEAD"
+        );
+        assert!(
+            dirty_target.dirty,
+            "modified tracked file makes target dirty"
+        );
+
+        let dirty_runs = Arc::clone(&runs);
+        let dirty = flight
+            .get_or_run(43, vec![dirty_target], move |_| {
+                let dirty_runs = Arc::clone(&dirty_runs);
+                async move {
+                    dirty_runs.fetch_add(1, Ordering::SeqCst);
+                    Ok(CheckEvidence::Failing)
+                }
+            })
+            .await
+            .expect("dirty worktree reruns checks");
+        assert_eq!(dirty, CheckEvidence::Failing);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+        std::fs::write(root.path().join("README.md"), "green\n").expect("restore tracked file");
+        let restored_target =
+            check_target_for_worktree(root.path(), stored_path).expect("restored clean target");
+        assert!(!restored_target.dirty, "restored worktree is clean");
+        let restored_runs = Arc::clone(&runs);
+        let restored = flight
+            .get_or_run(43, vec![restored_target], move |_| {
+                let restored_runs = Arc::clone(&restored_runs);
+                async move {
+                    restored_runs.fetch_add(1, Ordering::SeqCst);
+                    Ok(CheckEvidence::Passed)
+                }
+            })
+            .await
+            .expect("clean state after dirty interval reruns checks");
+        assert_eq!(restored, CheckEvidence::Passed);
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
     async fn check_flight_reruns_after_ttl_expiry() {
         let flight = CheckFlight::new(Duration::ZERO, 2);
         let runs = Arc::new(AtomicUsize::new(0));
@@ -1978,6 +2371,44 @@ mod tests {
             assert_eq!(evidence, CheckEvidence::Passed);
         }
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn bounded_check_evidence_keeps_observed_failures_sticky() {
+        let root = tempfile::tempdir().expect("temporary check fixture");
+
+        let failure_then_timeout = run_checks_with_timeout(
+            root.path(),
+            &[
+                shell_check("fail", "exit 1"),
+                shell_check("hang", "sleep 30"),
+            ],
+            Duration::from_millis(25),
+        )
+        .await
+        .expect("failure followed by timeout");
+        assert_eq!(failure_then_timeout, CheckEvidence::Failing);
+
+        let all_pass = run_checks_with_timeout(
+            root.path(),
+            &[
+                shell_check("pass-one", "exit 0"),
+                shell_check("pass-two", "exit 0"),
+            ],
+            Duration::from_millis(250),
+        )
+        .await
+        .expect("all passing checks");
+        assert_eq!(all_pass, CheckEvidence::Passed);
+
+        let timeout_only = run_checks_with_timeout(
+            root.path(),
+            &[shell_check("hang-only", "sleep 30")],
+            Duration::from_millis(25),
+        )
+        .await
+        .expect("timeout-only check");
+        assert_eq!(timeout_only, CheckEvidence::NotProduced);
     }
 
     #[tokio::test]
@@ -2023,6 +2454,58 @@ mod tests {
         .expect("timed-out runner released its global permit")
         .expect("post-timeout check result");
         assert_eq!(released, CheckEvidence::Passed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_readiness_check_reaps_the_entire_process_group() {
+        let root = tempfile::tempdir().expect("temporary check fixture");
+        let pid_file = root.path().join("check-processes.pid");
+        let quoted_pid_file = shell_single_quote(&pid_file.to_string_lossy());
+        let script = format!(
+            "sleep 30 & child=$!; printf '%s %s\\n' \"$$\" \"$child\" > {quoted_pid_file}; wait"
+        );
+        let evidence = run_checks_with_timeout(
+            root.path(),
+            &[shell_check("spawn-descendant", &script)],
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("timed process-group check");
+        assert_eq!(evidence, CheckEvidence::NotProduced);
+
+        let recorded = tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if let Ok(recorded) = std::fs::read_to_string(&pid_file) {
+                    if recorded.split_whitespace().count() == 2 {
+                        return recorded;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("check shell records its process-group members before timeout");
+        let pids: Vec<i32> = recorded
+            .split_whitespace()
+            .map(|pid| pid.parse::<i32>().expect("numeric process id"))
+            .collect();
+        assert_eq!(
+            pids.len(),
+            2,
+            "shell and spawned descendant must be recorded"
+        );
+
+        for _ in 0..40 {
+            if pids.iter().all(|pid| !process_is_live(*pid)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            pids.iter().all(|pid| !process_is_live(*pid)),
+            "timeout must leave no live process in the check's group: {pids:?}"
+        );
     }
 
     #[tokio::test]
