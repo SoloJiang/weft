@@ -29,15 +29,16 @@ Product goal → project context → dynamic change set → repository lanes
              → native agent runs → evidence → review / merge / release
 ```
 
-You describe the outcome once. Weft works out which repositories need to change,
-why they need to change, and in what order. Work inside the project's authority
-policy can continue without per-repository approval; anything outside that policy,
-high-risk, or uncertain stops at a focused gate. The result is a set of isolated,
-verifiable changes whose readiness can be judged from one place.
+In the finished product, you describe the outcome once. Weft works out which
+repositories need to change, why they need to change, and in what order. Work
+inside the project's authority policy can continue without per-repository approval;
+anything outside that policy, high-risk, or uncertain stops at a focused gate. The
+result is a set of isolated, verifiable changes whose readiness can be judged from
+one place.
 
 **Available today:** local multi-repo planning, repo-native worktrees, native agent
 sessions, reviewable diffs, pre-PR checks, remote questions and approvals,
-keep-awake, and encrypted local-state backup.
+keep-awake, and encrypted `weft.db` snapshots.
 
 **Product direction:** a delivery system you can walk away from, return to, and
 trust—and, over time, a project roster of long-lived coding agents that retain
@@ -105,10 +106,10 @@ details; the delivery remains stable.
 
 ### Bounded autonomy, not approval fatigue
 
-Every actual repository write remains visible and traceable. The authority policy
-decides what can proceed automatically; a role, an agent's past success, or a CLI
-permission answer cannot silently expand that boundary. Weft asks only when a real
-decision is needed.
+In the target model, every actual repository write remains visible and traceable.
+The authority policy decides what can proceed automatically; a role, an agent's
+past success, or a CLI permission answer cannot silently expand that boundary. The
+goal is to ask only when a real decision is needed.
 
 ### Evidence, not confident narration
 
@@ -128,8 +129,9 @@ sources after execution and fails closed when it cannot establish what happened.
 
 Code, credentials, agent processes, Git worktrees, and orchestration state stay on
 your machine by default. Feishu/Lark or DingTalk can carry focused questions and
-permission requests when you are away. Encrypted snapshots make the local state
-recoverable without turning Weft into a hosted code runner.
+permission requests when you are away. Encrypted `weft.db` snapshots make the
+orchestration database recoverable; they do not include repository worktrees,
+unpushed branches, or native-agent session stores.
 
 ### A project that learns without becoming opaque
 
@@ -138,7 +140,11 @@ and delivery patterns can improve later work. Every reusable item keeps provenan
 revision, validity, and a way to correct, supersede, or revoke it. Chat history does
 not silently become permanent truth.
 
-## Authority and safety boundaries
+## Target authority and safety boundaries
+
+This is the enforcement model Weft is building toward, not a claim about the
+current release. Today, worktree materialization is confirmation-gated; the
+complete Lane, AuthorityPolicy, Gate, and effect-reconciliation loop belongs to R1.
 
 - Every write is attributable to a public Lane and the AuthorityPolicy revision
   that allowed it.
@@ -182,6 +188,9 @@ and long-lived agents reuse experience without turning guesses into policy.
   attachments stay tied to the same Issue.
 - **Review surface:** materialized worktrees expose diffs and pre-PR checks, with
   sidecar observation for Claude JSONL, Codex rollout JSONL, and OpenCode SQLite.
+- **PR monitoring and guarded merge:** tracked GitHub PRs are polled for CI,
+  review, unresolved threads, conflicts, and cross-repository upstream readiness.
+  Optional auto-merge squash-merges only after fresh host facts clear its gate.
 - **Remote reachability:** Feishu/Lark or DingTalk can carry agent questions and
   permission decisions back to the same local state.
 - **Team configuration:** Git-backed Skill sources, personal Skill preservation,
@@ -192,7 +201,7 @@ and long-lived agents reuse experience without turning guesses into policy.
   work items, plus English and Chinese UI.
 
 Not yet productized are the complete Issue/Lane/Run/Evidence model, automatic PR
-and protected-branch merge orchestration, CI/CD and deployment observation,
+creation, CI/CD and deployment observation beyond tracked-PR readiness,
 quota-aware automatic resumption, process compression, Project knowledge, and the
 long-lived agent roster. They are roadmap outcomes, not current-product claims.
 
