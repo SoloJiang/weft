@@ -40,6 +40,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::{Child, Command};
 
 /// 每个受管子进程携带的实例标记 env。codex 会清洗它(见模块文档),故它**不是**主
@@ -626,6 +628,294 @@ fn own_pgid() -> i32 {
     unsafe { libc::getpgrp() }
 }
 
+/// A unique open-file identity inherited by one subprocess tree.
+///
+/// The parent keeps the descriptor `CLOEXEC`; [`attach`](Self::attach) clears
+/// that bit only in the selected command's post-fork child. Consequently,
+/// concurrent probes do not inherit one another's markers, while descendants
+/// of the selected command retain the descriptor across `fork`, `exec`,
+/// `setsid`, and PPID reparenting. Sweeping compares vnode `(device, inode)`
+/// identity rather than a path, so it remains valid even after unlink.
+///
+/// A descendant that deliberately closes unknown file descriptors has opted
+/// out of this ownership channel and cannot be recovered by this fallback.
+pub struct InheritedProcessMarker {
+    #[cfg(unix)]
+    file: std::fs::File,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl InheritedProcessMarker {
+    pub fn create(label: &str) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::os::fd::AsRawFd;
+            use std::os::unix::fs::MetadataExt;
+
+            static NEXT_MARKER: AtomicU64 = AtomicU64::new(1);
+            let safe_label: String = label
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .take(48)
+                .collect();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            for _ in 0..32 {
+                let sequence = NEXT_MARKER.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "weft-process-marker-{safe_label}-{}-{nanos}-{sequence}",
+                    instance_id()
+                ));
+                let file = match OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                };
+                let fd = file.as_raw_fd();
+                // Keep the descriptor private to Weft unless a command's
+                // pre-exec hook explicitly opts into this marker.
+                // SAFETY: `fd` belongs to `file` and remains live here.
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                if flags < 0 {
+                    let error = std::io::Error::last_os_error();
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error);
+                }
+                if flags & libc::FD_CLOEXEC == 0 {
+                    // SAFETY: setting descriptor flags on our own live fd has
+                    // no additional memory-safety preconditions.
+                    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+                        let error = std::io::Error::last_os_error();
+                        let _ = std::fs::remove_file(&path);
+                        return Err(error);
+                    }
+                }
+                let metadata = match file.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&path);
+                        return Err(error);
+                    }
+                };
+                // Ownership is the open vnode, not the directory entry. Unlink
+                // immediately so another process cannot open the marker by
+                // discovering its temporary name, and a crash leaves no file.
+                if let Err(error) = std::fs::remove_file(&path) {
+                    return Err(error);
+                }
+                return Ok(Self {
+                    file,
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                });
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate a unique process marker",
+            ))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = label;
+            Ok(Self {})
+        }
+    }
+
+    pub fn attach(&self, command: &mut Command) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            let fd = self.file.as_raw_fd();
+            // SAFETY: the closure runs after fork and before exec. It performs
+            // only `fcntl` plus construction of an OS error on failure.
+            unsafe {
+                command.pre_exec(move || {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = command;
+        }
+        Ok(())
+    }
+
+    /// Kill every live process that still owns this marker, then sweep each
+    /// marked process group. The caller may repeat this until it returns zero.
+    pub fn sweep(&self) -> usize {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let own_pid = std::process::id() as i32;
+            let marked: Vec<i32> = all_pids()
+                .into_iter()
+                .filter(|pid| {
+                    *pid != own_pid && process_has_open_file(*pid, self.device, self.inode)
+                })
+                .collect();
+            let mut groups = HashSet::new();
+            let mut killed = 0;
+            for pid in marked {
+                // Revalidate immediately before signalling to narrow the PID
+                // reuse race between enumeration and kill.
+                if !process_has_open_file(pid, self.device, self.inode) {
+                    continue;
+                }
+                if let Some((_, pgid)) = proc_ppid_pgid(pid) {
+                    groups.insert(pgid);
+                }
+                // SAFETY: signalling a numeric PID has no memory-safety
+                // precondition. The marker recheck above establishes ownership.
+                unsafe {
+                    let _ = libc::kill(pid, libc::SIGKILL);
+                }
+                killed += 1;
+            }
+            for group in groups {
+                kill_group(group);
+            }
+            killed
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            0
+        }
+    }
+}
+
+impl Drop for InheritedProcessMarker {
+    fn drop(&mut self) {
+        let _ = self.sweep();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_has_open_file(pid: i32, device: u64, inode: u64) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    if pid <= 1 {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        // `DirEntry::metadata` does not follow symlinks on this API. Proc fd
+        // rows are symlinks, so use `fs::metadata` to inspect the open target.
+        std::fs::metadata(entry.path())
+            .map(|metadata| metadata.dev() == device && metadata.ino() == inode)
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcessFileInfo {
+    open_flags: u32,
+    status: u32,
+    offset: libc::off_t,
+    file_type: i32,
+    guard_flags: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct VnodeFdInfo {
+    file: ProcessFileInfo,
+    vnode: libc::vnode_info,
+}
+
+#[cfg(target_os = "macos")]
+fn process_has_open_file(pid: i32, device: u64, inode: u64) -> bool {
+    const PROC_PIDFDVNODEINFO: libc::c_int = 1;
+
+    if pid <= 1 {
+        return false;
+    }
+    let entry_size = std::mem::size_of::<libc::proc_fdinfo>();
+    // SAFETY: a null buffer asks libproc for the current byte requirement.
+    let needed = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if needed <= 0 {
+        return false;
+    }
+    let capacity = (needed as usize)
+        .saturating_add(entry_size.saturating_mul(32))
+        .min(libc::c_int::MAX as usize);
+    let mut entries = vec![libc::proc_fdinfo {
+        proc_fd: 0,
+        proc_fdtype: 0,
+    }; capacity / entry_size];
+    // SAFETY: `entries` owns `capacity` writable bytes and libproc fills at
+    // most the supplied byte count.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            entries.as_mut_ptr() as *mut libc::c_void,
+            capacity as libc::c_int,
+        )
+    };
+    if filled <= 0 {
+        return false;
+    }
+    entries.truncate((filled as usize / entry_size).min(entries.len()));
+    entries.into_iter().any(|entry| {
+        if entry.proc_fdtype != libc::PROX_FDTYPE_VNODE as u32 {
+            return false;
+        }
+        let mut info: VnodeFdInfo = unsafe { std::mem::zeroed() };
+        let info_size = std::mem::size_of::<VnodeFdInfo>() as libc::c_int;
+        // SAFETY: `info` is a correctly sized writable C-layout buffer for
+        // PROC_PIDFDVNODEINFO.
+        let read = unsafe {
+            libc::proc_pidfdinfo(
+                pid,
+                entry.proc_fd,
+                PROC_PIDFDVNODEINFO,
+                &mut info as *mut _ as *mut libc::c_void,
+                info_size,
+            )
+        };
+        read == info_size
+            && u64::from(info.vnode.vi_stat.vst_dev) == device
+            && info.vnode.vi_stat.vst_ino == inode
+    })
+}
+
 // ── 口径:is_ours / count ────────────────────────────────────────────────────
 
 /// **唯一口径。** 一个存活 OS 进程属于本实例 ⟺ 返回 `true`:沿 ppid 上溯能到达某个登记
@@ -1131,6 +1421,62 @@ mod tests {
             !registered().iter().any(|r| r.pid == reg.pid()),
             "reap deregisters the child"
         );
+    }
+
+    #[tokio::test]
+    async fn inherited_fd_marker_reaps_a_background_child_after_its_parent_exits() {
+        let _g = test_guard();
+        let marker = InheritedProcessMarker::create("proc-registry-test")
+            .expect("create inherited process marker");
+        let root = tempfile::tempdir().expect("marker fixture directory");
+        let pid_file = root.path().join("background.pid");
+        let mut command = null_cmd("sh");
+        command
+            .env("WEFT_PROC_REGISTRY_TEST_PID_FILE", &pid_file)
+            .arg("-c")
+            .arg("sleep 30 >/dev/null 2>&1 & printf '%s\\n' \"$!\" > \"$WEFT_PROC_REGISTRY_TEST_PID_FILE\"");
+        marker
+            .attach(&mut command)
+            .expect("attach inherited process marker");
+        let configured = configure(&mut command, Owner::other("marker-parent-exit"));
+        let mut child = command.spawn().expect("spawn marker fixture");
+        let registration = configured.register(&child);
+        child.wait().await.expect("wait direct shell");
+
+        let background_pid = std::fs::read_to_string(&pid_file)
+            .expect("background child records pid")
+            .trim()
+            .parse::<i32>()
+            .expect("numeric background pid");
+        let mut marker_visible = false;
+        for _ in 0..40 {
+            if process_has_open_file(background_pid, marker.device, marker.inode) {
+                marker_visible = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            marker_visible,
+            "the inherited fd marker must remain visible on reparented pid {background_pid}"
+        );
+
+        let killed = marker.sweep();
+        assert!(
+            killed > 0,
+            "the inherited fd must retain ownership after the shell is reparented away"
+        );
+        let mut still_alive = true;
+        for _ in 0..40 {
+            if proc_ppid_pgid(background_pid).is_none() {
+                still_alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let _ = marker.sweep();
+        }
+        assert!(!still_alive, "the marked background process must be gone");
+        drop(registration);
     }
 
     #[test]

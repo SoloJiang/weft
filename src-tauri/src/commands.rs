@@ -2500,6 +2500,13 @@ pub struct RepoLite {
     pub name: String,
 }
 
+#[derive(serde::Serialize)]
+pub struct ReadinessWorktreeSignature {
+    pub direction_id: i32,
+    pub worktree_id: i32,
+    pub exists: bool,
+}
+
 /// A thread's roll-up for the workspace board (cards = threads). Live state
 /// (sessions / needs / asks) is overlaid client-side; this is the structure.
 #[derive(serde::Serialize)]
@@ -2519,6 +2526,11 @@ pub struct ThreadOverview {
     /// Stored lifecycle status of each direction (same order as direction_ids),
     /// so the workspace board derives the thread's phase deterministically.
     pub statuses: Vec<String>,
+    /// Every registered worktree row needed by an unopened workspace card's
+    /// readiness key. This avoids depending on the selected thread's hydrated
+    /// `worktreesByDirection` cache.
+    #[serde(default)]
+    pub readiness_worktrees: Vec<ReadinessWorktreeSignature>,
     /// distinct repos this thread WRITES (across its directions).
     pub write_repos: Vec<RepoLite>,
 }
@@ -2537,6 +2549,17 @@ async fn workspace_overview_inner(db: &Db, workspace_id: i32) -> R<Vec<ThreadOve
         .into_iter()
         .filter(|t| t.kind != "curator") // hidden curator-chat thread is not a board issue
         .collect();
+    // One portfolio snapshot, grouped in memory. Querying worktrees inside the
+    // thread/direction loop makes a board refresh add one DB round trip per
+    // lane and scales poorly precisely when the portfolio view is most useful.
+    let mut worktrees_by_direction =
+        std::collections::HashMap::<i32, Vec<entities::worktree::Model>>::new();
+    for worktree in repo::list_worktrees(db, None).await.map_err(e)? {
+        worktrees_by_direction
+            .entry(worktree.direction_id)
+            .or_default()
+            .push(worktree);
+    }
     let mut out = Vec::new();
     for t in threads {
         let dirs = repo::list_directions(db, t.id).await.map_err(e)?;
@@ -2545,11 +2568,22 @@ async fn workspace_overview_inner(db: &Db, workspace_id: i32) -> R<Vec<ThreadOve
             None => (None, None),
         };
         let mut seen = std::collections::BTreeMap::<i32, String>::new();
+        let mut readiness_worktrees = Vec::new();
         for d in &dirs {
             if let Some(r) = repo::direction_repo_of(db, d.id).await.map_err(e)? {
                 seen.entry(r.id).or_insert(r.name);
             }
+            if let Some(worktrees) = worktrees_by_direction.get(&d.id) {
+                for worktree in worktrees {
+                    readiness_worktrees.push(ReadinessWorktreeSignature {
+                        direction_id: d.id,
+                        worktree_id: worktree.id,
+                        exists: std::path::Path::new(&worktree.path).exists(),
+                    });
+                }
+            }
         }
+        readiness_worktrees.sort_by_key(|worktree| (worktree.direction_id, worktree.worktree_id));
         out.push(ThreadOverview {
             thread_id: t.id,
             title: t.title,
@@ -2558,6 +2592,7 @@ async fn workspace_overview_inner(db: &Db, workspace_id: i32) -> R<Vec<ThreadOve
             plan_created_at,
             direction_ids: dirs.iter().map(|d| d.id).collect(),
             statuses: dirs.iter().map(|d| d.status.clone()).collect(),
+            readiness_worktrees,
             write_repos: seen
                 .into_iter()
                 .map(|(id, name)| RepoLite { id, name })
@@ -4765,6 +4800,43 @@ mod tests {
         repo::upsert_plan(&db, planned.id, "{}", "proposed", "plan-v1")
             .await
             .expect("initial plan");
+        let worktree_root = tempfile::tempdir().expect("workspace overview worktree");
+        let worktree_path = worktree_root.path().display().to_string();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "overview-repo",
+            &worktree_path,
+            "main",
+            "",
+            true,
+        )
+        .await
+        .expect("overview repo");
+        let direction = repo::create_direction(
+            &db,
+            planned.id,
+            "implementation",
+            "codex",
+            repo_ref.id,
+            "exercise portfolio worktree signatures",
+            "impl-only",
+            "main",
+        )
+        .await
+        .expect("overview direction");
+        let worktree = repo::record_worktree(
+            &db,
+            repo_ref.id,
+            direction.id,
+            "main",
+            &worktree_path,
+            false,
+            false,
+            "",
+        )
+        .await
+        .expect("overview worktree row");
 
         let before = workspace_overview_inner(&db, workspace.id)
             .await
@@ -4781,6 +4853,12 @@ mod tests {
             .expect("planned overview");
         assert_eq!(planned_overview.plan_status.as_deref(), Some("proposed"));
         assert_eq!(planned_overview.plan_created_at.as_deref(), Some("plan-v1"));
+        assert_eq!(planned_overview.readiness_worktrees.len(), 1);
+        assert_eq!(
+            planned_overview.readiness_worktrees[0].worktree_id,
+            worktree.id
+        );
+        assert!(planned_overview.readiness_worktrees[0].exists);
 
         repo::set_plan_created_at(&db, planned.id, "plan-v2")
             .await

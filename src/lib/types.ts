@@ -790,6 +790,12 @@ export interface ThreadOverview {
   direction_ids: number[];
   /** stored lifecycle status per direction (same order as direction_ids). */
   statuses: string[];
+  /** Worktree existence signatures for every card, including unopened issues. */
+  readiness_worktrees?: {
+    direction_id: number;
+    worktree_id: number;
+    exists: boolean;
+  }[];
   write_repos: { id: number; name: string }[];
 }
 

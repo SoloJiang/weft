@@ -1661,8 +1661,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           ),
         };
       });
+      await refreshOverview(true);
     },
-    [],
+    [refreshOverview],
   );
 
   // ALL workers run on the chat engine — one product-native conversation UI

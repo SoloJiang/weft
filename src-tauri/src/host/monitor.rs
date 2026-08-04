@@ -213,7 +213,7 @@ fn snapshot_changed(
     let new_threads = serde_json::to_string(&snapshot.threads).unwrap_or_default();
     let new_conflict = serde_json::to_string(&snapshot.conflict).unwrap_or_default();
     let new_readiness = serde_json::to_string(readiness).unwrap_or_default();
-    let old_probe_failed = !old.last_error.is_empty() || old.probe_fail_count > 0;
+    let old_probe_failed = !old.last_error.trim().is_empty() || old.probe_fail_count > 0;
     old.head_sha != snapshot.head_sha
         || old.lifecycle != snapshot.lifecycle.as_str()
         || old.ci_status != new_ci

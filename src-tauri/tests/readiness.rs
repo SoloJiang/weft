@@ -265,6 +265,9 @@ async fn add_failing_build_script(fixture: &Fixture) {
         r#"{"scripts":{"build":"exit 1"}}"#,
     )
     .expect("failing build fixture");
+    let worktree = Path::new(&registered[0].path);
+    git(worktree, &["add", "package.json"]);
+    git(worktree, &["commit", "-q", "-m", "add failing readiness check"]);
 }
 
 async fn add_passing_build_script_for_direction(fixture: &Fixture, direction_id: i32) {
@@ -277,6 +280,9 @@ async fn add_passing_build_script_for_direction(fixture: &Fixture, direction_id:
         r#"{"scripts":{"build":"exit 0"}}"#,
     )
     .expect("passing build fixture");
+    let worktree = Path::new(&registered[0].path);
+    git(worktree, &["add", "package.json"]);
+    git(worktree, &["commit", "-q", "-m", "add passing readiness check"]);
 }
 
 async fn add_passing_build_script(fixture: &Fixture) {
@@ -300,6 +306,13 @@ async fn add_counting_build_script(fixture: &Fixture) -> PathBuf {
         r#"{"scripts":{"build":"sh ./readiness-check.sh"}}"#,
     )
     .expect("counting package fixture");
+    std::fs::write(worktree.join(".gitignore"), ".readiness-check-count\n")
+        .expect("ignore readiness counter");
+    git(
+        worktree,
+        &["add", "readiness-check.sh", "package.json", ".gitignore"],
+    );
+    git(worktree, &["commit", "-q", "-m", "add counting readiness check"]);
     counter
 }
 
@@ -320,6 +333,21 @@ async fn add_hanging_counting_build_script(fixture: &Fixture) -> PathBuf {
         r#"{"scripts":{"build":"sh ./readiness-hanging-check.sh"}}"#,
     )
     .expect("hanging package fixture");
+    std::fs::write(
+        worktree.join(".gitignore"),
+        ".readiness-hanging-check-count\n",
+    )
+    .expect("ignore hanging readiness counter");
+    git(
+        worktree,
+        &[
+            "add",
+            "readiness-hanging-check.sh",
+            "package.json",
+            ".gitignore",
+        ],
+    );
+    git(worktree, &["commit", "-q", "-m", "add hanging readiness check"]);
     counter
 }
 
@@ -592,6 +620,12 @@ async fn assistant_text_error_fails_a_worker_turn_despite_completed_tool_row() {
     )
     .await
     .expect("failed assistant row");
+    // The persisted error is a completed turn outcome. `create_session`
+    // starts in `starting`, which correctly owns the checkout and preempts
+    // terminal worker facts until the engine records the drained idle state.
+    repo::set_session_status(&fixture.db, session.id, "idle")
+        .await
+        .expect("failed worker idle status");
 
     let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
         .await
@@ -618,6 +652,32 @@ async fn working_lane_skips_checks_until_it_claims_completion() {
 
     assert_eq!(result.readiness, IssueReadiness::Unknown);
     assert_eq!(result.reasons[0].code, ReasonCode::InProgress);
+}
+
+#[tokio::test]
+async fn dirty_review_lane_fails_closed_without_running_checks() {
+    let fixture = fixture(None).await;
+    let registered = repo::list_worktrees(&fixture.db, Some(fixture.direction_id))
+        .await
+        .expect("registered worktrees");
+    let worktree = Path::new(&registered[0].path);
+    let counter = worktree.join("dirty-readiness-check-ran");
+    std::fs::write(
+        worktree.join("package.json"),
+        r#"{"scripts":{"build":"printf run > dirty-readiness-check-ran"}}"#,
+    )
+    .expect("dirty check fixture");
+
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
+        .await
+        .expect("dirty readiness");
+
+    assert_eq!(result.readiness, IssueReadiness::Unknown);
+    assert_eq!(result.reasons[0].code, ReasonCode::ChecksUnknown);
+    assert!(
+        !counter.exists(),
+        "delivery readiness must not run checks for an already-dirty target"
+    );
 }
 
 #[tokio::test]

@@ -58,7 +58,7 @@
 //! | answerable BusRegistry or AskRegistry ask is open for the direction | NeedsYou | OpenNeed |
 //! | policy needs a human gate | NeedsYou | PolicyGatePending |
 //! | any repository slot's latest worker session is `running`, `starting`, or `stopped` while direction status is `review` or `done` | Unknown | InProgress |
-//! | at least one tracked PR is `merged`, and the deterministic reduction of every tracked PR is clear | ReviewReady | — |
+//! | no worker is active, at least one tracked PR is `merged`, and the deterministic reduction of every tracked PR is clear | ReviewReady | — |
 //! | worktree/branch reconciliation drifted | Blocked | ExecutionDrifted |
 //! | an inferred check failed for a claimed-complete lane | Blocked | ChecksFailing |
 //! | upstream evidence is Unmet (including a pending or unregistered upstream PR) | Blocked | UpstreamUnmet |
@@ -127,19 +127,22 @@
 //! kills every distinct PGID before waiting the root. Its 250ms deadline covers
 //! the blocking process-table scan, tree walk, group signals, and child wait;
 //! a slow platform scan runs off the async executor and returns incomplete
-//! rather than holding a readiness permit indefinitely. A normally completed
-//! direct child instead gets a best-effort sweep of its original process group,
-//! which clears ordinary redirected background helpers. The registration is
-//! dropped immediately after a successful `child.wait`, before any still-open
-//! output pipes are drained. Once the root has exited its descendants may be
-//! reparented, so this normal-completion path deliberately cannot discover an
-//! actively escaped orphan through the old PPID tree; that is a known boundary,
-//! not a zero-orphan guarantee. Drop/future cancellation likewise can only
-//! kill the root group because Drop cannot await tree cleanup. Only a completed
-//! bounded reap disarms the root-group guard. On incomplete cleanup readiness
-//! keeps that guard armed and explicitly tears down the direct child before its
-//! registration is dropped; an escaped PGID is not guaranteed to have been
-//! discovered.
+//! rather than holding a readiness permit indefinitely. Every inferred check
+//! also receives one unique inherited file-descriptor marker. The parent keeps
+//! every marker close-on-exec and clears that flag only in its selected probe,
+//! so concurrent checks cannot inherit one another's ownership token. After
+//! the direct child exits, macOS/Linux scan same-user open vnode identities and
+//! kill every matching PID and process group, retaining ownership across
+//! `fork`, `exec`, `setsid`, and PPID reparenting. Finding any background
+//! process discards the check result as `NotProduced`; it can never be
+//! published as a pass. The marker's Drop path repeats the synchronous
+//! fork-free sweep when a check future is cancelled. Tools that deliberately
+//! close unknown inherited descriptors remain outside this unprivileged
+//! contract; they cannot be given a cross-platform cgroup/Job-style ownership
+//! guarantee by this process.
+//! Only a completed bounded reap disarms the root-group guard. On incomplete
+//! cleanup readiness keeps that guard armed and explicitly tears down the
+//! direct child before its registration is dropped.
 //! Non-Unix platforms retain the direct-child kill-on-drop fallback. A
 //! completed failing rung remains `Failing` even if a later rung times out or
 //! cannot be awaited. Completed stdout and stderr are read continuously into
@@ -151,8 +154,11 @@
 //! signatures match the newly collected values; any branch or HEAD change
 //! immediately reruns checks.
 //! A dirty worktree invalidates any prior entry and is intentionally
-//! uncacheable, so uncommitted changes can never inherit a previously passing
-//! result. Run-allowed collection samples every target again after its runner
+//! ineligible for delivery-readiness evidence: a boolean dirty marker cannot
+//! distinguish content changes that occur during an already-dirty run. The
+//! explicit `verify_direction` path may still run those checks for working-
+//! phase feedback, but a dirty checkout cannot make a Lane review-ready.
+//! Run-allowed collection samples every clean target again after its runner
 //! returns and before it publishes evidence: a failed post-run sample or any
 //! path/branch/HEAD/dirty mismatch invalidates the memo and publishes `NotProduced`
 //! to the leader and matching followers. Requests that observed the same dirty
@@ -597,6 +603,21 @@ pub fn lane_readiness(facts: &LaneFacts) -> Option<LaneReadinessDto> {
             Some(ReasonCode::InProgress),
         ));
     }
+    // A merge is terminal only after the checkout is no longer occupied. A
+    // worker may still be active while the stored lifecycle says `working`;
+    // do not let the merged-row shortcut advertise readiness over that work.
+    if facts.worker_active
+        && has_all_clear_merged_pull_request(
+            &facts.pull_requests,
+            facts.open_pr_snapshot_freshness,
+        )
+    {
+        return Some(lane_verdict(
+            facts,
+            LaneReadiness::Unknown,
+            Some(ReasonCode::InProgress),
+        ));
+    }
     // Merge is terminal delivery evidence only when every tracked row is clear.
     // It intentionally comes after the human-action gates above, but before
     // local execution, predecessor, and live-host evidence that may disappear
@@ -884,6 +905,7 @@ const READINESS_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
 const GIT_SIGNATURE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const BOUNDED_PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_CONCURRENT_CHECK_RUNNERS: usize = 2;
+const MAX_CONCURRENT_GIT_PROBES: usize = 4;
 const CHECK_OUTPUT_TAIL_BYTES: usize = 2_000;
 const CHECK_OUTPUT_READ_BUFFER_BYTES: usize = 8 * 1024;
 // Keep this aligned with host::monitor's private default. The readiness
@@ -1408,12 +1430,6 @@ impl CheckFlight {
                 }
                 CheckFlightClaim::Leader(leader) => {
                     let _admission = self.acquire_admission(direction_id).await?;
-                    if let Some(report) = self.cached(direction_id, &targets)? {
-                        let shared_result = Ok(report.clone());
-                        leader.finish(shared_result)?;
-                        return Ok(report);
-                    }
-
                     let mut admitted_targets = match admission_targets(targets.clone()).await {
                         Ok(targets) => targets,
                         Err(_) => {
@@ -1433,6 +1449,15 @@ impl CheckFlight {
                         };
                         leader.finish(shared_result.clone())?;
                         return Self::shared_result(shared_result);
+                    }
+                    // Even a cache hit must match a target sample taken after
+                    // this caller owns admission. Otherwise a branch switch or
+                    // worker start in the initial-sample-to-admission gap could
+                    // publish a memo for a checkout that no longer exists.
+                    if let Some(report) = self.cached(direction_id, &targets)? {
+                        let shared_result = Ok(report.clone());
+                        leader.finish(shared_result)?;
+                        return Ok(report);
                     }
 
                     let runner_result = {
@@ -1530,8 +1555,13 @@ async fn latest_worker_facts(db: &Db, direction_id: i32) -> Result<WorkerSession
         // safety boundary: a worker can own the checkout while it is starting,
         // running, or taken over in a human terminal (stopped). `reviving` is
         // a revive operation label, not a persisted session.status value.
-        if worker_session_occupies_worktree(session.status.as_str()) {
+        let active = worker_session_occupies_worktree(session.status.as_str());
+        if active {
             facts.active = true;
+            // The active turn supersedes this same session's prior terminal
+            // text. Until the new turn ends, an older error is not the latest
+            // worker outcome for this repository slot.
+            continue;
         }
 
         // engine::finalize_text_row persists the turn's terminal state by
@@ -1561,6 +1591,10 @@ async fn latest_worker_facts(db: &Db, direction_id: i32) -> Result<WorkerSession
 struct GitSignatureProbe {
     program: PathBuf,
     timeout: Duration,
+    /// Production probes share the process-wide cap. Tests that need to prove
+    /// a child actually starts may inject an isolated cap so unrelated
+    /// parallel tests cannot consume the whole deadline before spawn.
+    limit: Option<Arc<Semaphore>>,
 }
 
 impl GitSignatureProbe {
@@ -1568,6 +1602,7 @@ impl GitSignatureProbe {
         Self {
             program: PathBuf::from("git"),
             timeout: GIT_SIGNATURE_PROBE_TIMEOUT,
+            limit: None,
         }
     }
 
@@ -1579,10 +1614,23 @@ impl GitSignatureProbe {
             ));
         }
 
-        // This is deliberately one total budget rather than 15 seconds per
-        // subcommand: a slow fsmonitor cannot turn status + branch + HEAD into
-        // an unbounded sequence of readiness refresh work.
+        // This is deliberately one total budget, including time queued behind
+        // other board cards, rather than 15 seconds per subcommand. A large
+        // portfolio and a slow fsmonitor therefore cannot create an unbounded
+        // backlog of overlapping readiness refreshes.
         let deadline = tokio::time::Instant::now() + self.timeout;
+        // Board cards and multi-lane collection may sample concurrently. Keep
+        // the process fan-out globally bounded across every issue rather than
+        // multiplying one Git child per card, lane, and worktree.
+        let limit = self
+            .limit
+            .clone()
+            .unwrap_or_else(|| Arc::clone(git_probe_limit()));
+        let _permit = match tokio::time::timeout_at(deadline, limit.acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(anyhow!("readiness Git probe semaphore closed")),
+            Err(_) => return Err(anyhow!("readiness Git probe deadline elapsed while queued")),
+        };
         let porcelain = run_bounded_git_command(
             path,
             self.program.as_path(),
@@ -1613,6 +1661,11 @@ impl GitSignatureProbe {
     }
 }
 
+fn git_probe_limit() -> &'static Arc<Semaphore> {
+    static LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    LIMIT.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_PROBES)))
+}
+
 #[derive(Clone, Debug)]
 struct GitWorktreeSignature {
     branch: String,
@@ -1633,21 +1686,20 @@ async fn probe_worktrees_for_direction(
     git_probe: &GitSignatureProbe,
 ) -> Result<Vec<ProbedWorktree>> {
     let worktrees = repo::list_worktrees(db, Some(direction_id)).await?;
-    let mut probed = Vec::with_capacity(worktrees.len());
-    for worktree in worktrees {
+    let probes = worktrees.into_iter().map(|worktree| async move {
         let repo_name = repo::get_repo(db, worktree.repo_id)
             .await?
             .map(|repo| repo.name)
             .unwrap_or_else(|| format!("repo {}", worktree.repo_id));
         let stored_path = worktree.path;
         let signature = git_probe.sample(Path::new(&stored_path)).await.ok();
-        probed.push(ProbedWorktree {
+        Ok(ProbedWorktree {
             repo: repo_name,
             stored_path,
             signature,
-        });
-    }
-    Ok(probed)
+        })
+    });
+    futures::future::join_all(probes).await.into_iter().collect()
 }
 
 fn reconciliation_for(
@@ -1704,6 +1756,15 @@ fn check_targets_for_worktrees(worktrees: &[ProbedWorktree]) -> Option<Vec<Check
     Some(targets)
 }
 
+/// Delivery readiness may publish check evidence only for a clean checkout.
+/// A dirty boolean is enough to invalidate old cache entries, but not enough
+/// to prove that dirty contents stayed unchanged while a runner was active.
+/// Explicit verification bypasses this collector boundary and can still
+/// provide working-phase feedback for uncommitted edits.
+fn targets_support_delivery_evidence(targets: &[CheckTarget]) -> bool {
+    targets.iter().all(|target| !target.dirty)
+}
+
 /// Re-read the direction's active-worker state, then fetch the currently
 /// registered worktrees and sample their live Git signatures. Leaders call
 /// this while holding the admission gate, so a queued verification cannot run
@@ -1724,12 +1785,29 @@ async fn verification_targets_for_direction(
         );
     }
     let worker = latest_worker_facts(db, direction_id).await?;
-    if worker_active_preempts_completion(worker.active, direction.status.as_str()) {
+    // Verification target occupancy is stricter than lane-verdict precedence:
+    // a working lane may be explicitly verified only after every repository
+    // worker is idle. `starting`, `running`, and terminal-takeover `stopped`
+    // all own the checkout regardless of the direction lifecycle label.
+    if worker.active {
         anyhow::bail!(
             "verification was not produced for direction {direction_id}: worker is active"
         );
     }
     let worktrees = probe_worktrees_for_direction(db, direction_id, git_probe).await?;
+    match reconciliation_for(&direction, &worktrees) {
+        ExecutionReconciliation::Matched => {}
+        ExecutionReconciliation::Drifted => {
+            anyhow::bail!(
+                "verification was not produced for direction {direction_id}: worktree branch drifted"
+            );
+        }
+        ExecutionReconciliation::Unknown => {
+            anyhow::bail!(
+                "verification was not produced for direction {direction_id}: worktree branch is unknown"
+            );
+        }
+    }
     check_targets_for_worktrees(&worktrees).ok_or_else(|| {
         anyhow!(
             "verification was not produced for direction {direction_id}: \
@@ -1806,6 +1884,9 @@ where
     let Some(targets) = check_targets_for_worktrees(worktrees) else {
         return Ok(CheckEvidence::NotProduced);
     };
+    if !targets_support_delivery_evidence(&targets) {
+        return Ok(CheckEvidence::NotProduced);
+    }
     checks_for_targets_with_runner_and_post_targets(
         flight,
         execution,
@@ -1981,6 +2062,26 @@ fn rendered_check_output_tail(output_tail: &SharedOutputTail) -> Result<String> 
 enum BoundedCheckOutcome {
     Completed(crate::check::CheckResult),
     NotProduced { output_tail: String },
+}
+
+/// A per-check ownership marker that survives `setsid` and PPID reparenting.
+/// Normal completion performs an explicit sweep before publishing evidence;
+/// Drop is the synchronous cancellation fallback if the future is abandoned.
+struct ReadinessProbeMarker(crate::proc_registry::InheritedProcessMarker);
+
+impl ReadinessProbeMarker {
+    fn attach(command: &mut tokio::process::Command) -> Result<Self> {
+        let marker = crate::proc_registry::InheritedProcessMarker::create("readiness-check")
+            .map_err(|error| anyhow!("could not create readiness process marker: {error}"))?;
+        marker
+            .attach(command)
+            .map_err(|error| anyhow!("could not attach readiness process marker: {error}"))?;
+        Ok(Self(marker))
+    }
+
+    fn sweep(&self) -> usize {
+        self.0.sweep()
+    }
 }
 
 /// A Unix readiness subprocess owns a fresh process group. Keep the group
@@ -2401,6 +2502,7 @@ async fn run_bounded_check(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    let process_marker = ReadinessProbeMarker::attach(&mut command)?;
     let configured =
         crate::proc_registry::configure(&mut command, crate::proc_registry::Owner::probe());
     let mut child = match command.spawn() {
@@ -2468,6 +2570,10 @@ async fn run_bounded_check(
     .await
     {
         BoundedReadinessWait::Completed(status) => {
+            // Inspect the inherited ownership marker before the ordinary root
+            // group sweep can make a same-group background process disappear.
+            // Any such process invalidates otherwise-successful evidence.
+            let escaped_processes = process_marker.sweep();
             #[cfg(unix)]
             // The direct child is already reaped, so this only sweeps residual
             // root-group members (for example `sh -c 'server >/dev/null 2>&1
@@ -2477,6 +2583,18 @@ async fn run_bounded_check(
             // cannot leave a background process mutating the checkout.
             process_group.kill();
             let output_tail = rendered_check_output_tail(&output_tail)?;
+            if escaped_processes > 0 {
+                let detail = format!(
+                    "verification discarded: check left {escaped_processes} background process(es)"
+                );
+                return Ok(BoundedCheckOutcome::NotProduced {
+                    output_tail: if output_tail.is_empty() {
+                        detail
+                    } else {
+                        format!("{output_tail}\n{detail}")
+                    },
+                });
+            }
             Ok(BoundedCheckOutcome::Completed(crate::check::CheckResult {
                 name: check.name.clone(),
                 status: if status.success() { "pass" } else { "fail" }.to_string(),
@@ -2490,6 +2608,7 @@ async fn run_bounded_check(
             #[cfg(not(unix))]
             reap_bounded_readiness_process(&mut child, &mut registration).await;
             readers.abort_pending().await;
+            let _ = process_marker.sweep();
             Ok(BoundedCheckOutcome::NotProduced {
                 output_tail: rendered_check_output_tail(&output_tail)?,
             })
@@ -2500,6 +2619,7 @@ async fn run_bounded_check(
             // swept safely. See the normal-completion comment above.
             process_group.kill();
             readers.abort_pending().await;
+            let _ = process_marker.sweep();
             Ok(BoundedCheckOutcome::NotProduced {
                 output_tail: rendered_check_output_tail(&output_tail)?,
             })
@@ -2670,6 +2790,9 @@ async fn checks_for(
     let Some(mut targets) = check_targets_for_worktrees(worktrees) else {
         return Ok(CheckEvidence::NotProduced);
     };
+    if !targets_support_delivery_evidence(&targets) {
+        return Ok(CheckEvidence::NotProduced);
+    }
     CheckFlight::sort_targets(&mut targets);
     match execution {
         CheckExecution::RunAllowed => Ok(
@@ -2922,6 +3045,42 @@ async fn collect_unbound_pr_lane(
     )))
 }
 
+enum PendingLaneCollection {
+    Immediate(LaneFacts),
+    Direction {
+        direction: direction::Model,
+        policy: PolicyDecision,
+    },
+}
+
+async fn resolve_pending_lanes(
+    db: &Db,
+    pending: Vec<PendingLaneCollection>,
+    open_ask_direction_ids: &HashSet<i32>,
+    open_pr_snapshot_freshness: OpenPrSnapshotFreshness,
+    check_execution: CheckExecution,
+    git_probe: &GitSignatureProbe,
+) -> Result<Vec<LaneFacts>> {
+    let tasks = pending.into_iter().map(|pending_lane| async move {
+        match pending_lane {
+            PendingLaneCollection::Immediate(facts) => Ok(facts),
+            PendingLaneCollection::Direction { direction, policy } => {
+                collect_lane(
+                    db,
+                    &direction,
+                    policy,
+                    open_ask_direction_ids,
+                    open_pr_snapshot_freshness,
+                    check_execution,
+                    git_probe,
+                )
+                .await
+            }
+        }
+    });
+    futures::future::join_all(tasks).await.into_iter().collect()
+}
+
 /// Collect live storage/process facts, then run the pure aggregation. This
 /// function performs no writes and deliberately reuses the existing local
 /// check runner and host parsers rather than inventing parallel semantics.
@@ -2971,39 +3130,23 @@ pub async fn collect_with_check_execution(
     }
     let open_pr_snapshot_freshness = current_open_pr_snapshot_freshness()?;
     let git_probe = GitSignatureProbe::readiness();
-    let mut facts = Vec::with_capacity(directions.len() + 2);
+    let mut pending = Vec::with_capacity(directions.len() + 2);
 
     match planned_lane_source(plan.as_ref()) {
         PlannedLaneSource::Legacy => {
             for direction in &directions {
-                facts.push(
-                    collect_lane(
-                        db,
-                        direction,
-                        PolicyDecision::AllowedByPolicy,
-                        &open_ask_direction_ids,
-                        open_pr_snapshot_freshness,
-                        check_execution,
-                        &git_probe,
-                    )
-                    .await?,
-                );
+                pending.push(PendingLaneCollection::Direction {
+                    direction: direction.clone(),
+                    policy: PolicyDecision::AllowedByPolicy,
+                });
             }
         }
         PlannedLaneSource::Unavailable => {
             for direction in &directions {
-                facts.push(
-                    collect_lane(
-                        db,
-                        direction,
-                        PolicyDecision::NeedsGate,
-                        &open_ask_direction_ids,
-                        open_pr_snapshot_freshness,
-                        check_execution,
-                        &git_probe,
-                    )
-                    .await?,
-                );
+                pending.push(PendingLaneCollection::Direction {
+                    direction: direction.clone(),
+                    policy: PolicyDecision::NeedsGate,
+                });
             }
         }
         PlannedLaneSource::Parsed {
@@ -3039,14 +3182,14 @@ pub async fn collect_with_check_execution(
                     if policy == PolicyDecision::Denied {
                         continue;
                     }
-                    facts.push(virtual_lane_facts(
+                    pending.push(PendingLaneCollection::Immediate(virtual_lane_facts(
                         0,
                         proposed_lane.name,
                         policy,
                         ExecutionReconciliation::Matched,
                         Vec::new(),
                         open_pr_snapshot_freshness,
-                    ));
+                    )));
                     continue;
                 }
                 if !handled_direction_ids.insert(proposed_lane.direction_id) {
@@ -3062,49 +3205,43 @@ pub async fn collect_with_check_execution(
                     continue;
                 }
                 let Some(direction) = directions_by_id.get(&proposed_lane.direction_id) else {
-                    facts.push(virtual_lane_facts(
+                    pending.push(PendingLaneCollection::Immediate(virtual_lane_facts(
                         proposed_lane.direction_id,
                         proposed_lane.name,
                         policy,
                         ExecutionReconciliation::Unknown,
                         Vec::new(),
                         open_pr_snapshot_freshness,
-                    ));
+                    )));
                     continue;
                 };
-                facts.push(
-                    collect_lane(
-                        db,
-                        direction,
-                        policy,
-                        &open_ask_direction_ids,
-                        open_pr_snapshot_freshness,
-                        check_execution,
-                        &git_probe,
-                    )
-                    .await?,
-                );
+                pending.push(PendingLaneCollection::Direction {
+                    direction: (*direction).clone(),
+                    policy,
+                });
             }
 
             for direction in &directions {
                 if referenced_direction_ids.contains(&direction.id) {
                     continue;
                 }
-                facts.push(
-                    collect_lane(
-                        db,
-                        direction,
-                        PolicyDecision::AllowedByPolicy,
-                        &open_ask_direction_ids,
-                        open_pr_snapshot_freshness,
-                        check_execution,
-                        &git_probe,
-                    )
-                    .await?,
-                );
+                pending.push(PendingLaneCollection::Direction {
+                    direction: direction.clone(),
+                    policy: PolicyDecision::AllowedByPolicy,
+                });
             }
         }
     }
+
+    let mut facts = resolve_pending_lanes(
+        db,
+        pending,
+        &open_ask_direction_ids,
+        open_pr_snapshot_freshness,
+        check_execution,
+        &git_probe,
+    )
+    .await?;
 
     if let Some(unbound_pr_lane) =
         collect_unbound_pr_lane(db, thread_id, open_pr_snapshot_freshness).await?
@@ -3384,6 +3521,10 @@ mod tests {
         )
         .await
         .expect("direction");
+        git_in(
+            root.path(),
+            &["checkout", "--quiet", "-b", direction.branch.as_str()],
+        );
         repo::set_direction_status(&db, direction.id, "working")
             .await
             .expect("working direction");
@@ -3392,7 +3533,7 @@ mod tests {
             &db,
             repo_ref.id,
             direction.id,
-            "main",
+            &direction.branch,
             &root_path,
             false,
             false,
@@ -3415,6 +3556,23 @@ mod tests {
         );
 
         let probe = GitSignatureProbe::readiness();
+        for active_status in ["starting", "running", "stopped"] {
+            repo::set_session_status(&db, worker.id, active_status)
+                .await
+                .expect("active working worker status");
+            let error = verification_targets_for_direction(
+                &db,
+                direction.id,
+                &probe,
+                VerificationTargetPurpose::ExplicitDirectionVerification,
+            )
+            .await
+            .expect_err("working verification must wait for every active worker state");
+            assert!(error.to_string().contains("worker is active"));
+        }
+        repo::set_session_status(&db, worker.id, "idle")
+            .await
+            .expect("restore idle worker status");
         let explicit_targets = verification_targets_for_direction(
             &db,
             direction.id,
@@ -3522,6 +3680,20 @@ mod tests {
         assert!(collection_error
             .to_string()
             .contains("completion was withdrawn"));
+
+        git_in(
+            root.path(),
+            &["checkout", "--quiet", "-b", "feature/unexpected"],
+        );
+        let drift_error = verification_targets_for_direction(
+            &db,
+            direction.id,
+            &probe,
+            VerificationTargetPurpose::ExplicitDirectionVerification,
+        )
+        .await
+        .expect_err("explicit verification must reject the wrong checked-out branch");
+        assert!(drift_error.to_string().contains("worktree branch drifted"));
     }
 
     #[tokio::test]
@@ -3658,6 +3830,53 @@ mod tests {
         assert!(
             !recovered.failed,
             "errors from replaced repository sessions must not latch forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_retry_does_not_latch_a_prior_error_from_the_same_session() {
+        let (db, direction, thread_id, first_repo_id, _) = multi_repo_worker_fixture().await;
+        let worker = repo::create_session(
+            &db,
+            direction.id,
+            first_repo_id,
+            "claude",
+            "/tmp/same-session-retry",
+        )
+        .await
+        .expect("same-session worker");
+        repo::set_session_status(&db, worker.id, "idle")
+            .await
+            .expect("failed turn becomes idle");
+        repo::insert_lead_message(
+            &db,
+            thread_id,
+            Some(worker.id),
+            1,
+            "assistant",
+            "text",
+            r#"{"text":"first turn failed"}"#,
+            "error",
+        )
+        .await
+        .expect("first turn error");
+        assert!(
+            latest_worker_facts(&db, direction.id)
+                .await
+                .expect("failed worker facts")
+                .failed
+        );
+
+        repo::set_session_status(&db, worker.id, "running")
+            .await
+            .expect("same session starts retry");
+        let retry = latest_worker_facts(&db, direction.id)
+            .await
+            .expect("active retry facts");
+        assert!(retry.active);
+        assert!(
+            !retry.failed,
+            "the prior turn error must not preempt the active retry"
         );
     }
 
@@ -3882,6 +4101,25 @@ mod tests {
         assert_eq!(
             verdict(&lane),
             (LaneReadiness::NeedsYou, Some(ReasonCode::OpenNeed))
+        );
+    }
+
+    #[test]
+    fn active_working_worker_prevents_terminal_merge_readiness() {
+        let mut lane = facts();
+        let mut merged = pr();
+        merged.lifecycle = Some(PrLifecycle::Merged);
+        lane.direction_status = "working".to_string();
+        lane.worker_active = true;
+        lane.pull_requests = vec![merged];
+
+        assert_eq!(
+            verdict(&lane),
+            (LaneReadiness::Unknown, Some(ReasonCode::InProgress))
+        );
+        assert!(
+            checks_are_preempted(&lane),
+            "an occupied merged lane must not launch verification"
         );
     }
 
@@ -4921,6 +5159,7 @@ mod tests {
         let git_probe = GitSignatureProbe {
             program: git_stub,
             timeout: Duration::from_secs(1),
+            limit: Some(Arc::new(Semaphore::new(1))),
         };
 
         let cases = [
@@ -5240,6 +5479,7 @@ mod tests {
         let git_probe = GitSignatureProbe {
             program: git_stub,
             timeout: Duration::from_secs(1),
+            limit: Some(Arc::new(Semaphore::new(1))),
         };
         // The app prewarms this cached PATH at startup. Do the same before the
         // bounded sample so this test measures the injected Git child rather
@@ -5756,6 +5996,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_allowed_cached_hit_revalidates_targets_after_admission() {
+        let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
+        let targets = check_targets("/tmp/run-allowed-target-recheck", "head-a");
+        let primed = flight
+            .get_or_run(425, targets.clone(), |_| async {
+                Ok(CheckEvidence::Passed)
+            })
+            .await
+            .expect("prime cached evidence");
+        assert_eq!(primed, CheckEvidence::Passed);
+
+        let runner_calls = Arc::new(AtomicUsize::new(0));
+        let attempted_runner = Arc::clone(&runner_calls);
+        let report = flight
+            .get_or_run_report_with_admission_and_post_targets(
+                425,
+                targets.clone(),
+                move |_| {
+                    attempted_runner.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Ok(VerificationReport::from_evidence(
+                            CheckEvidence::Failing,
+                        ))
+                    }
+                },
+                |mut admitted_targets| async move {
+                    admitted_targets[0].head_sha = "head-b".to_string();
+                    Ok(admitted_targets)
+                },
+                |post_targets| async move { Ok(post_targets) },
+            )
+            .await
+            .expect("mismatched admitted target is fail-closed");
+
+        assert_eq!(report.evidence, CheckEvidence::NotProduced);
+        assert_eq!(runner_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            flight
+                .cached_read_only(425, &targets)
+                .expect("cache lookup after target mismatch"),
+            None,
+            "the pre-admission memo must be invalidated"
+        );
+    }
+
+    #[tokio::test]
     async fn cached_only_checks_never_start_a_runner_and_reuse_a_fresh_memo() {
         let flight = Arc::new(CheckFlight::new(CHECK_EVIDENCE_TTL, 1));
         let runs = Arc::new(AtomicUsize::new(0));
@@ -6220,9 +6506,12 @@ mod tests {
         .expect("completed check must not wait for its redirected background child")
         .expect("completed check execution");
         match outcome {
-            BoundedCheckOutcome::Completed(result) => assert_eq!(result.status, "pass"),
-            BoundedCheckOutcome::NotProduced { .. } => {
-                panic!("completed check unexpectedly lost its result")
+            BoundedCheckOutcome::NotProduced { output_tail } => assert!(
+                output_tail.contains("left 1 background process"),
+                "daemonizing checks must be discarded with an ownership reason: {output_tail}"
+            ),
+            BoundedCheckOutcome::Completed(_) => {
+                panic!("a check that leaves a background process must not publish pass evidence")
             }
         }
 
@@ -6263,6 +6552,73 @@ mod tests {
             reaped,
             "completed check must leave no live process in the check's group: {pids:?}"
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn completed_check_reaps_a_setsid_child_after_the_direct_parent_exits() {
+        let perl_status = std::process::Command::new("perl")
+            .args(["-MPOSIX", "-e", "exit 0"])
+            .status();
+        let Ok(perl_status) = perl_status else {
+            eprintln!("perl unavailable — skipping completed setsid check test");
+            return;
+        };
+        if !perl_status.success() {
+            eprintln!("perl POSIX unavailable — skipping completed setsid check test");
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("temporary completed setsid fixture");
+        let pid_file = root.path().join("completed-setsid-child.pid");
+        let perl_script = r#"my $file = shift; my $pid = fork(); if (!$pid) { POSIX::setsid(); open(STDOUT, '>', '/dev/null'); open(STDERR, '>', '/dev/null'); open(my $fh, '>', $file) or die $!; print {$fh} "$$\n"; close($fh); exec('sleep', '30'); } select(undef, undef, undef, 0.1); exit 0;"#;
+        let check = crate::check::Check {
+            name: "completed-setsid-child".to_string(),
+            program: "perl".to_string(),
+            args: vec![
+                "-MPOSIX".to_string(),
+                "-e".to_string(),
+                perl_script.to_string(),
+                pid_file.to_string_lossy().into_owned(),
+            ],
+        };
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_bounded_check(root.path(), &check, Duration::from_secs(5)),
+        )
+        .await
+        .expect("setsid parent-exit check returns")
+        .expect("setsid parent-exit execution");
+        match outcome {
+            BoundedCheckOutcome::NotProduced { output_tail } => assert!(
+                output_tail.contains("background process"),
+                "escaped ownership must invalidate evidence: {output_tail}"
+            ),
+            BoundedCheckOutcome::Completed(_) => {
+                panic!("an escaped setsid child must prevent pass evidence")
+            }
+        }
+
+        let child_pid = std::fs::read_to_string(&pid_file)
+            .expect("setsid child records pid")
+            .trim()
+            .parse::<i32>()
+            .expect("numeric setsid child pid");
+        let mut reaped = false;
+        for _ in 0..40 {
+            if !process_is_live(child_pid) {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if !reaped {
+            if let Some(group) = process_group_id(child_pid) {
+                crate::proc_registry::kill_group(group);
+            }
+        }
+        assert!(reaped, "escaped setsid child must be reaped: {child_pid}");
     }
 
     #[tokio::test]

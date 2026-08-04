@@ -4596,6 +4596,26 @@ pub async fn set_session_status(db: &Db, session_id: i32, status: &str) -> Resul
     Ok(())
 }
 
+/// Strict activity transition for an about-to-start worker turn. Unlike the
+/// best-effort lifecycle helper above, a missing row is an admission failure:
+/// the caller must not mutate an untracked checkout while durable state still
+/// appears idle (or no longer has an owning session at all).
+pub async fn set_existing_session_status(
+    db: &Db,
+    session_id: i32,
+    status: &str,
+) -> Result<()> {
+    let updated = session::Entity::update_many()
+        .col_expr(session::Column::Status, Expr::value(status.to_string()))
+        .filter(session::Column::Id.eq(session_id))
+        .exec(&db.0)
+        .await?;
+    if updated.rows_affected != 1 {
+        anyhow::bail!("session {session_id} no longer exists");
+    }
+    Ok(())
+}
+
 /// One-time upgrade reconcile: before honest activity status existed, `status`
 /// was a write-once high-water-mark (`running` on attach, never reset to idle),
 /// so every legacy worker row reads `running`/`starting` regardless of whether

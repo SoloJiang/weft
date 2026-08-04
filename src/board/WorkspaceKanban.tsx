@@ -17,7 +17,6 @@ import { inheritedAccessOf } from "../lib/grants";
 import { cn } from "../lib/cn";
 import {
   beginReadinessRefresh,
-  buildReadinessWorktreeSignatures,
   buildReadinessKey,
   completeReadinessRefresh,
   failReadinessRefresh,
@@ -207,7 +206,6 @@ function ThreadCard({
     leadTurn,
     authGrants,
     readOnlyGrants,
-    worktreesByDirection,
   } = useStore();
   const { t } = useTranslation();
   const [storedReadiness, setStoredReadiness] = useState<StoredReadiness<IssueReadinessDto> | null>(
@@ -226,7 +224,11 @@ function ThreadCard({
   const readinessKey = buildReadinessKey({
     directions: readinessDirections,
     attentionIds: threadAttentionIds(o, attentionItems),
-    worktrees: buildReadinessWorktreeSignatures(readinessDirections, worktreesByDirection),
+    worktrees: (o.readiness_worktrees ?? []).map((worktree) => ({
+      directionId: worktree.direction_id,
+      worktreeId: worktree.worktree_id,
+      exists: worktree.exists,
+    })),
     workerSessions: Object.values(sessions).map((session) => ({
       directionId: session.directionId,
       repoId: session.repoId,

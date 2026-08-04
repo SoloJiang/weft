@@ -418,13 +418,16 @@ test("reclaiming one of two worktrees invalidates readiness deterministically", 
   );
 });
 
-test("WorkspaceKanban uses the row-level worktree readiness signatures", () => {
+test("WorkspaceKanban uses portfolio worktree signatures for unopened cards", () => {
   const source = readFileSync(workspaceKanbanPath, "utf8");
 
   assert.match(
     source,
-    /worktrees:\s*buildReadinessWorktreeSignatures\(readinessDirections, worktreesByDirection\)/,
+    /worktrees:\s*\(o\.readiness_worktrees \?\? \[\]\)\.map\(\(worktree\) => \(\{/,
   );
+  assert.match(source, /worktreeId:\s*worktree\.worktree_id/);
+  assert.doesNotMatch(source, /buildReadinessWorktreeSignatures/);
+  assert.doesNotMatch(source, /worktreesByDirection/);
   assert.doesNotMatch(source, /\.some\(\(worktree\) => worktree\.exists\)/);
 });
 
