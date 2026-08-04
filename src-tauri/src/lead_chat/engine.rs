@@ -31,14 +31,62 @@ pub const STATUS_STOPPED: &str = "stopped";
 pub const BUS_WAKE_PROMPT: &str =
     "You have new messages on the thread bus. Call bus_inbox to read them. After incorporating any durable human answers that carry request_id, call bus_ack with those ids.";
 
+const WORKER_ACTIVITY_RETRY_INITIAL: std::time::Duration =
+    std::time::Duration::from_millis(25);
+const WORKER_ACTIVITY_RETRY_MAX: std::time::Duration = std::time::Duration::from_millis(200);
+const WORKER_ACTIVITY_RETRY_ATTEMPTS: u32 = 5;
+
+/// A worker's durable activity row is the readiness/worktree-ownership fence.
+/// Retry transient SQLite errors before exposing the transition. Callers hold
+/// the engine mutex across this await, so a later start/stop cannot overtake
+/// these writes. If SQLite remains unavailable, readiness still consumes the
+/// process-live activity recorded at the same serialized transition; retries
+/// are bounded so Stop/control cannot be wedged forever by a broken database.
+async fn persist_worker_activity_with_retry<F, Fut>(
+    session_id: i32,
+    status: &str,
+    mut persist: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let mut delay = WORKER_ACTIVITY_RETRY_INITIAL;
+    for attempt in 1..=WORKER_ACTIVITY_RETRY_ATTEMPTS {
+        match persist().await {
+            Ok(()) => return,
+            Err(error) => {
+                if attempt == 1 {
+                    eprintln!(
+                        "[weft] session {session_id} status {status:?} persistence failed; retrying: {error}"
+                    );
+                } else if attempt == WORKER_ACTIVITY_RETRY_ATTEMPTS {
+                    eprintln!(
+                        "[weft] session {session_id} status {status:?} remains unpersisted after {attempt} attempts; using live engine activity: {error}"
+                    );
+                }
+                if attempt == WORKER_ACTIVITY_RETRY_ATTEMPTS {
+                    break;
+                }
+                tokio::time::sleep(delay).await;
+                delay = std::cmp::min(delay.saturating_mul(2), WORKER_ACTIVITY_RETRY_MAX);
+            }
+        }
+    }
+}
+
 /// Persist the turn-activity status for whichever surface this engine drives:
 /// a worker session row (`Some`) or the lead's per-thread meta row (`None`).
 async fn persist_activity(db: &Db, session_id: Option<i32>, thread_id: i32, status: &str) {
     match session_id {
         Some(sid) => {
-            let _ = repo::set_session_status(db, sid, status).await;
+            persist_worker_activity_with_retry(sid, status, || {
+                repo::set_session_status(db, sid, status)
+            })
+            .await;
         }
         None => {
+            // Lead metadata is not a worktree/readiness ownership fence; retain
+            // its historical best-effort behavior.
             let _ = repo::set_lead_status(db, thread_id, status).await;
         }
     }
@@ -2957,6 +3005,20 @@ impl LeadChatState {
         !inner.stopped && inner.turn.busy
     }
 
+    /// Process-live worktree ownership used by readiness. Unlike
+    /// `worker_is_running`'s routing meaning, a stopped/manual-takeover engine
+    /// still owns its checkout. A contended engine mutex is conservatively
+    /// active; an idle cached engine is the authoritative override for a stale
+    /// durable `running` row after a terminal status write failure.
+    pub fn worker_activity(&self, session_id: i32) -> Option<bool> {
+        let engine = self.get(i64::from(session_id))?;
+        let activity = match engine.try_lock() {
+            Ok(inner) => Some(inner.stopped || inner.turn.busy),
+            Err(_) => Some(true),
+        };
+        activity
+    }
+
     /// Remove an engine only when the caller still owns the exact cached Arc.
     /// An initial-open failure must not tear down a newer engine that won a
     /// concurrent reconstruction race.
@@ -2965,6 +3027,27 @@ impl LeadChatState {
             .remove_if(&key, |_, current| Arc::ptr_eq(current, expected))
             .map(|(_, engine)| engine)
     }
+}
+
+/// Resolve one worker against the current app's live engine registry. Wait
+/// briefly for a terminal transition that is still holding the engine mutex;
+/// this closes the idle-push/verification race without letting a long stdin or
+/// tool operation stall readiness. Tests and startup paths without a managed
+/// app return `None`, leaving the durable session status authoritative.
+pub(crate) async fn live_worker_activity(session_id: i32) -> Option<bool> {
+    let app = crate::APP_HANDLE.get()?;
+    let state = app.try_state::<LeadChatState>()?;
+    let engine = state.get(i64::from(session_id))?;
+    let activity = match tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        engine.lock(),
+    )
+    .await
+    {
+        Ok(inner) => Some(inner.stopped || inner.turn.busy),
+        Err(_) => Some(true),
+    };
+    activity
 }
 
 /// Serialize a worker's first-route ownership across planner pinning and engine
@@ -10688,6 +10771,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_idle_write_is_retried_before_terminal_activity_returns() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let retry_started = Arc::new(tokio::sync::Notify::new());
+        let release_retry = Arc::new(tokio::sync::Notify::new());
+        let persisted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = tokio::spawn({
+            let attempts = Arc::clone(&attempts);
+            let retry_started = Arc::clone(&retry_started);
+            let release_retry = Arc::clone(&release_retry);
+            let persisted = Arc::clone(&persisted);
+            async move {
+                persist_worker_activity_with_retry(42, "idle", move || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    let retry_started = Arc::clone(&retry_started);
+                    let release_retry = Arc::clone(&release_retry);
+                    let persisted = Arc::clone(&persisted);
+                    async move {
+                        if attempt == 0 {
+                            anyhow::bail!("injected transient SQLite failure");
+                        }
+                        retry_started.notify_one();
+                        release_retry.notified().await;
+                        persisted.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }
+                })
+                .await;
+            }
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            retry_started.notified(),
+        )
+        .await
+        .expect("terminal status retry starts");
+        assert!(
+            !task.is_finished(),
+            "the terminal transition must not return before idle is durable"
+        );
+        assert!(
+            !persisted.load(Ordering::SeqCst),
+            "a failed write cannot be trusted as terminal activity"
+        );
+
+        release_retry.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("terminal status retry completes")
+            .expect("terminal status task joins");
+        assert!(persisted.load(Ordering::SeqCst));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn persistent_activity_failure_keeps_control_wait_bounded() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_attempts = Arc::clone(&attempts);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            persist_worker_activity_with_retry(42, "idle", move || {
+                observed_attempts.fetch_add(1, Ordering::SeqCst);
+                async { anyhow::bail!("injected persistent SQLite failure") }
+            }),
+        )
+        .await
+        .expect("persistent status failure must not wedge Stop/control forever");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            WORKER_ACTIVITY_RETRY_ATTEMPTS as usize
+        );
+    }
+
+    #[tokio::test]
     async fn worker_direct_start_waits_for_a_check_that_already_holds_admission() {
         let direction_id = next_worker_admission_test_direction();
         let mut inner = test_inner("codex");
@@ -11374,10 +11531,29 @@ mod tests {
         state.get_or_insert(42, engine.clone());
 
         assert!(!state.worker_is_running(42));
+        assert_eq!(state.worker_activity(42), Some(false));
         engine.lock().await.turn.busy = true;
         assert!(state.worker_is_running(42));
+        assert_eq!(state.worker_activity(42), Some(true));
         engine.lock().await.turn.busy = false;
         assert!(!state.worker_is_running(42));
+        let idle_guard = engine.lock().await;
+        assert_eq!(
+            state.worker_activity(42),
+            Some(true),
+            "a contended live engine must fail active"
+        );
+        drop(idle_guard);
+        engine.lock().await.stopped = true;
+        assert!(
+            !state.worker_is_running(42),
+            "manual takeover is not a headless routing turn"
+        );
+        assert_eq!(
+            state.worker_activity(42),
+            Some(true),
+            "manual takeover still owns the worktree for readiness"
+        );
     }
 
     #[tokio::test]

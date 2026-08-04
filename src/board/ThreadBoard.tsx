@@ -224,6 +224,10 @@ export function ThreadBoard() {
           return;
         }
         unlisten = nextUnlisten;
+        // Close the fetch/listen handoff: a PR change that landed before the
+        // async listener registration is recovered by one fresh request after
+        // registration. Request revisions reject any older response.
+        setPrReadinessRevision((revision) => revision + 1);
       })
       .catch(() => {});
     return () => {

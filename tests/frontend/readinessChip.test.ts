@@ -12,6 +12,7 @@ const chipPath = new URL("../../src/components/ReadinessChip.tsx", import.meta.u
 const readinessKeyPath = new URL("../../src/lib/readinessKey.ts", import.meta.url);
 const threadBoardPath = new URL("../../src/board/ThreadBoard.tsx", import.meta.url);
 const workspaceKanbanPath = new URL("../../src/board/WorkspaceKanban.tsx", import.meta.url);
+const storePath = new URL("../../src/state/store.tsx", import.meta.url);
 
 type ReadinessDto = {
   readiness: string;
@@ -502,6 +503,20 @@ test("WorkspaceKanban same-status proposal re-proposal synchronously hides an ot
   );
 });
 
+test("proposal pushes refresh unopened workspace-card proposal versions", () => {
+  const source = readFileSync(storePath, "utf8");
+  const proposalPush = source.match(
+    /if \(p\.message\.kind === "proposal"\) \{[\s\S]*?\n\s*\}/,
+  )?.[0];
+
+  assert.ok(proposalPush, "the lead-chat listener handles proposal pushes");
+  assert.match(
+    proposalPush,
+    /refreshOverviewRef\.current\(true\)/,
+    "background proposals force a trailing overview refresh even during an in-flight poll",
+  );
+});
+
 test("ThreadBoard keys readiness with proposal status and its stable version", () => {
   const source = readFileSync(threadBoardPath, "utf8");
 
@@ -510,6 +525,23 @@ test("ThreadBoard keys readiness with proposal status and its stable version", (
     /planReadinessSignature = `\$\{proposal\.status\}:\$\{proposal\.created_at\}`/,
   );
   assert.match(source, /planStatus:\s*planReadinessSignature,/);
+});
+
+test("both boards refresh once after PR listener registration closes the initial fetch gap", () => {
+  for (const source of [
+    readFileSync(threadBoardPath, "utf8"),
+    readFileSync(workspaceKanbanPath, "utf8"),
+  ]) {
+    assert.match(
+      source,
+      /unlisten = nextUnlisten;[\s\S]*?setPrReadinessRevision\(\(revision\) => revision \+ 1\);/,
+    );
+    assert.match(
+      source,
+      /isReadinessResponseApplicable\([\s\S]*?readinessRequestRevisionRef\.current/,
+      "the post-registration fetch must make an older initial response inapplicable",
+    );
+  }
 });
 
 test("worker terminal status changes synchronously hide a prior verdict", async () => {

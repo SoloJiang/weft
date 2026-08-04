@@ -111,14 +111,23 @@
 //! worktree-occupancy boundary exactly: `running`, `starting`, and `stopped`.
 //! `engine::persist_activity` persists `running` while a worker turn is active
 //! and `idle` once it drains; the frontend-only `busy` push state is not a
-//! stored session value. `reviving` is only a revive-operation label and is
-//! not persisted as `session.status`. This retains check.rs's
+//! stored session value. Terminal writes retry with bounded backoff. While the
+//! app is live, collection also reconciles each current session against its
+//! engine under a 250ms bounded lock wait, so an idle engine cannot remain
+//! blocked forever by a stale durable `running` row; a missing engine falls
+//! back to durable state and a contended engine fails active. `reviving` is
+//! only a revive-operation label and is not persisted as `session.status`.
+//! This retains check.rs's
 //! worker-done-means-checks-green contract without turning ordinary in-progress
 //! work into automatic build/test execution.
 //! An inferred zero-rung suite is `NotProduced`, never `Passed`: no configured
 //! check is missing verification evidence rather than proof of delivery.
 //!
-//! Readiness checks reuse `check::infer_checks`, but run each inferred rung in
+//! Manifest inference itself runs off the async executor with a one-second
+//! deadline and a process-wide two-task cap. A timed-out blocking task keeps
+//! its permit until it really exits, so stalled network/FUSE mounts cannot
+//! accumulate unbounded manifest readers; unavailable inference produces
+//! `NotProduced`. Readiness checks then run each inferred rung in
 //! a kill-on-drop Tokio child with a 120-second per-rung deadline. Every check
 //! and Git-signature child is configured and registered with
 //! `proc_registry::Owner::probe`. On Unix, a timeout, child-wait failure, or
@@ -905,9 +914,11 @@ fn virtual_lane_facts(
 
 const CHECK_EVIDENCE_TTL: Duration = Duration::from_secs(10 * 60);
 const READINESS_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
+const CHECK_INFERENCE_TIMEOUT: Duration = Duration::from_secs(1);
 const GIT_SIGNATURE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const BOUNDED_PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_CONCURRENT_CHECK_RUNNERS: usize = 2;
+const MAX_CONCURRENT_CHECK_INFERENCES: usize = 2;
 const MAX_CONCURRENT_GIT_PROBES: usize = 4;
 const MAX_CONCURRENT_MARKER_SWEEPS: usize = 2;
 const MARKER_SWEEP_TIMEOUT: Duration = Duration::from_millis(250);
@@ -1537,6 +1548,10 @@ fn worker_session_occupies_worktree(status: &str) -> bool {
     matches!(status, "running" | "starting" | "stopped")
 }
 
+fn reconciled_worker_activity(status: &str, live_worker_activity: Option<bool>) -> bool {
+    live_worker_activity.unwrap_or_else(|| worker_session_occupies_worktree(status))
+}
+
 async fn latest_worker_facts(db: &Db, direction_id: i32) -> Result<WorkerSessionFacts> {
     // A multi-repo direction dispatches one worker per worktree. Sort every
     // session newest-first, then retain the first row for each repository slot
@@ -1550,17 +1565,34 @@ async fn latest_worker_facts(db: &Db, direction_id: i32) -> Result<WorkerSession
         .await?;
     let mut seen_repo_ids = HashSet::new();
     let mut facts = WorkerSessionFacts::default();
-
-    for session in sessions {
-        if !seen_repo_ids.insert(session.repo_id) {
-            continue;
+    let current_sessions = sessions
+        .into_iter()
+        .filter(|session| seen_repo_ids.insert(session.repo_id))
+        .collect::<Vec<_>>();
+    // A contended engine lookup waits at most 250ms. Probe repository slots
+    // concurrently so a multi-repo direction still has one total live-state
+    // budget rather than multiplying that wait by its repository count.
+    let live_sessions = futures::future::join_all(current_sessions.into_iter().map(|session| {
+        async move {
+            let activity = crate::lead_chat::engine::live_worker_activity(session.id).await;
+            (session, activity)
         }
+    }))
+    .await;
+
+    for (session, live_worker_activity) in live_sessions {
 
         // Match materialize::remove_direction_worktree's exact worktree
         // safety boundary: a worker can own the checkout while it is starting,
         // running, or taken over in a human terminal (stopped). `reviving` is
         // a revive operation label, not a persisted session.status value.
-        let active = worker_session_occupies_worktree(session.status.as_str());
+        // A live engine is the authoritative checkout owner for this process.
+        // In particular, an idle override reconciles a durable `running` row
+        // left by a terminal SQLite write failure. A live lookup waits briefly
+        // for a serialized terminal transition, then fails active if the lock
+        // remains contended. Without a live engine (including after restart),
+        // the durable status remains authoritative.
+        let active = reconciled_worker_activity(session.status.as_str(), live_worker_activity);
         if active {
             facts.active = true;
             // The active turn supersedes this same session's prior terminal
@@ -2804,6 +2836,51 @@ async fn run_readiness_checks(paths: Vec<String>, timeout: Duration) -> Result<C
     Ok(CheckEvidence::Passed)
 }
 
+fn check_inference_limit() -> &'static Arc<Semaphore> {
+    static LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    LIMIT.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_CHECK_INFERENCES)))
+}
+
+async fn run_bounded_check_inference_with<F>(
+    deadline: tokio::time::Instant,
+    limit: Arc<Semaphore>,
+    infer: F,
+) -> Option<Vec<crate::check::Check>>
+where
+    F: FnOnce() -> Vec<crate::check::Check> + Send + 'static,
+{
+    if tokio::time::Instant::now() >= deadline {
+        return None;
+    }
+    let permit = match tokio::time::timeout_at(deadline, limit.acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) | Err(_) => return None,
+    };
+    let task = tokio::task::spawn_blocking(move || {
+        // A timed-out blocking task keeps this permit until the filesystem
+        // call really returns. Later callers fail closed at their own deadline
+        // instead of spawning an unbounded queue against the same stalled mount.
+        let _permit = permit;
+        infer()
+    });
+    match tokio::time::timeout_at(deadline, task).await {
+        Ok(Ok(checks)) => Some(checks),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+async fn infer_readiness_checks(
+    path: PathBuf,
+    timeout: Duration,
+) -> Option<Vec<crate::check::Check>> {
+    let budget = std::cmp::min(timeout, CHECK_INFERENCE_TIMEOUT);
+    let deadline = tokio::time::Instant::now() + budget;
+    run_bounded_check_inference_with(deadline, Arc::clone(check_inference_limit()), move || {
+        crate::check::infer_checks(&path)
+    })
+    .await
+}
+
 async fn run_verification_checks(
     targets: Vec<CheckTarget>,
     timeout: Duration,
@@ -2818,7 +2895,15 @@ async fn run_verification_checks(
     for target in targets {
         let repo = target.repo;
         let worktree = target.path;
-        let checks = crate::check::infer_checks(Path::new(&worktree));
+        let Some(checks) = infer_readiness_checks(PathBuf::from(&worktree), timeout).await else {
+            saw_not_produced = true;
+            repo_checks.push(RepoChecks {
+                repo,
+                worktree,
+                checks: Vec::new(),
+            });
+            continue;
+        };
         let (evidence, checks) =
             run_checks_with_timeout_report(Path::new(&worktree), &checks, timeout).await?;
         if evidence == CheckEvidence::Failing {
@@ -3463,6 +3548,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_idle_worker_reconciles_a_failed_terminal_status_write() {
+        let (db, direction, _thread_id, first_repo_id, _second_repo_id) =
+            multi_repo_worker_fixture().await;
+        let worker = repo::create_session(
+            &db,
+            direction.id,
+            first_repo_id,
+            "claude",
+            "/tmp/live-idle-worker",
+        )
+        .await
+        .expect("worker session");
+        repo::set_session_status(&db, worker.id, "running")
+            .await
+            .expect("simulate stale durable running status");
+
+        let durable = latest_worker_facts(&db, direction.id)
+            .await
+            .expect("durable worker facts");
+        assert!(durable.active, "the stale durable row remains conservative");
+
+        assert!(
+            !reconciled_worker_activity("running", Some(false)),
+            "an idle live engine must unblock verification after its idle SQLite write failed"
+        );
+        assert!(
+            reconciled_worker_activity("idle", Some(true)),
+            "a live turn must remain active even before a durable status refresh"
+        );
+    }
+
+    #[tokio::test]
     async fn admission_target_recheck_refuses_a_worker_that_started_after_collection() {
         let db = Db::connect("sqlite::memory:").await.expect("memory db");
         let workspace = repo::create_workspace(&db, "admission recheck")
@@ -4084,6 +4201,64 @@ mod tests {
             return None;
         }
         String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_manifest_inference_is_deadline_bounded_and_caps_blocking_tasks() {
+        let limit = Arc::new(Semaphore::new(1));
+        let release = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let first_release = Arc::clone(&release);
+        let first_started = Arc::clone(&started);
+        let first_limit = Arc::clone(&limit);
+        let first = tokio::spawn(async move {
+            run_bounded_check_inference_with(
+                tokio::time::Instant::now() + Duration::from_millis(100),
+                first_limit,
+                move || {
+                    first_started.notify_one();
+                    while !first_release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Vec::new()
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("blocking manifest fixture starts");
+        assert_eq!(
+            first.await.expect("bounded inference task joins"),
+            None,
+            "a stalled manifest read must release the async caller at its deadline"
+        );
+
+        let second_started = Arc::new(AtomicBool::new(false));
+        let second_observed = Arc::clone(&second_started);
+        let second = run_bounded_check_inference_with(
+            tokio::time::Instant::now() + Duration::from_millis(20),
+            Arc::clone(&limit),
+            move || {
+                second_observed.store(true, Ordering::SeqCst);
+                Vec::new()
+            },
+        )
+        .await;
+        assert_eq!(second, None);
+        assert!(
+            !second_started.load(Ordering::SeqCst),
+            "a timed-out manifest read must retain its permit and cap later blocking work"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while limit.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("stalled manifest fixture releases its blocking permit");
     }
 
     #[tokio::test(flavor = "current_thread")]
