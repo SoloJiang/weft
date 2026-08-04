@@ -54,6 +54,7 @@
 //! | most recent worker turn ended `error` | Failed | WorkerFailed |
 //! | answerable bus ask is open for the direction | NeedsYou | OpenNeed |
 //! | policy needs a human gate | NeedsYou | PolicyGatePending |
+//! | latest worker session is active while direction status is `review` or `done` | Unknown | InProgress |
 //! | at least one tracked PR is `merged`, and the deterministic reduction of every tracked PR is clear | ReviewReady | — |
 //! | worktree/branch reconciliation drifted | Blocked | ExecutionDrifted |
 //! | an inferred check failed for a claimed-complete lane | Blocked | ChecksFailing |
@@ -80,24 +81,30 @@
 //! A CLI-reported `review`/`done` state is intentionally last: it cannot
 //! override drift, remote uncertainty, or missing checks. A lane without a PR
 //! skips the PR rows entirely; a PR is not a prerequisite for single-repo
-//! review readiness. A merged tracked PR is different only when every tracked
-//! PR row is clear: after the three human gates above, that all-clear merge set
-//! is terminal delivery evidence and makes the lane `ReviewReady` even when its
-//! old worktree has been reclaimed or a predecessor remains pending. A failing,
-//! conflicting, closed-unmerged, or unknown sibling PR remains in the normal
-//! deterministic reduction and cannot be bypassed. An unresolved worker
-//! failure, open ask, or policy gate is still reported first because it needs a
-//! human response.
+//! review readiness. A worker that is currently editing a claimed-complete
+//! lane is instead `Unknown[InProgress]`: that state is neither a failed check
+//! nor missing remote evidence, and no verifier may read its intermediate
+//! checkout. A merged tracked PR is different only when every tracked PR row
+//! is clear: after the three human gates above and with no active worker, that
+//! all-clear merge set is terminal delivery evidence and makes the lane
+//! `ReviewReady` even when its old worktree has been reclaimed or a predecessor
+//! remains pending. A failing, conflicting, closed-unmerged, or unknown sibling
+//! PR remains in the normal deterministic reduction and cannot be bypassed. An
+//! unresolved worker failure, open ask, or policy gate is still reported first
+//! because it needs a human response.
 //!
 //! Check collection is intentionally gated by claimed completion: only
 //! `review` and `done` lanes invoke inferred checks. The collector records
 //! `NotApplicable` for `queued`, `planning`, and `working` lanes; that evidence
 //! skips both check-failing and check-unknown verdict rows. Before it invokes a
 //! check runner, collection also short-circuits every decisive first-match gate:
-//! worker failure, an open direction ask, a policy gate, an all-clear merged PR
-//! set, or reconciliation drift. It records `NotApplicable` for those lanes,
-//! because the winner is already known and a mismatched checkout is not a safe
-//! target for build/test work. This retains check.rs's
+//! worker failure, an open direction ask, a policy gate, an active worker on a
+//! claimed-complete lane, an all-clear merged PR set, or reconciliation drift.
+//! It records `NotApplicable` for those lanes, because the winner is already
+//! known and a changing or mismatched checkout is not a safe target for
+//! build/test work. `engine::persist_activity` persists `running` while a
+//! worker turn is active and `idle` once it drains; the frontend-only `busy`
+//! push state is not a stored session value. This retains check.rs's
 //! worker-done-means-checks-green contract without turning ordinary in-progress
 //! work into automatic build/test execution.
 //! An inferred zero-rung suite is `NotProduced`, never `Passed`: no configured
@@ -106,13 +113,15 @@
 //! Readiness checks reuse `check::infer_checks`, but run each inferred rung in
 //! a kill-on-drop Tokio child with a 120-second per-rung deadline. On Unix each
 //! child leads its own process group, and a timeout or child-wait failure kills
-//! that whole group before returning `NotProduced`; non-Unix platforms retain
-//! the direct-child kill-on-drop fallback. A completed failing rung remains
-//! `Failing` even if a later rung times out or cannot be awaited. Completed
-//! stdout and stderr are read continuously into one bounded 2000-byte tail
-//! buffer, so a noisy check cannot accumulate unbounded output before its
-//! deadline. Completed output uses the same combined-output tail convention as
-//! `CheckResult`.
+//! that whole group before returning `NotProduced`. A normally completed child
+//! also gets a best-effort group sweep before its result is returned, so a
+//! background descendant that redirected its pipes cannot outlive a passing or
+//! failing check. Non-Unix platforms retain the direct-child kill-on-drop
+//! fallback. A completed failing rung remains `Failing` even if a later rung
+//! times out or cannot be awaited. Completed stdout and stderr are read
+//! continuously into one bounded 2000-byte tail buffer, so a noisy check cannot
+//! accumulate unbounded output before its deadline. Completed output uses the
+//! same combined-output tail convention as `CheckResult`.
 //! The process-local single-flight cache is valid for at most 10 minutes and
 //! only while its sorted worktree-path, HEAD-SHA, and clean-worktree signatures
 //! match the newly collected values; any HEAD change immediately reruns checks.
@@ -353,6 +362,7 @@ pub struct LaneFacts {
     pub active: bool,
     pub policy: PolicyDecision,
     pub worker_failed: bool,
+    pub worker_active: bool,
     pub has_open_ask: bool,
     pub reconciliation: ExecutionReconciliation,
     pub checks: CheckEvidence,
@@ -540,6 +550,13 @@ pub fn lane_readiness(facts: &LaneFacts) -> Option<LaneReadinessDto> {
             Some(ReasonCode::PolicyGatePending),
         ));
     }
+    if worker_active_preempts_completion(facts.worker_active, facts.direction_status.as_str()) {
+        return Some(lane_verdict(
+            facts,
+            LaneReadiness::Unknown,
+            Some(ReasonCode::InProgress),
+        ));
+    }
     // Merge is terminal delivery evidence only when every tracked row is clear.
     // It intentionally comes after the human-action gates above, but before
     // local execution, predecessor, and live-host evidence that may disappear
@@ -723,6 +740,14 @@ fn direction_is_active(direction: &direction::Model) -> bool {
     !matches!(direction.status.as_str(), "inactive" | "cancelled")
 }
 
+fn direction_claimed_completion(status: &str) -> bool {
+    matches!(status, "review" | "done")
+}
+
+fn worker_active_preempts_completion(worker_active: bool, direction_status: &str) -> bool {
+    worker_active && direction_claimed_completion(direction_status)
+}
+
 fn proposal_lane_policy(proposed_lane: &crate::planner::ProposedDirection) -> PolicyDecision {
     match proposed_lane.decision.as_str() {
         "denied" => PolicyDecision::Denied,
@@ -759,6 +784,7 @@ fn virtual_lane_facts(
         active: true,
         policy,
         worker_failed: false,
+        worker_active: false,
         has_open_ask: false,
         reconciliation,
         checks: CheckEvidence::NotApplicable,
@@ -1162,10 +1188,20 @@ fn check_flight() -> &'static CheckFlight {
     CHECK_FLIGHT.get_or_init(|| CheckFlight::new(CHECK_EVIDENCE_TTL, MAX_CONCURRENT_CHECK_RUNNERS))
 }
 
-async fn latest_worker_failed(db: &Db, direction_id: i32) -> Result<bool> {
+#[derive(Clone, Copy, Debug, Default)]
+struct WorkerSessionFacts {
+    failed: bool,
+    active: bool,
+}
+
+async fn latest_worker_facts(db: &Db, direction_id: i32) -> Result<WorkerSessionFacts> {
     let Some(session) = repo::latest_session_for_direction(db, direction_id).await? else {
-        return Ok(false);
+        return Ok(WorkerSessionFacts::default());
     };
+    // engine::persist_activity writes `running` while `inner.turn.busy` and
+    // flips the session row to `idle` when the turn drains. `busy` is only the
+    // Push::Turn wire vocabulary, so it is deliberately not matched here.
+    let active = session.status == "running";
     // engine::finalize_text_row persists the turn's terminal state by calling
     // repo::update_lead_message on an assistant/text row. Assistant/tool rows
     // describe individual tool calls, so their `error` cannot diagnose the
@@ -1178,7 +1214,10 @@ async fn latest_worker_failed(db: &Db, direction_id: i32) -> Result<bool> {
         .order_by_desc(lead_message::Column::Id)
         .one(&db.0)
         .await?;
-    Ok(latest.is_some_and(|message| message.status == "error"))
+    Ok(WorkerSessionFacts {
+        failed: latest.is_some_and(|message| message.status == "error"),
+        active,
+    })
 }
 
 async fn reconciliation_for(
@@ -1290,7 +1329,7 @@ where
     F: FnOnce(Vec<String>) -> Fut,
     Fut: Future<Output = Result<CheckEvidence>>,
 {
-    if !matches!(direction.status.as_str(), "review" | "done") {
+    if !direction_claimed_completion(direction.status.as_str()) {
         return Ok(CheckEvidence::NotApplicable);
     }
 
@@ -1453,8 +1492,8 @@ enum BoundedCheckOutcome {
 }
 
 /// A Unix check command owns a fresh process group. Keep the group armed until
-/// the direct child has been reaped successfully so cancellation, timeout, or a
-/// child-wait error cannot strand ordinary descendants such as compilers.
+/// every return path has swept it: a direct child can exit normally while a
+/// redirected background descendant remains in that group.
 #[cfg(unix)]
 struct BoundedCheckProcessGroup {
     pgid: Option<i32>,
@@ -1466,10 +1505,6 @@ impl BoundedCheckProcessGroup {
         Self {
             pgid: child_id.map(|pid| pid as i32),
         }
-    }
-
-    fn disarm(&mut self) {
-        self.pgid = None;
     }
 
     fn kill(&mut self) {
@@ -1560,7 +1595,11 @@ async fn run_bounded_check(
     match waited {
         Ok(Ok(status)) => {
             #[cfg(unix)]
-            process_group.disarm();
+            // The direct child is already reaped, so this only sweeps residual
+            // group members (for example `sh -c 'server >/dev/null 2>&1 &'`).
+            // Do this for both pass and fail exits; otherwise a successful
+            // check could leave a background process mutating the checkout.
+            process_group.kill();
             let output_tail = rendered_check_output_tail(&output_tail)?;
             Ok(BoundedCheckOutcome::Completed(crate::check::CheckResult {
                 name: check.name.clone(),
@@ -1663,6 +1702,8 @@ async fn checks_for(
 
 fn checks_are_preempted(
     worker_failed: bool,
+    worker_active: bool,
+    direction_status: &str,
     has_open_ask: bool,
     policy: PolicyDecision,
     reconciliation: ExecutionReconciliation,
@@ -1672,12 +1713,15 @@ fn checks_are_preempted(
     worker_failed
         || has_open_ask
         || policy == PolicyDecision::NeedsGate
+        || worker_active_preempts_completion(worker_active, direction_status)
         || has_all_clear_merged_pull_request(pull_requests, open_pr_snapshot_freshness)
         || reconciliation == ExecutionReconciliation::Drifted
 }
 
 async fn checks_after_decisive_gates<F, Fut>(
     worker_failed: bool,
+    worker_active: bool,
+    direction_status: &str,
     has_open_ask: bool,
     policy: PolicyDecision,
     reconciliation: ExecutionReconciliation,
@@ -1691,6 +1735,8 @@ where
 {
     if checks_are_preempted(
         worker_failed,
+        worker_active,
+        direction_status,
         has_open_ask,
         policy,
         reconciliation,
@@ -1755,6 +1801,7 @@ async fn collect_lane(
             active,
             policy,
             worker_failed: false,
+            worker_active: false,
             has_open_ask: false,
             reconciliation: ExecutionReconciliation::Unknown,
             checks: CheckEvidence::NotApplicable,
@@ -1764,7 +1811,7 @@ async fn collect_lane(
             direction_status: direction.status.clone(),
         });
     }
-    let worker_failed = latest_worker_failed(db, direction.id).await?;
+    let worker = latest_worker_facts(db, direction.id).await?;
     let has_open_ask = open_ask_direction_ids.contains(&direction.id);
     let mut pull_requests = repo::list_pull_requests_for_direction(db, direction.id).await?;
     pull_requests.sort_by_key(|row| row.id);
@@ -1772,11 +1819,13 @@ async fn collect_lane(
         pull_requests.iter().map(pull_request_facts).collect();
     let reconciliation = reconciliation_for(db, direction).await?;
     // Keep collection's cost aligned with `lane_readiness` first-match order.
-    // Once a human-action, all-clear terminal merge, or drift gate decides the
-    // outcome, starting a build/test process cannot add useful delivery
-    // evidence.
+    // Once a human-action, active-worker, all-clear terminal merge, or drift
+    // gate decides the outcome, starting a build/test process cannot add useful
+    // delivery evidence or may race a changing checkout.
     let checks = checks_after_decisive_gates(
-        worker_failed,
+        worker.failed,
+        worker.active,
+        direction.status.as_str(),
         has_open_ask,
         policy,
         reconciliation,
@@ -1790,7 +1839,8 @@ async fn collect_lane(
         name: direction.name.clone(),
         active,
         policy,
-        worker_failed,
+        worker_failed: worker.failed,
+        worker_active: worker.active,
         has_open_ask,
         reconciliation,
         checks,
@@ -2034,6 +2084,7 @@ mod tests {
             active: true,
             policy: PolicyDecision::AllowedByPolicy,
             worker_failed: false,
+            worker_active: false,
             has_open_ask: false,
             reconciliation: ExecutionReconciliation::Matched,
             checks: CheckEvidence::Passed,
@@ -2148,6 +2199,27 @@ mod tests {
         assert_eq!(
             verdict(&lane),
             (LaneReadiness::NeedsYou, Some(ReasonCode::PolicyGatePending))
+        );
+    }
+
+    #[test]
+    fn active_worker_keeps_claimed_completion_in_progress_before_merge_or_drift() {
+        let mut lane = facts();
+        let mut merged = pr();
+        merged.lifecycle = Some(PrLifecycle::Merged);
+        lane.worker_active = true;
+        lane.pull_requests = vec![merged];
+        lane.reconciliation = ExecutionReconciliation::Drifted;
+        lane.checks = CheckEvidence::Failing;
+        assert_eq!(
+            verdict(&lane),
+            (LaneReadiness::Unknown, Some(ReasonCode::InProgress))
+        );
+
+        lane.has_open_ask = true;
+        assert_eq!(
+            verdict(&lane),
+            (LaneReadiness::NeedsYou, Some(ReasonCode::OpenNeed))
         );
     }
 
@@ -2359,6 +2431,8 @@ mod tests {
         assert!(
             !checks_are_preempted(
                 false,
+                false,
+                "review",
                 false,
                 PolicyDecision::AllowedByPolicy,
                 ExecutionReconciliation::Matched,
@@ -3083,6 +3157,73 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_readiness_check_reaps_redirected_background_descendants() {
+        let root = tempfile::tempdir().expect("temporary completed-check fixture");
+        let pid_file = root.path().join("completed-check-processes.pid");
+        let quoted_pid_file = shell_single_quote(&pid_file.to_string_lossy());
+        let script = format!(
+            "sleep 30 >/dev/null 2>&1 & child=$!; printf '%s %s\\n' \"$$\" \"$child\" > {quoted_pid_file}; exit 0"
+        );
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_bounded_check(
+                root.path(),
+                &shell_check("completed-background-descendant", &script),
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("completed check must not wait for its redirected background child")
+        .expect("completed check execution");
+        match outcome {
+            BoundedCheckOutcome::Completed(result) => assert_eq!(result.status, "pass"),
+            BoundedCheckOutcome::NotProduced { .. } => {
+                panic!("completed check unexpectedly lost its result")
+            }
+        }
+
+        let recorded = tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if let Ok(recorded) = std::fs::read_to_string(&pid_file) {
+                    if recorded.split_whitespace().count() == 2 {
+                        return recorded;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completed check shell records its process-group members");
+        let pids: Vec<i32> = recorded
+            .split_whitespace()
+            .map(|pid| pid.parse::<i32>().expect("numeric process id"))
+            .collect();
+        assert_eq!(
+            pids.len(),
+            2,
+            "shell and redirected background descendant must be recorded"
+        );
+
+        let mut reaped = false;
+        for _ in 0..40 {
+            if pids.iter().all(|pid| !process_is_live(*pid)) {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if !reaped {
+            crate::proc_registry::kill_group(pids[0]);
+        }
+        assert!(
+            reaped,
+            "completed check must leave no live process in the check's group: {pids:?}"
+        );
+    }
+
     #[tokio::test]
     async fn decisive_gates_skip_the_check_flight() {
         let flight = Arc::new(CheckFlight::new(Duration::ZERO, 1));
@@ -3091,6 +3232,8 @@ mod tests {
         let skipped_runs = Arc::clone(&runs);
         let evidence = checks_after_decisive_gates(
             false,
+            false,
+            "review",
             false,
             PolicyDecision::AllowedByPolicy,
             ExecutionReconciliation::Drifted,
@@ -3139,6 +3282,8 @@ mod tests {
             Duration::from_millis(100),
             checks_after_decisive_gates(
                 false,
+                false,
+                "review",
                 true,
                 PolicyDecision::AllowedByPolicy,
                 ExecutionReconciliation::Matched,
