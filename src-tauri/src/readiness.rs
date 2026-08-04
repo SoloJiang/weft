@@ -54,7 +54,7 @@
 //! | most recent worker turn ended `error` | Failed | WorkerFailed |
 //! | answerable bus ask is open for the direction | NeedsYou | OpenNeed |
 //! | policy needs a human gate | NeedsYou | PolicyGatePending |
-//! | latest worker session is active while direction status is `review` or `done` | Unknown | InProgress |
+//! | latest worker session is `running`, `starting`, or `stopped` while direction status is `review` or `done` | Unknown | InProgress |
 //! | at least one tracked PR is `merged`, and the deterministic reduction of every tracked PR is clear | ReviewReady | — |
 //! | worktree/branch reconciliation drifted | Blocked | ExecutionDrifted |
 //! | an inferred check failed for a claimed-complete lane | Blocked | ChecksFailing |
@@ -81,15 +81,16 @@
 //! A CLI-reported `review`/`done` state is intentionally last: it cannot
 //! override drift, remote uncertainty, or missing checks. A lane without a PR
 //! skips the PR rows entirely; a PR is not a prerequisite for single-repo
-//! review readiness. A worker that is currently editing a claimed-complete
-//! lane is instead `Unknown[InProgress]`: that state is neither a failed check
-//! nor missing remote evidence, and no verifier may read its intermediate
-//! checkout. A merged tracked PR is different only when every tracked PR row
-//! is clear: after the three human gates above and with no active worker, that
-//! all-clear merge set is terminal delivery evidence and makes the lane
-//! `ReviewReady` even when its old worktree has been reclaimed or a predecessor
-//! remains pending. A failing, conflicting, closed-unmerged, or unknown sibling
-//! PR remains in the normal deterministic reduction and cannot be bypassed. An
+//! review readiness. A worker session that still occupies a claimed-complete
+//! lane (`running`, `starting`, or terminal-takeover `stopped`) instead yields
+//! `Unknown[InProgress]`: that state is neither a failed check nor missing
+//! remote evidence, and no verifier may read its intermediate checkout. A
+//! merged tracked PR is different only when every tracked PR row is clear:
+//! after the three human gates above and with no active worker, that all-clear
+//! merge set is terminal delivery evidence and makes the lane `ReviewReady`
+//! even when its old worktree has been reclaimed or a predecessor remains
+//! pending. A failing, conflicting, closed-unmerged, or unknown sibling PR
+//! remains in the normal deterministic reduction and cannot be bypassed. An
 //! unresolved worker failure, open ask, or policy gate is still reported first
 //! because it needs a human response.
 //!
@@ -102,9 +103,12 @@
 //! claimed-complete lane, an all-clear merged PR set, or reconciliation drift.
 //! It records `NotApplicable` for those lanes, because the winner is already
 //! known and a changing or mismatched checkout is not a safe target for
-//! build/test work. `engine::persist_activity` persists `running` while a
-//! worker turn is active and `idle` once it drains; the frontend-only `busy`
-//! push state is not a stored session value. This retains check.rs's
+//! build/test work. This matches `materialize::remove_direction_worktree`'s
+//! worktree-occupancy boundary exactly: `running`, `starting`, and `stopped`.
+//! `engine::persist_activity` persists `running` while a worker turn is active
+//! and `idle` once it drains; the frontend-only `busy` push state is not a
+//! stored session value. `reviving` is only a revive-operation label and is
+//! not persisted as `session.status`. This retains check.rs's
 //! worker-done-means-checks-green contract without turning ordinary in-progress
 //! work into automatic build/test execution.
 //! An inferred zero-rung suite is `NotProduced`, never `Passed`: no configured
@@ -1194,14 +1198,19 @@ struct WorkerSessionFacts {
     active: bool,
 }
 
+fn worker_session_occupies_worktree(status: &str) -> bool {
+    matches!(status, "running" | "starting" | "stopped")
+}
+
 async fn latest_worker_facts(db: &Db, direction_id: i32) -> Result<WorkerSessionFacts> {
     let Some(session) = repo::latest_session_for_direction(db, direction_id).await? else {
         return Ok(WorkerSessionFacts::default());
     };
-    // engine::persist_activity writes `running` while `inner.turn.busy` and
-    // flips the session row to `idle` when the turn drains. `busy` is only the
-    // Push::Turn wire vocabulary, so it is deliberately not matched here.
-    let active = session.status == "running";
+    // Match materialize::remove_direction_worktree's exact worktree safety
+    // boundary: a worker can own the checkout while it is starting, running,
+    // or taken over in a human terminal (stopped). `reviving` is a revive
+    // operation label, not a persisted session.status value.
+    let active = worker_session_occupies_worktree(session.status.as_str());
     // engine::finalize_text_row persists the turn's terminal state by calling
     // repo::update_lead_message on an assistant/text row. Assistant/tool rows
     // describe individual tool calls, so their `error` cannot diagnose the
@@ -2221,6 +2230,16 @@ mod tests {
             verdict(&lane),
             (LaneReadiness::NeedsYou, Some(ReasonCode::OpenNeed))
         );
+    }
+
+    #[test]
+    fn worker_occupancy_matches_the_worktree_reclaim_safety_boundary() {
+        for status in ["running", "starting", "stopped"] {
+            assert!(worker_session_occupies_worktree(status), "{status}");
+        }
+        for status in ["idle", "reviving", "complete", "error"] {
+            assert!(!worker_session_occupies_worktree(status), "{status}");
+        }
     }
 
     #[test]

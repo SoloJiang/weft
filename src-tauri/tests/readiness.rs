@@ -514,6 +514,11 @@ async fn tool_error_does_not_fail_a_worker_turn_with_completed_assistant_text() 
     )
     .await
     .expect("completed assistant row");
+    // A completed worker turn drains through engine::persist_activity into
+    // `idle`; keep this fixture on the completed side of the session boundary.
+    repo::set_session_status(&fixture.db, session.id, "idle")
+        .await
+        .expect("completed worker idle status");
     add_passing_build_script(&fixture).await;
 
     let result = weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id)
@@ -618,52 +623,55 @@ async fn open_ask_short_circuits_a_hanging_check_runner() {
 }
 
 #[tokio::test]
-async fn active_review_worker_skips_hanging_checks_until_idle() {
-    let fixture = fixture(None).await;
-    let counter = add_hanging_counting_build_script(&fixture).await;
-    let session = repo::create_session(
-        &fixture.db,
-        fixture.direction_id,
-        fixture.repo_id,
-        "claude",
-        "/tmp/readiness-active-worker",
-    )
-    .await
-    .expect("active worker session");
-    // `engine::persist_activity` persists this status while a worker turn is
-    // busy. The collector must not start build/test against that live checkout.
-    repo::set_session_status(&fixture.db, session.id, "running")
+async fn occupied_review_worker_statuses_skip_hanging_checks_until_idle() {
+    for status in ["running", "starting", "stopped"] {
+        let fixture = fixture(None).await;
+        let counter = add_hanging_counting_build_script(&fixture).await;
+        let session = repo::create_session(
+            &fixture.db,
+            fixture.direction_id,
+            fixture.repo_id,
+            "claude",
+            "/tmp/readiness-active-worker",
+        )
         .await
-        .expect("mark worker active");
+        .expect("occupied worker session");
+        // This is the same session occupancy boundary used by worktree reclaim:
+        // starting precedes engine activity, and stopped preserves human-terminal
+        // takeover ownership. Neither may race readiness verification.
+        repo::set_session_status(&fixture.db, session.id, status)
+            .await
+            .expect("mark worker occupied");
 
-    let active = tokio::time::timeout(
-        Duration::from_millis(500),
-        weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id),
-    )
-    .await
-    .expect("active-worker readiness must not wait for the hanging command")
-    .expect("active-worker readiness");
-
-    assert_eq!(active.readiness, IssueReadiness::Unknown);
-    assert_eq!(active.reasons[0].code, ReasonCode::InProgress);
-    assert!(
-        !counter.exists(),
-        "an active worker must not start the readiness check runner"
-    );
-
-    repo::set_session_status(&fixture.db, session.id, "idle")
+        let occupied = tokio::time::timeout(
+            Duration::from_millis(500),
+            weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id),
+        )
         .await
-        .expect("mark worker idle");
-    add_passing_build_script(&fixture).await;
-    let idle = tokio::time::timeout(
-        Duration::from_secs(3),
-        weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id),
-    )
-    .await
-    .expect("idle-worker readiness must complete")
-    .expect("idle-worker readiness");
+        .expect("occupied-worker readiness must not wait for the hanging command")
+        .expect("occupied-worker readiness");
 
-    assert_eq!(idle.readiness, IssueReadiness::ReviewReady);
+        assert_eq!(occupied.readiness, IssueReadiness::Unknown, "{status}");
+        assert_eq!(occupied.reasons[0].code, ReasonCode::InProgress, "{status}");
+        assert!(
+            !counter.exists(),
+            "a {status} worker must not start the readiness check runner"
+        );
+
+        repo::set_session_status(&fixture.db, session.id, "idle")
+            .await
+            .expect("mark worker idle");
+        add_passing_build_script(&fixture).await;
+        let idle = tokio::time::timeout(
+            Duration::from_secs(3),
+            weft::readiness::collect(&fixture.db, &fixture.bus, fixture.thread_id),
+        )
+        .await
+        .expect("idle-worker readiness must complete")
+        .expect("idle-worker readiness");
+
+        assert_eq!(idle.readiness, IssueReadiness::ReviewReady, "{status}");
+    }
 }
 
 #[tokio::test]
