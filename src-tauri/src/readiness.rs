@@ -799,6 +799,28 @@ fn direction_claimed_completion(status: &str) -> bool {
     matches!(status, "review" | "done")
 }
 
+/// The caller's reason for sampling verification targets. Readiness collection
+/// is intentionally stricter than an explicit verification request: only a
+/// claimed-complete lane may cause collection to start checks, while the
+/// established worker-completion path can explicitly verify an idle `working`
+/// lane before its lifecycle advances to `review`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerificationTargetPurpose {
+    ReadinessCollection,
+    ExplicitDirectionVerification,
+}
+
+impl VerificationTargetPurpose {
+    fn allows(self, direction_status: &str) -> bool {
+        match self {
+            Self::ReadinessCollection => direction_claimed_completion(direction_status),
+            Self::ExplicitDirectionVerification => {
+                direction_claimed_completion(direction_status) || direction_status == "working"
+            }
+        }
+    }
+}
+
 fn worker_active_preempts_completion(worker_active: bool, direction_status: &str) -> bool {
     worker_active && direction_claimed_completion(direction_status)
 }
@@ -1691,11 +1713,12 @@ async fn verification_targets_for_direction(
     db: &Db,
     direction_id: i32,
     git_probe: &GitSignatureProbe,
+    purpose: VerificationTargetPurpose,
 ) -> Result<Vec<CheckTarget>> {
     let direction = repo::get_direction(db, direction_id)
         .await?
         .ok_or_else(|| anyhow!("direction {direction_id} no longer exists"))?;
-    if !direction_claimed_completion(direction.status.as_str()) {
+    if !purpose.allows(direction.status.as_str()) {
         anyhow::bail!(
             "verification was not produced for direction {direction_id}: completion was withdrawn"
         );
@@ -2611,6 +2634,7 @@ async fn run_shared_verification(
     direction_id: i32,
     targets: Vec<CheckTarget>,
     git_probe: &GitSignatureProbe,
+    purpose: VerificationTargetPurpose,
 ) -> Result<VerificationReport> {
     let admission_probe = git_probe.clone();
     let post_probe = git_probe.clone();
@@ -2622,10 +2646,11 @@ async fn run_shared_verification(
                 run_verification_checks(targets, READINESS_CHECK_TIMEOUT).await
             },
             move |_| async move {
-                verification_targets_for_direction(db, direction_id, &admission_probe).await
+                verification_targets_for_direction(db, direction_id, &admission_probe, purpose)
+                    .await
             },
             move |_| async move {
-                verification_targets_for_direction(db, direction_id, &post_probe).await
+                verification_targets_for_direction(db, direction_id, &post_probe, purpose).await
             },
         )
         .await
@@ -2648,9 +2673,15 @@ async fn checks_for(
     CheckFlight::sort_targets(&mut targets);
     match execution {
         CheckExecution::RunAllowed => Ok(
-            run_shared_verification(db, direction.id, targets, git_probe)
-                .await?
-                .evidence,
+            run_shared_verification(
+                db,
+                direction.id,
+                targets,
+                git_probe,
+                VerificationTargetPurpose::ReadinessCollection,
+            )
+            .await?
+            .evidence,
         ),
         CheckExecution::CachedOnly => Ok(check_flight()
             .cached_read_only_if_admitted(direction.id, &targets)?
@@ -2664,8 +2695,21 @@ async fn checks_for(
 /// than a misleading empty successful response.
 pub async fn verify_direction(db: &Db, direction_id: i32) -> Result<Vec<RepoChecks>> {
     let git_probe = GitSignatureProbe::readiness();
-    let targets = verification_targets_for_direction(db, direction_id, &git_probe).await?;
-    let report = run_shared_verification(db, direction_id, targets, &git_probe).await?;
+    let targets = verification_targets_for_direction(
+        db,
+        direction_id,
+        &git_probe,
+        VerificationTargetPurpose::ExplicitDirectionVerification,
+    )
+    .await?;
+    let report = run_shared_verification(
+        db,
+        direction_id,
+        targets,
+        &git_probe,
+        VerificationTargetPurpose::ExplicitDirectionVerification,
+    )
+    .await?;
     if matches!(
         report.evidence,
         CheckEvidence::NotProduced | CheckEvidence::NotApplicable
@@ -3227,6 +3271,7 @@ mod tests {
             &db,
             direction.id,
             &GitSignatureProbe::readiness(),
+            VerificationTargetPurpose::ReadinessCollection,
         )
         .await
         .expect_err("active worker must preempt the admitted verification target probe");
@@ -3277,11 +3322,206 @@ mod tests {
                 &db,
                 direction.id,
                 &GitSignatureProbe::readiness(),
+                VerificationTargetPurpose::ReadinessCollection,
             )
             .await
             .expect_err("an active worker in either repo must preempt verification");
             assert!(error.to_string().contains("worker is active"), "{status}");
         }
+    }
+
+    #[tokio::test]
+    async fn working_idle_worker_is_explicitly_verifiable_while_readiness_collection_skips_runner()
+    {
+        let root = tempfile::tempdir().expect("temporary working verification fixture");
+        std::fs::write(root.path().join("README.md"), "working verification\n")
+            .expect("write fixture readme");
+        git_in(root.path(), &["init", "--quiet", "-b", "main"]);
+        git_in(
+            root.path(),
+            &["config", "user.email", "readiness@example.invalid"],
+        );
+        git_in(root.path(), &["config", "user.name", "Readiness Test"]);
+        git_in(root.path(), &["add", "README.md"]);
+        git_in(root.path(), &["commit", "--quiet", "-m", "fixture"]);
+
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("memory readiness db");
+        let workspace = repo::create_workspace(&db, "working verification workspace")
+            .await
+            .expect("workspace");
+        let root_path = root.path().display().to_string();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "working-verification-repo",
+            &root_path,
+            "main",
+            "",
+            true,
+        )
+        .await
+        .expect("repo reference");
+        let thread = repo::create_thread(
+            &db,
+            workspace.id,
+            "working verification",
+            "feature/working-verification",
+            "claude",
+        )
+        .await
+        .expect("thread");
+        let mut direction = repo::create_direction(
+            &db,
+            thread.id,
+            "implementation",
+            "claude",
+            repo_ref.id,
+            "verify after an idle worker finishes",
+            "impl-only",
+            "main",
+        )
+        .await
+        .expect("direction");
+        repo::set_direction_status(&db, direction.id, "working")
+            .await
+            .expect("working direction");
+        direction.status = "working".to_string();
+        repo::record_worktree(
+            &db,
+            repo_ref.id,
+            direction.id,
+            "main",
+            &root_path,
+            false,
+            false,
+            "",
+        )
+        .await
+        .expect("worktree row");
+        let worker = repo::create_session(&db, direction.id, repo_ref.id, "claude", &root_path)
+            .await
+            .expect("idle worker session");
+        repo::set_session_status(&db, worker.id, "idle")
+            .await
+            .expect("idle worker status");
+        assert!(
+            !latest_worker_facts(&db, direction.id)
+                .await
+                .expect("idle worker facts")
+                .active,
+            "an idle worker does not occupy the verification target"
+        );
+
+        let probe = GitSignatureProbe::readiness();
+        let explicit_targets = verification_targets_for_direction(
+            &db,
+            direction.id,
+            &probe,
+            VerificationTargetPurpose::ExplicitDirectionVerification,
+        )
+        .await
+        .expect("working idle worker remains explicitly verifiable");
+        assert_eq!(explicit_targets.len(), 1);
+        // `verify_direction` uses this same explicit target purpose for its
+        // initial, admission, and post-run samples. Keep the runner injected
+        // so this regression proves that authorization boundary without a
+        // checker mutating a fixture signature during the test itself.
+        let explicit_flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
+        let direction_id = direction.id;
+        let db_for_admission = &db;
+        let db_for_post = &db;
+        let admission_probe = probe.clone();
+        let post_probe = probe.clone();
+        let explicit_report = explicit_flight
+            .get_or_run_report_with_admission_and_post_targets(
+                direction_id,
+                explicit_targets.clone(),
+                |targets| async move {
+                    Ok(VerificationReport {
+                        evidence: CheckEvidence::Passed,
+                        repo_checks: targets
+                            .into_iter()
+                            .map(|target| RepoChecks {
+                                repo: target.repo,
+                                worktree: target.path,
+                                checks: vec![crate::check::CheckResult {
+                                    name: "injected".to_string(),
+                                    status: "pass".to_string(),
+                                    code: 0,
+                                    output_tail: String::new(),
+                                }],
+                            })
+                            .collect(),
+                    })
+                },
+                move |_| async move {
+                    verification_targets_for_direction(
+                        db_for_admission,
+                        direction_id,
+                        &admission_probe,
+                        VerificationTargetPurpose::ExplicitDirectionVerification,
+                    )
+                    .await
+                },
+                move |_| async move {
+                    verification_targets_for_direction(
+                        db_for_post,
+                        direction_id,
+                        &post_probe,
+                        VerificationTargetPurpose::ExplicitDirectionVerification,
+                    )
+                    .await
+                },
+            )
+            .await
+            .expect("working idle worker verifies through the explicit shared path");
+        assert_eq!(explicit_report.repo_checks.len(), 1);
+        assert!(
+            explicit_report.repo_checks[0]
+                .checks
+                .iter()
+                .all(|check| check.status == "pass"),
+            "explicit verification publishes the successful checks for checksByDirection"
+        );
+
+        let worktrees = probe_worktrees_for_direction(&db, direction.id, &probe)
+            .await
+            .expect("working worktree facts");
+        let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let attempted_runs = Arc::clone(&runs);
+        let evidence = checks_for_with_runner(
+            &direction,
+            &worktrees,
+            &flight,
+            CheckExecution::RunAllowed,
+            move |_| {
+                attempted_runs.fetch_add(1, Ordering::SeqCst);
+                async { Ok(CheckEvidence::Passed) }
+            },
+        )
+        .await
+        .expect("working readiness collection result");
+        assert_eq!(evidence, CheckEvidence::NotApplicable);
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "readiness collection must not run checks for a working lane"
+        );
+
+        let collection_error = verification_targets_for_direction(
+            &db,
+            direction.id,
+            &probe,
+            VerificationTargetPurpose::ReadinessCollection,
+        )
+        .await
+        .expect_err("readiness collection retains claimed-completion target guard");
+        assert!(collection_error
+            .to_string()
+            .contains("completion was withdrawn"));
     }
 
     #[tokio::test]

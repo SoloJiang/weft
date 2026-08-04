@@ -44,6 +44,30 @@ async fn persist_activity(db: &Db, session_id: Option<i32>, thread_id: i32, stat
     }
 }
 
+/// A worker may not begin a new direct turn until its durable session state is
+/// `running`. This is intentionally stricter than [`persist_activity`]: most
+/// activity writes are best-effort telemetry/recovery upkeep, but admitting a
+/// fresh worker while SQLite still says `idle` would let verification read a
+/// checkout that the worker is about to mutate.
+async fn persist_running_for_direct_turn(
+    db: &Db,
+    session_id: Option<i32>,
+    thread_id: i32,
+) -> anyhow::Result<()> {
+    match session_id {
+        Some(session_id) => {
+            repo::set_session_status(db, session_id, "running").await?;
+        }
+        None => {
+            // Leads have no worker worktree/readiness identity. Preserve their
+            // historical best-effort status semantics rather than making an
+            // unrelated meta update reject a visible lead turn.
+            persist_activity(db, None, thread_id, "running").await;
+        }
+    }
+    Ok(())
+}
+
 /// 流式节流间隔（ms）：每过这么久把当前累积文本落一次 DB 快照，并向 IM 桥发一帧
 /// LeadDelta（飞书 CardKit 流式卡据此逐帧更新）。桌面 UI 不受影响——它吃的是每个
 /// token 的原始 `Push::Delta`。150ms 是流式卡看着流畅的下限；再大就一顿一顿的。
@@ -1051,6 +1075,115 @@ where
     result
 }
 
+/// A worker direct-send candidate observed before it waits on verification.
+/// The direction guard is deliberately acquired after this snapshot, with no
+/// engine/session admission fence held. Once it is acquired, the visible-send
+/// path must revalidate every field below before it reserves a turn.
+struct DirectWorkerSendAdmission {
+    session_id: i32,
+    direction_id: i32,
+    reset_epoch: u64,
+    _verification: crate::readiness::VerificationAdmission,
+}
+
+/// Snapshot an idle worker direct-send candidate, then wait for its shared
+/// verification admission without holding the engine mutex or per-surface
+/// admission gate. `before_wait` is a no-op production hook; the deterministic
+/// test hook proves a held check cannot freeze Stop/control acquisition.
+async fn acquire_direct_worker_send_admission<F>(
+    eng: &EngineRef,
+    before_wait: F,
+) -> anyhow::Result<Option<DirectWorkerSendAdmission>>
+where
+    F: FnOnce(),
+{
+    let candidate = {
+        let inner = eng.lock().await;
+        let Some(session_id) = inner.session_id else {
+            return Ok(None);
+        };
+        if inner.turn.busy {
+            return Ok(None);
+        }
+        let Some(direction_id) = worker_direction_id(&inner)? else {
+            return Ok(None);
+        };
+        (session_id, direction_id, inner.reset_epoch)
+    };
+
+    before_wait();
+    let (session_id, direction_id, reset_epoch) = candidate;
+    let verification = acquire_worker_direct_turn_admission(Some(direction_id)).await?;
+    let Some(verification) = verification else {
+        anyhow::bail!("worker direct send lost its verification admission");
+    };
+    Ok(Some(DirectWorkerSendAdmission {
+        session_id,
+        direction_id,
+        reset_epoch,
+        _verification: verification,
+    }))
+}
+
+/// Revalidate a direct-send candidate after its verification wait. A worker
+/// that became busy can still use the normal queue path; Stop, interrupt,
+/// teardown, identity replacement, or an epoch change cancel the stale send
+/// instead of allowing it to start after the control action won.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectWorkerSendRevalidation {
+    Start,
+    Queue,
+    Cancel,
+}
+
+fn revalidate_direct_worker_send(
+    inner: &EngineInner,
+    admission: &DirectWorkerSendAdmission,
+) -> anyhow::Result<DirectWorkerSendRevalidation> {
+    if inner.session_id != Some(admission.session_id)
+        || worker_direction_id(inner)? != Some(admission.direction_id)
+    {
+        return Ok(DirectWorkerSendRevalidation::Cancel);
+    }
+    if inner.reset_epoch != admission.reset_epoch
+        || inner.stopped
+        || inner.tearing_down
+        || inner.interrupting
+    {
+        return Ok(DirectWorkerSendRevalidation::Cancel);
+    }
+    if inner.turn.busy {
+        return Ok(DirectWorkerSendRevalidation::Queue);
+    }
+    Ok(DirectWorkerSendRevalidation::Start)
+}
+
+/// Persist the worker's durable `running` state before mutating its in-memory
+/// turn reservation. If SQLite rejects the write, the engine remains idle, so
+/// dropping the verification admission cannot expose a changing checkout as an
+/// `idle` verification target.
+async fn reserve_direct_turn_after_running_persist<F, Fut>(
+    inner: &mut EngineInner,
+    origin_tag: Option<String>,
+    persist_running: F,
+) -> anyhow::Result<i32>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    if inner.turn.busy {
+        anyhow::bail!("cannot reserve a direct turn while the engine is busy");
+    }
+    persist_running().await?;
+    if !inner.turn.try_begin_send() {
+        anyhow::bail!("direct turn became unavailable while persisting running state");
+    }
+    inner.turn_id += 1;
+    inner.clock.begin_turn();
+    inner.current_origin_tag = origin_tag;
+    Ok(inner.turn_id)
+}
+
 /// Join worker verification admission only when the current turn-end will
 /// actually dequeue another direct turn. Empty queues go idle without touching
 /// cached verification evidence.
@@ -1071,11 +1204,14 @@ async fn begin_hidden_turn(
 ) -> anyhow::Result<i32> {
     let direction_id = worker_direction_id(inner)?;
     let turn_id = with_worker_direct_turn_admission(direction_id, || async {
+        let session_id = inner.session_id;
+        let thread_id = inner.thread_id;
+        // A hidden delivery can be the first turn on an idle worker too. Do
+        // not reserve it until its durable `running` state is committed; a
+        // failed write must leave no idle-vs-running verification window.
+        persist_running_for_direct_turn(db, session_id, thread_id).await?;
         let turn_id = mark_hidden_turn_started_with_delivery(inner, hidden_delivery_id);
         crate::power::on_turn_began(app);
-        // Hidden delivery is a turn-start too, so persist `running`; otherwise a
-        // crash mid-action can leave stale `idle` state and skip boot revive.
-        persist_activity(db, inner.session_id, inner.thread_id, "running").await;
         Ok(turn_id)
     })
     .await?;
@@ -4223,7 +4359,11 @@ pub async fn send(
     files: Vec<String>,
     origin_tag: Option<String>,
 ) -> anyhow::Result<()> {
-    let _engine_admission = engine_admission_guard(app, db, eng).await?;
+    // Keep the visible-send/hidden-delivery ordering preflight under the
+    // normal surface fence, then release it before a worker direct send waits
+    // behind a potentially multi-minute verification run. Stop/interrupt and
+    // status operations must be able to acquire that fence during the wait.
+    let preflight_admission = engine_admission_guard(app, db, eng).await?;
     crate::process_quota::admit_new_work(app)?;
     // A rewind holds its reservation from the busy check to the final
     // truncate; sends error out for that window rather than racing the
@@ -4361,6 +4501,32 @@ pub async fn send(
         }
     }
     ensure_running_for_send_admitted(app, db, eng).await?;
+    drop(preflight_admission);
+
+    // A real idle worker direct send has to serialize with verification, but
+    // this wait deliberately happens before reacquiring either engine fence.
+    // A Stop that wins in this gap increments `reset_epoch`; Phase 1 below
+    // observes that and cancels rather than resurrecting the stopped turn.
+    let mut worker_direct_admission = acquire_direct_worker_send_admission(eng, || {}).await?;
+    let mut engine_admission = engine_admission_guard(app, db, eng).await?;
+    // A busy worker can drain between the unlocked direct-candidate snapshot
+    // and the surface-gate reacquisition. Retry the snapshot without holding
+    // the fence, so the newly idle direct start still joins verification rather
+    // than bypassing it. If a candidate did acquire the gate and another turn
+    // won first, Phase 1 safely falls back to queueing instead.
+    loop {
+        let needs_direct_admission = {
+            let inner = eng.lock().await;
+            inner.session_id.is_some() && !inner.turn.busy && worker_direct_admission.is_none()
+        };
+        if !needs_direct_admission {
+            break;
+        }
+        drop(engine_admission);
+        worker_direct_admission = acquire_direct_worker_send_admission(eng, || {}).await?;
+        engine_admission = engine_admission_guard(app, db, eng).await?;
+    }
+    let _engine_admission = engine_admission;
 
     // Phase 1: acquire the lock only long enough to reserve turn state and
     // snapshot the fields needed for persistence. All slow IO (DB writes,
@@ -4386,39 +4552,68 @@ pub async fn send(
         {
             return Err(anyhow::anyhow!("该 worktree 正在回退代码，请稍后重试"));
         }
-        // A queued send does not mutate a verification target yet, so it skips
-        // the direction gate entirely. A real direct start invalidates old
-        // evidence before it reserves `busy`, and keeps the gate through this
-        // locked `running` persistence.
-        let starts_direct = !inner.turn.busy;
-        let direction_id = if starts_direct {
-            worker_direction_id(&inner)?
-        } else {
-            None
+        // The verification gate was obtained before this send reacquired any
+        // engine fence. It now stays held only through the critical `running`
+        // persistence and direct-turn reservation. A competing turn may have
+        // started while this send waited; that case preserves FIFO by using the
+        // ordinary queue path instead of starting a second worker turn.
+        let direct_revalidation = match worker_direct_admission.as_ref() {
+            Some(admission) => Some(revalidate_direct_worker_send(&inner, admission)?),
+            None => None,
         };
-        let direct = with_worker_direct_turn_admission(direction_id, || async {
-            let direct = inner.turn.try_begin_send();
-            debug_assert_eq!(direct, starts_direct);
-            // Count only tracked (user-visible) items: hidden plumbing deliveries
-            // (queue_id == None) are filtered out of the UI, so they must not eat the budget.
-            if !direct && visible_queued(&inner.turn) >= MAX_QUEUED {
-                return Err(anyhow::anyhow!("queue_full"));
-            }
-            if direct {
-                inner.turn_id += 1;
-                inner.clock.begin_turn();
-                // This send starts a turn now → its tag IS the in-flight turn's tag.
-                inner.current_origin_tag = origin_tag.clone();
+        let direct = match direct_revalidation {
+            Some(DirectWorkerSendRevalidation::Start) => {
+                let session_id = inner.session_id;
+                let thread_id = inner.thread_id;
+                reserve_direct_turn_after_running_persist(&mut inner, origin_tag.clone(), || {
+                    persist_running_for_direct_turn(db, session_id, thread_id)
+                })
+                .await?;
                 crate::power::on_turn_began(app);
-                // Persist "running" WHILE holding the lock so it is ordered before any
-                // concurrent stop's "stopped" write: stop_quiet must take this same lock
-                // first, so its later "stopped" write can't be overtaken and leave a
-                // stopped session recorded as running (which boot-revive would resume).
-                persist_activity(db, inner.session_id, inner.thread_id, "running").await;
+                true
             }
-            Ok(direct)
-        })
-        .await?;
+            Some(DirectWorkerSendRevalidation::Queue) => {
+                // This guard is no longer needed: the existing worker remains
+                // active, and the queue does not mutate a verification target.
+                worker_direct_admission = None;
+                if visible_queued(&inner.turn) >= MAX_QUEUED {
+                    return Err(anyhow::anyhow!("queue_full"));
+                }
+                false
+            }
+            Some(DirectWorkerSendRevalidation::Cancel) => {
+                return Err(anyhow::anyhow!(
+                    "send could not start: the session was stopped or changed while waiting for verification"
+                ));
+            }
+            None if inner.session_id.is_some() && !inner.turn.busy => {
+                // The retry loop above closes the ordinary busy-to-idle race.
+                // If a reader wins the final tiny window, reject before a row
+                // is persisted rather than bypassing verification admission.
+                return Err(anyhow::anyhow!(
+                    "send could not start: worker verification admission must be retried"
+                ));
+            }
+            None => {
+                let direct = inner.turn.try_begin_send();
+                // Count only tracked (user-visible) items: hidden plumbing deliveries
+                // (queue_id == None) are filtered out of the UI, so they must not eat the budget.
+                if !direct && visible_queued(&inner.turn) >= MAX_QUEUED {
+                    return Err(anyhow::anyhow!("queue_full"));
+                }
+                if direct {
+                    // Only the lead reaches this branch. Lead activity updates
+                    // remain best-effort because no worker readiness target can
+                    // race on a failed thread-meta write.
+                    inner.turn_id += 1;
+                    inner.clock.begin_turn();
+                    inner.current_origin_tag = origin_tag.clone();
+                    crate::power::on_turn_began(app);
+                    persist_activity(db, inner.session_id, inner.thread_id, "running").await;
+                }
+                direct
+            }
+        };
         SendContext {
             thread_id: inner.thread_id,
             session_id: inner.session_id,
@@ -4430,6 +4625,10 @@ pub async fn send(
             reset_epoch: inner.reset_epoch,
         }
     };
+    // Once the worker's `running` persistence and in-memory reservation have
+    // committed, verification can observe the durable active worker state and
+    // no longer needs to wait behind the rest of visible-send persistence.
+    drop(worker_direct_admission);
 
     let kind = if ctx.is_command { "command" } else { "text" };
     let status = if ctx.direct { "complete" } else { "queued" };
@@ -4725,16 +4924,29 @@ pub async fn send(
                 // an idle queue, so deliver NOW by promoting into a fresh direct
                 // turn — the same commit-time decision a direct send makes.
                 let direction_id = worker_direction_id(&inner)?;
-                let promoted_turn = with_worker_direct_turn_admission(direction_id, || async {
+                let promotion = with_worker_direct_turn_admission(direction_id, || async {
+                    let session_id = inner.session_id;
+                    let thread_id = inner.thread_id;
+                    // This is another idle-worker direct start: commit
+                    // `running` before reserving the promoted turn so a failed
+                    // SQLite write leaves the queued row retryable, not racing
+                    // readiness as an apparently idle worker.
+                    persist_running_for_direct_turn(db, session_id, thread_id).await?;
                     let turn_id =
                         promote_queued_reservation(&mut inner, ctx.origin_tag.clone());
                     crate::power::on_turn_began(app);
-                    // Under the lock for the same ordering reason as Phase 1's direct
-                    // write: a concurrent stop's "stopped" write must not be overtaken.
-                    persist_activity(db, inner.session_id, inner.thread_id, "running").await;
                     Ok(turn_id)
                 })
-                .await?;
+                .await;
+                let promoted_turn = match promotion {
+                    Ok(turn_id) => turn_id,
+                    Err(error) => {
+                        drop(inner);
+                        let _ = repo::update_lead_message(db, row_id, &content, "error").await;
+                        emit_finalize(app, ctx.thread_id, row_id, "error");
+                        return Err(error);
+                    }
+                };
                 promoted = Some(promoted_turn);
                 // Same pre-turn checkpoint as a direct send, taken after the
                 // worker-start admission and before the resident write / Phase-4
@@ -10732,6 +10944,99 @@ mod tests {
         allow_running_persist.notify_one();
         worker.await.expect("worker task joins").expect("worker start");
         check.await.expect("check task joins");
+    }
+
+    #[tokio::test]
+    async fn failed_running_persistence_leaves_worker_unreserved_before_verification_follows() {
+        let direction_id = next_worker_admission_test_direction();
+        let mut inner = test_inner("codex");
+        inner.session_id = Some(direction_id - 1_000);
+        inner.ask_dir = direction_id.to_string();
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+        let start_engine = eng.clone();
+
+        let error = with_worker_direct_turn_admission(Some(direction_id), || async move {
+            let mut inner = start_engine.lock().await;
+            reserve_direct_turn_after_running_persist(
+                &mut inner,
+                Some("reply-tag".to_string()),
+                || async { anyhow::bail!("injected SQLite running-state persistence failure") },
+            )
+            .await
+        })
+        .await
+        .expect_err("a failed running-state write must reject the direct worker start");
+        assert!(error
+            .to_string()
+            .contains("running-state persistence failure"));
+
+        // The failed start drops its direction guard only after it has left no
+        // in-memory turn to race a following verification request.
+        let verification = crate::readiness::acquire_verification_admission(direction_id)
+            .await
+            .expect("verification follows failed worker admission");
+        let inner = eng.lock().await;
+        assert!(!inner.turn.busy, "failed persistence must not reserve busy");
+        assert_eq!(
+            inner.turn_id, 0,
+            "failed persistence must not consume a turn"
+        );
+        assert_eq!(inner.current_origin_tag, None);
+        assert_eq!(inner.clock.started_millis, 0);
+        drop(inner);
+        drop(verification);
+    }
+
+    #[tokio::test]
+    async fn direct_send_wait_does_not_hold_stop_controls_and_revalidates_stop_epoch() {
+        let direction_id = next_worker_admission_test_direction();
+        let session_id = direction_id - 2_000;
+        let mut inner = test_inner("codex");
+        inner.session_id = Some(session_id);
+        inner.ask_dir = direction_id.to_string();
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+        let held_verification = crate::readiness::acquire_verification_admission(direction_id)
+            .await
+            .expect("held verification admission");
+        let (wait_started_tx, wait_started_rx) = tokio::sync::oneshot::channel();
+        let waiting_engine = eng.clone();
+        let waiting = tokio::spawn(async move {
+            let admission = acquire_direct_worker_send_admission(&waiting_engine, || {
+                let _ = wait_started_tx.send(());
+            })
+            .await?
+            .expect("idle worker needs direct-send admission");
+            let inner = waiting_engine.lock().await;
+            revalidate_direct_worker_send(&inner, &admission)
+        });
+
+        wait_started_rx
+            .await
+            .expect("direct send reached verification wait without a fence");
+        // `stop_quiet` obtains the same per-session control gate as a real
+        // Stop. It must complete while direct send is waiting for verification;
+        // a timeout here would reproduce the old outer-gate/engine-lock hold.
+        let stop_engine = eng.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::spawn(async move { stop_quiet(&stop_engine).await }),
+        )
+        .await
+        .expect("Stop must not wait for a held verification gate")
+        .expect("Stop task joins");
+
+        drop(held_verification);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("direct-send waiter completes after verification releases")
+            .expect("direct-send waiter joins")
+            .expect("direct-send revalidation result");
+        assert_eq!(outcome, DirectWorkerSendRevalidation::Cancel);
+        let inner = eng.lock().await;
+        assert!(
+            !inner.turn.busy,
+            "Stop wins before a worker turn is reserved"
+        );
     }
 
     // —— hardened codex app-server attachment write ——
