@@ -2928,6 +2928,17 @@ pub async fn delete_direction(db: &Db, direction_id: i32) -> Result<()> {
         .filter(worktree::Column::DirectionId.eq(direction_id))
         .exec(&db.0)
         .await?;
+    // The direction's OWN dependency rows die with it — leftover rows would both leak
+    // deleted-issue content and let `thread_creates_cycle` keep walking a ghost's edges
+    // (a later write naming this id could be rejected for a "cycle" through a direction
+    // that no longer exists). Rows on OTHER directions that NAME this one as upstream are
+    // deliberately kept: a dangling resolved reference reads `Unknown` (blocked) in
+    // `upstream_merge_state`, which is the fail-closed answer a consumer whose declared
+    // producer vanished must keep giving until a re-proposal rewrites its edge set.
+    direction_dependency::Entity::delete_many()
+        .filter(direction_dependency::Column::DirectionId.eq(direction_id))
+        .exec(&db.0)
+        .await?;
     direction::Entity::delete_by_id(direction_id)
         .exec(&db.0)
         .await?;
@@ -3242,7 +3253,9 @@ pub async fn set_direction_upstream(db: &Db, direction_id: i32, upstream_id: i32
 /// - no cycle anywhere in the thread's resolved-edge graph once this
 ///   direction's new edges are added (see [`thread_creates_cycle`]);
 /// - at most [`MAX_EDGES_PER_THREAD`] edges total across the whole thread
-///   after this write.
+///   after this write — EXCEPT a single blocking-sentinel edge, which is
+///   always accepted (see the inline comment on the cap check: rejecting the
+///   fail-closed placeholder/fallback would strand a lane fail-open).
 ///
 /// A missing `direction_id` row is a silent no-op (nothing to write ON),
 /// matching the legacy single-slot function's own behavior.
@@ -3296,14 +3309,25 @@ pub async fn set_direction_upstreams(
         anyhow::bail!("this would create a dependency cycle");
     }
 
-    let existing_thread_edges =
-        thread_edge_count_excluding(db, dir.thread_id, direction_id).await?;
-    if existing_thread_edges + edges.len() > MAX_EDGES_PER_THREAD {
-        anyhow::bail!(
-            "this thread would exceed the {MAX_EDGES_PER_THREAD}-edge dependency cap \
-             ({existing_thread_edges} existing + {} new)",
-            edges.len()
-        );
+    // A single blocking-sentinel edge — the planner's pass-1 placeholder and its
+    // rejected-write fallback both write exactly this shape — is EXEMPT from the
+    // thread-wide cap: it REPLACES the lane's whole set with one row whose only
+    // effect is to block, and rejecting it would strand the lane EMPTY ("no
+    // upstream, free to merge") — the precise fail-open that write exists to
+    // prevent. Growth stays bounded regardless: replace semantics allow at most
+    // one such row per direction.
+    let blocking_sentinel_only =
+        matches!(edges, [only] if only.state != UpstreamEdgeState::Resolved);
+    if !blocking_sentinel_only {
+        let existing_thread_edges =
+            thread_edge_count_excluding(db, dir.thread_id, direction_id).await?;
+        if existing_thread_edges + edges.len() > MAX_EDGES_PER_THREAD {
+            anyhow::bail!(
+                "this thread would exceed the {MAX_EDGES_PER_THREAD}-edge dependency cap \
+                 ({existing_thread_edges} existing + {} new)",
+                edges.len()
+            );
+        }
     }
 
     let txn = db.0.begin().await?;
@@ -4637,6 +4661,15 @@ async fn delete_thread_cascade_with_action_cleanups(
         }
         session::Entity::delete_many()
             .filter(session::Column::DirectionId.eq(d.id))
+            .exec(&txn)
+            .await?;
+        // Dependency edges die with their direction (issue #173). Deleting by
+        // consumer side alone is complete here: cross-Issue references are
+        // rejected at write time, so every edge row naming one of this
+        // thread's directions as upstream is itself owned by a direction in
+        // this same loop.
+        direction_dependency::Entity::delete_many()
+            .filter(direction_dependency::Column::DirectionId.eq(d.id))
             .exec(&txn)
             .await?;
         direction::Entity::delete_by_id(d.id).exec(&txn).await?;
@@ -15376,6 +15409,93 @@ mod tests {
             "error should name the cap: {err}"
         );
         assert!(direction_upstream_edges(&db, one_more.id).await.unwrap().is_empty());
+
+        // The ONE exemption: a single blocking-sentinel edge (the planner's pass-1
+        // placeholder / rejected-write fallback) must still be accepted at the cap —
+        // rejecting it would leave this lane's edge set EMPTY, reading "no upstream,
+        // free to merge", the precise fail-open that write exists to prevent.
+        set_direction_upstreams(&db, one_more.id, &[UpstreamEdge::unresolved()])
+            .await
+            .expect("the blocking sentinel is exempt from the thread-wide cap");
+        let edges = direction_upstream_edges(&db, one_more.id).await.unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].state, UpstreamEdgeState::Unresolved);
+        assert_eq!(
+            get_direction(&db, one_more.id).await.unwrap().unwrap().depends_on_direction_id,
+            UNRESOLVED_UPSTREAM_SENTINEL,
+            "the mirror column blocks too"
+        );
+    }
+
+    /// A deleted direction's OWN dependency rows die with it — no ghost edges for
+    /// `thread_creates_cycle` to walk and no deleted-issue content leaking — while a
+    /// CONSUMER's edge NAMING the deleted direction is kept and reads fail-closed
+    /// `Unknown` (its declared producer vanished; that must block, not release).
+    #[tokio::test]
+    async fn delete_direction_removes_its_own_edges_but_keeps_consumers_dangling_edge() {
+        let db = mem().await;
+        let ids = bare_directions(&db, 3).await;
+        let (upstream, middle, consumer) = (ids[0], ids[1], ids[2]);
+        set_direction_upstreams(&db, middle, &[UpstreamEdge::resolved(upstream)])
+            .await
+            .unwrap();
+        set_direction_upstreams(&db, consumer, &[UpstreamEdge::resolved(middle)])
+            .await
+            .unwrap();
+
+        delete_direction(&db, middle).await.unwrap();
+
+        assert!(
+            direction_dependency::Entity::find()
+                .filter(direction_dependency::Column::DirectionId.eq(middle))
+                .all(&db.0)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the deleted direction's own edge rows are gone"
+        );
+        let consumer_edges = direction_upstream_edges(&db, consumer).await.unwrap();
+        assert_eq!(consumer_edges.len(), 1, "the consumer's declared dependency is kept");
+        assert_eq!(consumer_edges[0].upstream_direction_id, middle);
+        assert!(
+            matches!(
+                upstream_merge_state(&db, consumer).await,
+                crate::host::UpstreamStatus::Unknown { .. }
+            ),
+            "a dangling reference reads Unknown (blocked), never \"no upstream\""
+        );
+    }
+
+    /// Thread deletion sweeps dependency edges with the rest of the thread-owned rows —
+    /// same contract as every other table in the cascade: deleted-issue content must not
+    /// linger in weft.db and backups.
+    #[tokio::test]
+    async fn delete_thread_cascade_removes_dependency_edges() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws_dep_cascade").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "api", "/tmp/dep-cascade-api", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let producer = create_direction(&db, t.id, "p", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+        let consumer = create_direction(&db, t.id, "c", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+        set_direction_upstreams(&db, consumer.id, &[UpstreamEdge::resolved(producer.id)])
+            .await
+            .unwrap();
+        set_direction_upstreams(&db, producer.id, &[UpstreamEdge::unresolved()])
+            .await
+            .unwrap();
+
+        delete_thread_cascade(&db, t.id).await.unwrap();
+
+        assert!(
+            direction_dependency::Entity::find().all(&db.0).await.unwrap().is_empty(),
+            "no dependency edge may outlive its issue"
+        );
     }
 
     /// The fail-closed mirror column (`direction.depends_on_direction_id`) truth table (ADR,

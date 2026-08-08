@@ -265,8 +265,10 @@ export const zh = {
     confirming: "创建中…",
     baseBranch: "基线分支",
     baseBranchHint: "从该分支拉出工作分支（留空 = 仓库默认分支）",
-    dependsOn_other: "等待「{{name}}」全部先落地",
-    dependsOnHint_other: "「{{name}}」全部合并之前，这个任务无法合并",
+    // 中文的 Intl.PluralRules 对任何数量都取 "other"，所以这里只有 _other 一种形态，
+    // 措辞必须对单个和多个依赖都自然（{{name}} 是逗号拼接后的名字列表）。
+    dependsOn_other: "等待「{{name}}」先落地",
+    dependsOnHint_other: "「{{name}}」合并之前，这个任务无法合并",
     engine: "引擎",
     engineAutomatic: "自动 · {{tool}}",
     engineManual: "已 pin · {{tool}}",

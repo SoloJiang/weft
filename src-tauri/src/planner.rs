@@ -368,6 +368,7 @@ pub async fn save_proposal_value(db: &Db, thread_id: i32, input: &Value) -> Resu
         // sets it only via confirm/approve. Reset to 0 (unset) before storing.
         d.direction_id = 0;
     }
+    reject_malformed_depends_on(input)?;
     let mut value = serde_json::to_value(&p)?;
     normalize_input_hints(&mut value, input);
     normalize_input_depends_on(&mut value, input);
@@ -542,6 +543,7 @@ fn validate_depends_on_shape(value: &Value) -> Result<()> {
     let Some(directions) = value.get("directions").and_then(Value::as_array) else {
         return Ok(());
     };
+    let mut total_edges = 0usize;
     for (index, direction) in directions.iter().enumerate() {
         let names = depends_on_values_from_direction(direction);
         if names.len() > repo::MAX_DIRECT_PREDECESSORS_PER_LANE {
@@ -551,10 +553,55 @@ fn validate_depends_on_shape(value: &Value) -> Result<()> {
                 repo::MAX_DIRECT_PREDECESSORS_PER_LANE
             );
         }
+        total_edges += names.len();
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for name in &names {
             if !seen.insert(name.as_str()) {
                 anyhow::bail!("lane {index} declares the dependency {name:?} more than once");
+            }
+        }
+    }
+    // Thread-wide budget, enforced up front where the lead can still fix the split: the
+    // per-lane cap alone admits MAX_LANES_PER_PROPOSAL x MAX_DIRECT_PREDECESSORS_PER_LANE
+    // declared edges — well past `MAX_EDGES_PER_THREAD` — and letting an oversized proposal
+    // through means `record_upstream_edges` only discovers the overflow lane by lane at
+    // write time, after confirm already returned Ok (best-effort logs, no user-visible
+    // rejection). Rejecting the proposal here keeps "fail closed" also "fail early".
+    if total_edges > repo::MAX_EDGES_PER_THREAD {
+        anyhow::bail!(
+            "this proposal declares {total_edges} dependencies in total, more than the \
+             {}-edge budget one issue's dependency graph may hold",
+            repo::MAX_EDGES_PER_THREAD
+        );
+    }
+    Ok(())
+}
+
+/// Reject a `depends_on` entry that is present but not usable BEFORE normalization drops it.
+/// `depends_on_values_from_direction` silently skips non-string array entries — correct for
+/// re-reading our own STORED plans (which only ever contain strings), but on the SAVE path a
+/// lead that sent `depends_on: [3]` or `[null]` clearly intended a dependency; letting the
+/// entry vanish would release the consumer with no signal to anyone ("fail open"). Runs against
+/// the RAW input (the normalized copy has already lost the malformed entries by design).
+fn reject_malformed_depends_on(input: &Value) -> Result<()> {
+    let Some(directions) = input.get("directions").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (index, direction) in directions.iter().enumerate() {
+        match direction.get("depends_on") {
+            None | Some(Value::Null) | Some(Value::String(_)) => {}
+            Some(Value::Array(items)) => {
+                if items.iter().any(|item| !item.is_string()) {
+                    anyhow::bail!(
+                        "lane {index}'s depends_on has a non-string entry — every entry must \
+                         be another lane's name"
+                    );
+                }
+            }
+            Some(_) => {
+                anyhow::bail!(
+                    "lane {index}'s depends_on must be a lane name or an array of lane names"
+                );
             }
         }
     }
@@ -564,15 +611,31 @@ fn validate_depends_on_shape(value: &Value) -> Result<()> {
 /// Read the `depends_on_index` extension value written by [`resolve_depends_on_indices`],
 /// aligned 1:1 by position with [`depends_on_from_value`]'s result: `Some(i)` for an entry whose
 /// name resolved to sibling index `i` in THIS SAME proposal, `None` for one that did not.
+///
+/// Accepts BOTH stored shapes: the current array (issue #173) AND the pre-#173 SCALAR the
+/// single-predecessor code persisted (`depends_on_index: 0` for a resolved name,
+/// `depends_on_index: null` for an unresolvable one). A plan saved+confirmed before the
+/// upgrade is re-read RAW by the confirmed fast path on every redispatch and is never
+/// re-saved/normalized, so without the scalar arm every upgraded plan's already-resolved
+/// dependency would read as an EMPTY index list — `depends_on_targets_of` would downgrade the
+/// name to `Unresolved`, and `record_upstream_edges` would overwrite the M0054-lifted resolved
+/// edge with a PERMANENT blocking sentinel. The scalar aligns 1:1 with the legacy bare-string
+/// `depends_on` (exactly one name), which `depends_on_values_from_direction` already keeps.
 fn depends_on_index_from_value(value: &Value, index: usize) -> Vec<Option<usize>> {
-    value
+    let Some(raw) = value
         .get("directions")
         .and_then(Value::as_array)
         .and_then(|directions| directions.get(index))
         .and_then(|direction| direction.get("depends_on_index"))
-        .and_then(Value::as_array)
-        .map(|items| items.iter().map(|v| v.as_u64().map(|i| i as usize)).collect())
-        .unwrap_or_default()
+    else {
+        return Vec::new();
+    };
+    match raw {
+        Value::Array(items) => items.iter().map(|v| v.as_u64().map(|i| i as usize)).collect(),
+        Value::Number(n) => vec![n.as_u64().map(|i| i as usize)],
+        Value::Null => vec![None],
+        _ => Vec::new(),
+    }
 }
 
 /// Resolve every lane's `depends_on` NAMEs to STABLE INDICES into this SAME proposal's
@@ -1890,14 +1953,17 @@ async fn record_upstream_edges(db: &Db, thread_id: i32, lanes: &[UpstreamLane]) 
     // EQUALLY safe against a false cycle rejection in pass 2, but a sweep reading it
     // mid-transition sees `UpstreamStatus::Unknown` (blocking), never `None` (releasing) — the
     // same fail-closed answer `UNRESOLVED_UPSTREAM_SENTINEL` already gives for "not resolved
-    // yet" everywhere else in this feature. Only touching lanes with EXISTING edges that are
-    // ACTUALLY different from their target (not every lane in the batch, and not a lane with no
-    // prior edges at all — nothing stale there to collide with) keeps the common case — most
-    // decisions touch no `depends_on` at all — at zero extra writes.
+    // yet" everywhere else in this feature. A lane whose edges already match its target is
+    // skipped (the common case — most decisions touch no `depends_on` at all: zero extra
+    // writes). A lane with NO prior edges but a NON-EMPTY target gets the placeholder too:
+    // nothing stale to collide with, but between this caller's CAS commit and pass 2's real
+    // write the row would otherwise read `UpstreamStatus::None` — "no upstream, free to
+    // merge" — and a crash in that gap would leave the fresh consumer PERMANENTLY
+    // dependency-free until some later call repaired it.
     for (direction_id, edges) in &targets {
         let current = repo::direction_upstream_edges(db, *direction_id).await;
         let stale = match &current {
-            Ok(rows) if rows.is_empty() => false,
+            Ok(rows) if rows.is_empty() => !edges.is_empty(),
             Ok(rows) => !edge_sets_equal(rows, edges),
             Err(_) => true, // can't tell — fail toward the extra, harmless placeholder write.
         };
@@ -7788,6 +7854,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
+    /// Pass 1 must protect a FRESH consumer (no prior edge rows) too, not only a replacement:
+    /// between confirm's materialization and pass 2's real write, the just-created lane would
+    /// otherwise read `UpstreamStatus::None` ("no upstream, free to merge") — and a crash
+    /// landing in that gap would leave it PERMANENTLY dependency-free until a later redispatch
+    /// repaired it. The placeholder makes the gap — and any crash inside it — fail closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fresh_consumers_first_edges_are_placeholder_blocked_between_passes() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-fresh-between-passes-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let _repo_path = make_repo(&root, "api");
+        // File-backed DB for the same cross-task visibility reason as
+        // `record_upstream_edges_never_reads_free_to_merge_between_its_two_passes`.
+        let db_file = weft_home.join("fresh-between-passes.sqlite");
+        std::fs::create_dir_all(&weft_home).unwrap();
+        let db = Db::connect(&format!("sqlite://{}?mode=rwc", db_file.to_str().unwrap()))
+            .await
+            .unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let _ra = repo::add_repo_ref(&db, ws.id, "api", root.join("api").to_str().unwrap(), "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // FIRST confirm ever: the consumer direction is brand new, with no prior edge rows.
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only", "depends_on": "producer"},
+            ]
+        });
+        save_proposal_value(&db, t.id, &raw).await.unwrap();
+
+        let (reached_rx, resume_tx) = tests::arm_between_upstream_passes_probe(t.id);
+        let db2 = db.clone();
+        let tid = t.id;
+        let confirm_handle = tokio::spawn(async move { confirm(&db2, tid).await });
+
+        reached_rx.await.expect("record_upstream_edges reached the between-passes probe");
+        // Both directions were materialized before record_upstream_edges ran; find the fresh
+        // consumer by name and read exactly what a concurrent sweep (or a crash-then-restart)
+        // would read at this instant.
+        let consumer_row = repo::list_directions(&db, t.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.name == "consumer")
+            .expect("the consumer direction exists at the probe point");
+        let mid_transition = repo::upstream_merge_state(&db, consumer_row.id).await;
+        let _ = resume_tx.send(());
+        let ids = confirm_handle.await.unwrap().unwrap();
+        assert_eq!(ids.len(), 2, "both lanes are dispatched");
+
+        assert!(
+            !matches!(mid_transition, crate::host::UpstreamStatus::None),
+            "a fresh consumer between the two passes must NEVER read None (\"no upstream, free \
+             to merge\") — got {mid_transition:?}"
+        );
+        assert!(
+            matches!(mid_transition, crate::host::UpstreamStatus::Unknown { .. }),
+            "mid-transition must read Unknown (blocking, fail-closed) — got {mid_transition:?}"
+        );
+        let producer_id = repo::list_directions(&db, t.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.name == "producer")
+            .map(|d| d.id)
+            .expect("producer exists");
+        assert_eq!(
+            repo::get_direction(&db, consumer_row.id).await.unwrap().unwrap().depends_on_direction_id,
+            producer_id,
+            "after resuming, pass 2 still lands the real edge"
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     /// THE FIX (Codex review, PR #159 planner.rs:1534): when the human DENIES the producer lane
     /// (not merely leaves it undecided), a consumer naming it via `depends_on` must NOT read as
     /// having no upstream — its declared prerequisite is a decided, permanent dead end. Denying
@@ -8002,6 +8155,196 @@ mod tests {
         assert!(
             err.to_string().contains(&MAX_LANES_PER_PROPOSAL.to_string()),
             "error should name the cap: {err}"
+        );
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// Pre-#173 plans stored `depends_on` as ONE bare-string name and `depends_on_index` as a
+    /// SCALAR (`0` for a resolved name, `null` for an unresolvable one). Those rows are re-read
+    /// RAW by the confirmed fast path on every redispatch and are never re-saved/normalized, so
+    /// the reader must keep resolving both legacy shapes — without the scalar arm, every
+    /// upgraded plan's already-resolved dependency read as an EMPTY index list and was
+    /// downgraded to a permanent blocking sentinel.
+    #[test]
+    fn depends_on_index_accepts_the_legacy_scalar_shapes() {
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only",
+                 "depends_on": "producer", "depends_on_index": 0},
+                {"name": "typo", "repo": "api", "reason": "r", "mandate": "impl-only",
+                 "depends_on": "nope", "depends_on_index": Value::Null},
+            ]
+        });
+        assert_eq!(depends_on_index_from_value(&raw, 1), vec![Some(0)]);
+        assert_eq!(depends_on_index_from_value(&raw, 2), vec![None]);
+        let targets = depends_on_targets_of(
+            &depends_on_from_value(&raw, 1),
+            &depends_on_index_from_value(&raw, 1),
+        );
+        assert!(
+            matches!(targets.as_slice(), [DependsOnTarget::Index(0)]),
+            "a resolved legacy scalar keeps naming its sibling"
+        );
+        let targets = depends_on_targets_of(
+            &depends_on_from_value(&raw, 2),
+            &depends_on_index_from_value(&raw, 2),
+        );
+        assert!(
+            matches!(targets.as_slice(), [DependsOnTarget::Unresolved]),
+            "a null legacy scalar stays actively blocked, exactly as before the upgrade"
+        );
+    }
+
+    /// End-to-end legacy-shape guard for the upgrade path: a plan stored BEFORE #173
+    /// (bare-string `depends_on`, SCALAR `depends_on_index`) whose single-column edge M0054
+    /// already lifted to a resolved edge row must KEEP that edge when the confirmed fast path
+    /// re-derives targets and re-runs `record_upstream_edges` on redispatch — not have it
+    /// overwritten with the blocking placeholder.
+    #[tokio::test]
+    async fn legacy_scalar_plan_keeps_its_lifted_resolved_edge_on_redispatch() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-legacy-scalar-{}", std::process::id());
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "api", "/tmp/legacy-scalar-api", "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let producer = repo::create_direction(&db, t.id, "producer", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+        let consumer = repo::create_direction(&db, t.id, "consumer", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+        // What M0054 lifts a legacy positive `depends_on_direction_id` into.
+        repo::set_direction_upstreams(&db, consumer.id, &[repo::UpstreamEdge::resolved(producer.id)])
+            .await
+            .unwrap();
+
+        // The stored plan JSON exactly as the pre-#173 code persisted it.
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only",
+                 "decision": "approved", "direction_id": producer.id},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only",
+                 "decision": "approved", "direction_id": consumer.id,
+                 "depends_on": "producer", "depends_on_index": 0},
+            ]
+        });
+        let proposal: Proposal = serde_json::from_value(raw.clone()).unwrap();
+        let lanes = upstream_lanes_from_raw(&proposal, &raw);
+        record_upstream_edges(&db, t.id, &lanes).await;
+
+        let edges = repo::direction_upstream_edges(&db, consumer.id).await.unwrap();
+        assert_eq!(edges.len(), 1, "exactly the one lifted edge remains");
+        assert_eq!(
+            (edges[0].upstream_direction_id, edges[0].state),
+            (producer.id, repo::UpstreamEdgeState::Resolved),
+            "the lifted resolved edge survives the legacy-shape redispatch"
+        );
+        assert_eq!(
+            repo::get_direction(&db, consumer.id).await.unwrap().unwrap().depends_on_direction_id,
+            producer.id,
+            "the mirror column still names the producer"
+        );
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// The thread-wide edge budget is enforced up front at SAVE time: the per-lane cap alone
+    /// admits `MAX_LANES_PER_PROPOSAL x MAX_DIRECT_PREDECESSORS_PER_LANE` declared edges — far
+    /// past `MAX_EDGES_PER_THREAD` — and an oversized batch that slipped through would only
+    /// surface lane by lane at write time, after confirm already returned Ok.
+    #[tokio::test]
+    async fn save_proposal_value_rejects_a_proposal_over_the_thread_edge_budget() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-edge-budget-{}", std::process::id());
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        // 8 producers + 17 consumers x 8 dependencies each = 136 declared edges: every lane
+        // within the per-lane cap, 25 lanes within the per-proposal cap, total over the
+        // 128-edge thread budget.
+        let producers: Vec<String> = (0..repo::MAX_DIRECT_PREDECESSORS_PER_LANE)
+            .map(|i| format!("producer-{i}"))
+            .collect();
+        let mut directions: Vec<Value> = producers
+            .iter()
+            .map(|name| serde_json::json!({"name": name, "repo": "api", "reason": "r", "mandate": "impl-only"}))
+            .collect();
+        for i in 0..17 {
+            directions.push(serde_json::json!({
+                "name": format!("consumer-{i}"), "repo": "api", "reason": "r",
+                "mandate": "impl-only", "depends_on": producers,
+            }));
+        }
+        assert!(directions.len() <= MAX_LANES_PER_PROPOSAL);
+        let raw = serde_json::json!({ "rationale": "r", "directions": directions });
+        let err = save_proposal_value(&db, t.id, &raw)
+            .await
+            .expect_err("exceeding the thread-wide edge budget must fail the save");
+        assert!(
+            err.to_string().contains(&repo::MAX_EDGES_PER_THREAD.to_string()),
+            "error should name the budget: {err}"
+        );
+
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// A malformed `depends_on` ENTRY (a non-string, or a non-string/array shape) is rejected
+    /// at save — normalization would otherwise silently DROP it, releasing a consumer the lead
+    /// clearly meant to gate (fail open, with no signal to anyone).
+    #[tokio::test]
+    async fn save_proposal_value_rejects_non_string_depends_on_entries() {
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-depends-on-shape-{}", std::process::id());
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "producer", "repo": "api", "reason": "r", "mandate": "impl-only"},
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only",
+                 "depends_on": [3]},
+            ]
+        });
+        let err = save_proposal_value(&db, t.id, &raw)
+            .await
+            .expect_err("a non-string depends_on entry must be rejected, not dropped");
+        assert!(err.to_string().contains("non-string"), "error should name the problem: {err}");
+
+        let raw = serde_json::json!({
+            "rationale": "r",
+            "directions": [
+                {"name": "consumer", "repo": "api", "reason": "r", "mandate": "impl-only",
+                 "depends_on": 3},
+            ]
+        });
+        let err = save_proposal_value(&db, t.id, &raw)
+            .await
+            .expect_err("a non-string/array depends_on shape must be rejected, not dropped");
+        assert!(
+            err.to_string().contains("array of lane names"),
+            "error should name the expected shape: {err}"
         );
 
         std::env::remove_var("WEFT_HOME");
