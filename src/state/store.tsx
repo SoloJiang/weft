@@ -1661,8 +1661,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           ),
         };
       });
+      await refreshOverview(true);
     },
-    [],
+    [refreshOverview],
   );
 
   // ALL workers run on the chat engine — one product-native conversation UI
@@ -2195,6 +2196,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           if (list.some((x) => x.id === p.message.id)) return m;
           return { ...m, [p.thread_id]: [...list, p.message] };
         });
+        // Proposal versions are part of unopened workspace cards' readiness
+        // keys. Refresh the overview for every proposal/withdraw push, not only
+        // the globally active thread, so a background lead cannot leave a card
+        // displaying evidence from the previous policy version. `force` queues
+        // a trailing pass when an older overview request is already in flight.
+        if (p.message.kind === "proposal") {
+          void refreshOverviewRef.current(true);
+        }
         // A proposal/withdraw row landed: refresh the active thread's proposal so the
         // review card + scope canvas reflect it at once — a withdraw flips status to
         // "withdrawn", closing an open ScopeReview — instead of waiting for the 2.5s

@@ -39,6 +39,9 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::{Child, Command};
 
 /// 每个受管子进程携带的实例标记 env。codex 会清洗它(见模块文档),故它**不是**主
@@ -318,6 +321,249 @@ pub async fn reap(child: &mut Child, reg: &Registration) {
     deregister(reg.id);
 }
 
+/// Whether [`reap_bounded`] completed both tree discovery/termination and the
+/// direct-child wait before its supplied budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundedReapOutcome {
+    Completed,
+    Incomplete,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+enum DeadlineWork<T> {
+    Complete(T),
+    Incomplete,
+}
+
+/// Deadline-aware variant of [`reap`] for latency-sensitive callers such as
+/// readiness probes. It preserves [`reap`]'s full tree behavior only when the
+/// complete process-table discovery, every tree-group kill, and the root wait
+/// fit within `budget`.
+///
+/// Process-table reads are synchronous platform syscalls/filesystem reads, so
+/// discovery runs in `spawn_blocking`. The outer deadline lets the async caller
+/// return even if one OS read stalls; the detached worker owns only numeric PID
+/// facts and repeatedly observes the same deadline while enumerating records
+/// and walking the descendant graph. It never touches `child` or `reg` after a
+/// caller has returned. An incomplete path always kills the known root group,
+/// but deliberately does not deregister the live root: its owner must retain
+/// the registration until it explicitly tears down or reaps that child.
+///
+/// On platforms without a fork-free descendant snapshot, this reports
+/// [`BoundedReapOutcome::Incomplete`] after the root-group fallback rather than
+/// claiming tree completion.
+pub async fn reap_bounded(
+    child: &mut Child,
+    reg: &Registration,
+    budget: Duration,
+) -> BoundedReapOutcome {
+    let Some(deadline) = Instant::now().checked_add(budget) else {
+        return bounded_reap_incomplete(reg);
+    };
+    if Instant::now() >= deadline {
+        return bounded_reap_incomplete(reg);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let root_pid = reg.pid as i32;
+        let root_pgid = reg.pgid;
+        let discovery_deadline = deadline;
+        let discovery = tokio::task::spawn_blocking(move || {
+            discover_tree_groups_until(root_pid, root_pgid, discovery_deadline)
+        });
+        let tokio_deadline = tokio::time::Instant::from_std(deadline);
+        let groups = match tokio::time::timeout_at(tokio_deadline, discovery).await {
+            Ok(Ok(DeadlineWork::Complete(groups))) => groups,
+            Ok(Ok(DeadlineWork::Incomplete)) | Ok(Err(_)) | Err(_) => {
+                return bounded_reap_incomplete(reg);
+            }
+        };
+
+        if !kill_tree_groups_until(groups, reg.pgid, deadline) {
+            return bounded_reap_incomplete(reg);
+        }
+        if Instant::now() >= deadline {
+            return bounded_reap_incomplete(reg);
+        }
+        let wait_deadline = tokio::time::Instant::from_std(deadline);
+        match tokio::time::timeout_at(wait_deadline, child.wait()).await {
+            Ok(Ok(_)) => {
+                deregister(reg.id);
+                // `timeout_at` chose the completed wait. The child is now
+                // reaped, so do not reinterpret a later clock observation as
+                // incomplete and signal the old root PGID after its owner has
+                // exited. Actual deadline expiry remains the `Err(_)` arm.
+                BoundedReapOutcome::Completed
+            }
+            Ok(Err(_)) | Err(_) => BoundedReapOutcome::Incomplete,
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = child;
+        bounded_reap_incomplete(reg)
+    }
+}
+
+fn bounded_reap_incomplete(reg: &Registration) -> BoundedReapOutcome {
+    kill_group(reg.pgid);
+    BoundedReapOutcome::Incomplete
+}
+
+/// Discover every process group in the still-living descendant tree. The
+/// caller supplies an absolute deadline so both snapshot enumeration and the
+/// graph walk stop before doing more unbounded per-process work.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn discover_tree_groups_until(
+    root_pid: i32,
+    root_pgid: i32,
+    deadline: Instant,
+) -> DeadlineWork<HashSet<i32>> {
+    let snapshot = match snapshot_until(deadline) {
+        DeadlineWork::Complete(snapshot) => snapshot,
+        DeadlineWork::Incomplete => return DeadlineWork::Incomplete,
+    };
+    tree_groups_from_snapshot_until(root_pid, root_pgid, &snapshot, || {
+        Instant::now() < deadline
+    })
+}
+
+/// A deadline-aware snapshot of `(pid, ppid, pgid)`. Linux iterates `/proc`
+/// lazily and checks before advancing to the next entry; macOS checks around
+/// its one kernel PID-list syscall and then before every per-PID lookup. The
+/// outer `spawn_blocking` deadline in [`reap_bounded`] protects callers from an
+/// individual platform read which cannot itself be preempted.
+#[cfg(target_os = "macos")]
+fn snapshot_until(deadline: Instant) -> DeadlineWork<Vec<(i32, i32, i32)>> {
+    if Instant::now() >= deadline {
+        return DeadlineWork::Incomplete;
+    }
+    let pids = all_pids();
+    snapshot_from_pids_until(pids.into_iter(), || Instant::now() < deadline, proc_ppid_pgid)
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_until(deadline: Instant) -> DeadlineWork<Vec<(i32, i32, i32)>> {
+    if Instant::now() >= deadline {
+        return DeadlineWork::Incomplete;
+    }
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(_) => return DeadlineWork::Incomplete,
+    };
+    let pids = entries.filter_map(|entry| {
+        let entry = entry.ok()?;
+        entry.file_name().to_str()?.parse::<i32>().ok()
+    });
+    snapshot_from_pids_until(pids, || Instant::now() < deadline, proc_ppid_pgid)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn snapshot_from_pids_until<I, HasTime, ReadFacts>(
+    mut pids: I,
+    mut has_time: HasTime,
+    mut read_facts: ReadFacts,
+) -> DeadlineWork<Vec<(i32, i32, i32)>>
+where
+    I: Iterator<Item = i32>,
+    HasTime: FnMut() -> bool,
+    ReadFacts: FnMut(i32) -> Option<(i32, i32)>,
+{
+    let mut snapshot = Vec::new();
+    loop {
+        if !has_time() {
+            return DeadlineWork::Incomplete;
+        }
+        let Some(pid) = pids.next() else {
+            return DeadlineWork::Complete(snapshot);
+        };
+        if !has_time() {
+            return DeadlineWork::Incomplete;
+        }
+        if let Some((ppid, pgid)) = read_facts(pid) {
+            snapshot.push((pid, ppid, pgid));
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn tree_groups_from_snapshot_until<HasTime>(
+    root_pid: i32,
+    root_pgid: i32,
+    snapshot: &[(i32, i32, i32)],
+    mut has_time: HasTime,
+) -> DeadlineWork<HashSet<i32>>
+where
+    HasTime: FnMut() -> bool,
+{
+    if !has_time() {
+        return DeadlineWork::Incomplete;
+    }
+    let mut groups: HashSet<i32> = HashSet::new();
+    groups.insert(root_pgid);
+    let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
+    let mut pgid_by: HashMap<i32, i32> = HashMap::new();
+    let mut root_seen = false;
+    for &(pid, ppid, pgid) in snapshot {
+        if !has_time() {
+            return DeadlineWork::Incomplete;
+        }
+        if pid == root_pid {
+            root_seen = true;
+        }
+        children.entry(ppid).or_default().push(pid);
+        pgid_by.insert(pid, pgid);
+    }
+    // A missing root means it may already have exited and reparented an escaped
+    // child. Do not claim a complete tree reap from that stale snapshot.
+    if !root_seen {
+        return DeadlineWork::Incomplete;
+    }
+
+    let mut seen: HashSet<i32> = HashSet::new();
+    seen.insert(root_pid);
+    let mut stack = vec![root_pid];
+    while let Some(current) = stack.pop() {
+        if !has_time() {
+            return DeadlineWork::Incomplete;
+        }
+        if let Some(kids) = children.get(&current) {
+            for &child in kids {
+                if !has_time() {
+                    return DeadlineWork::Incomplete;
+                }
+                if seen.insert(child) {
+                    if let Some(&pgid) = pgid_by.get(&child) {
+                        groups.insert(pgid);
+                    }
+                    stack.push(child);
+                }
+            }
+        }
+    }
+    DeadlineWork::Complete(groups)
+}
+
+/// Kill the root group first, then every discovered escaped descendant group
+/// while the deadline remains. Returning `false` means callers must preserve
+/// their root-group fallback; the root itself was already signalled.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn kill_tree_groups_until(groups: HashSet<i32>, root_pgid: i32, deadline: Instant) -> bool {
+    kill_group(root_pgid);
+    for pgid in groups {
+        if pgid == root_pgid {
+            continue;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        kill_group(pgid);
+    }
+    true
+}
+
 /// 把 `root_pid` 为根的整棵进程子树按「每个不同进程组」SIGKILL。`root_pgid` 是直接子
 /// 进程自己的组(configure 保证 == root_pid、且 ≠ Weft 的组)。快照在调用时刻取,故
 /// 需在 root 还活着(ppid 链完好)时调用。fork-free。
@@ -380,6 +626,382 @@ pub fn kill_group(pgid: i32) {
 fn own_pgid() -> i32 {
     // SAFETY: getpgrp 无参、无内存安全前置条件。
     unsafe { libc::getpgrp() }
+}
+
+/// A unique open-file identity inherited by one subprocess tree.
+///
+/// The parent keeps the descriptor `CLOEXEC`; [`attach`](Self::attach) clears
+/// that bit only in the selected command's post-fork child. Consequently,
+/// concurrent probes do not inherit one another's markers, while descendants
+/// of the selected command retain the descriptor across `fork`, `exec`,
+/// `setsid`, and PPID reparenting. Sweeping compares vnode `(device, inode)`
+/// identity rather than a path, so it remains valid even after unlink.
+///
+/// A descendant that deliberately closes unknown file descriptors has opted
+/// out of this ownership channel and cannot be recovered by this fallback.
+pub struct InheritedProcessMarker {
+    #[cfg(unix)]
+    file: Option<std::fs::File>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    armed: bool,
+}
+
+impl InheritedProcessMarker {
+    pub fn create(label: &str) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::os::fd::AsRawFd;
+            use std::os::unix::fs::MetadataExt;
+
+            static NEXT_MARKER: AtomicU64 = AtomicU64::new(1);
+            let safe_label: String = label
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .take(48)
+                .collect();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            for _ in 0..32 {
+                let sequence = NEXT_MARKER.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "weft-process-marker-{safe_label}-{}-{nanos}-{sequence}",
+                    instance_id()
+                ));
+                let file = match OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                };
+                let fd = file.as_raw_fd();
+                // Keep the descriptor private to Weft unless a command's
+                // pre-exec hook explicitly opts into this marker.
+                // SAFETY: `fd` belongs to `file` and remains live here.
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                if flags < 0 {
+                    let error = std::io::Error::last_os_error();
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error);
+                }
+                if flags & libc::FD_CLOEXEC == 0 {
+                    // SAFETY: setting descriptor flags on our own live fd has
+                    // no additional memory-safety preconditions.
+                    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+                        let error = std::io::Error::last_os_error();
+                        let _ = std::fs::remove_file(&path);
+                        return Err(error);
+                    }
+                }
+                let metadata = match file.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&path);
+                        return Err(error);
+                    }
+                };
+                // Ownership is the open vnode, not the directory entry. Unlink
+                // immediately so another process cannot open the marker by
+                // discovering its temporary name, and a crash leaves no file.
+                if let Err(error) = std::fs::remove_file(&path) {
+                    return Err(error);
+                }
+                return Ok(Self {
+                    file: Some(file),
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    armed: true,
+                });
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate a unique process marker",
+            ))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = label;
+            Ok(Self {})
+        }
+    }
+
+    pub fn attach(&self, command: &mut Command) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            let Some(file) = self.file.as_ref() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "process marker is no longer armed",
+                ));
+            };
+            let fd = file.as_raw_fd();
+            // SAFETY: the closure runs after fork and before exec. It performs
+            // only `fcntl` plus construction of an OS error on failure.
+            unsafe {
+                command.pre_exec(move || {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = command;
+        }
+        Ok(())
+    }
+
+    /// Kill every live process that still owns this marker, then sweep each
+    /// marked process group. The caller may repeat this until it returns zero.
+    pub fn sweep(&self) -> usize {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            sweep_open_file_identity(OpenFileIdentity {
+                device: self.device,
+                inode: self.inode,
+            })
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            0
+        }
+    }
+
+    /// Perform the final ownership sweep and suppress the Drop fallback.
+    /// Readiness runs this on a bounded blocking worker; disarming prevents a
+    /// second full process-table scan when the marker then leaves scope.
+    pub fn sweep_and_disarm(&mut self) -> usize {
+        let killed = self.sweep();
+        #[cfg(unix)]
+        {
+            self.armed = false;
+        }
+        killed
+    }
+}
+
+impl Drop for InheritedProcessMarker {
+    fn drop(&mut self) {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            if self.armed {
+                self.armed = false;
+                if let Some(file) = self.file.take() {
+                    enqueue_open_file_cleanup(OpenFileCleanup {
+                        // Keep the unlinked vnode allocated until the queued
+                        // scan finishes. Closing the last descriptor here
+                        // could let the inode be reused and make a delayed
+                        // identity-only scan target an unrelated process.
+                        _file: file,
+                        identity: OpenFileIdentity {
+                            device: self.device,
+                            inode: self.inode,
+                        },
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Clone, Copy)]
+struct OpenFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct OpenFileCleanup {
+    _file: std::fs::File,
+    identity: OpenFileIdentity,
+}
+
+/// Drop may run on a Tokio worker when a readiness future is cancelled. Queue
+/// the fallback scan onto one dedicated process-cleanup thread instead of
+/// synchronously enumerating every PID/file descriptor on the async executor.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn enqueue_open_file_cleanup(cleanup: OpenFileCleanup) {
+    const MAX_QUEUED_MARKER_CLEANUPS: usize = 64;
+    static SENDER: OnceLock<std::sync::mpsc::SyncSender<OpenFileCleanup>> = OnceLock::new();
+    let sender = SENDER.get_or_init(|| {
+        // The queue owns live file descriptors so delayed scans cannot match a
+        // reused inode. Bound it to keep repeated cancellation from turning a
+        // stalled platform scan into unbounded descriptor retention. When the
+        // queue is saturated, evidence is already fail-closed; relinquishing
+        // this best-effort fallback is safer than blocking a runtime worker or
+        // retaining an unbounded number of live descriptors.
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<OpenFileCleanup>(MAX_QUEUED_MARKER_CLEANUPS);
+        let _ = std::thread::Builder::new()
+            .name("weft-process-marker-cleanup".to_string())
+            .spawn(move || {
+                for cleanup in receiver {
+                    let _ = sweep_open_file_identity(cleanup.identity);
+                }
+            });
+        sender
+    });
+    let _ = sender.try_send(cleanup);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sweep_open_file_identity(identity: OpenFileIdentity) -> usize {
+    let own_pid = std::process::id() as i32;
+    let marked: Vec<i32> = all_pids()
+        .into_iter()
+        .filter(|pid| {
+            *pid != own_pid && process_has_open_file(*pid, identity.device, identity.inode)
+        })
+        .collect();
+    let mut groups = HashSet::new();
+    let mut killed = 0;
+    for pid in marked {
+        // Revalidate immediately before signalling to narrow the PID reuse
+        // race between enumeration and kill.
+        if !process_has_open_file(pid, identity.device, identity.inode) {
+            continue;
+        }
+        if let Some((_, pgid)) = proc_ppid_pgid(pid) {
+            groups.insert(pgid);
+        }
+        // SAFETY: signalling a numeric PID has no memory-safety precondition.
+        // The marker recheck above establishes ownership.
+        unsafe {
+            let _ = libc::kill(pid, libc::SIGKILL);
+        }
+        killed += 1;
+    }
+    for group in groups {
+        kill_group(group);
+    }
+    killed
+}
+
+#[cfg(target_os = "linux")]
+fn process_has_open_file(pid: i32, device: u64, inode: u64) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    if pid <= 1 {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        // `DirEntry::metadata` does not follow symlinks on this API. Proc fd
+        // rows are symlinks, so use `fs::metadata` to inspect the open target.
+        std::fs::metadata(entry.path())
+            .map(|metadata| metadata.dev() == device && metadata.ino() == inode)
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcessFileInfo {
+    open_flags: u32,
+    status: u32,
+    offset: libc::off_t,
+    file_type: i32,
+    guard_flags: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct VnodeFdInfo {
+    file: ProcessFileInfo,
+    vnode: libc::vnode_info,
+}
+
+#[cfg(target_os = "macos")]
+fn process_has_open_file(pid: i32, device: u64, inode: u64) -> bool {
+    const PROC_PIDFDVNODEINFO: libc::c_int = 1;
+
+    if pid <= 1 {
+        return false;
+    }
+    let entry_size = std::mem::size_of::<libc::proc_fdinfo>();
+    // SAFETY: a null buffer asks libproc for the current byte requirement.
+    let needed = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if needed <= 0 {
+        return false;
+    }
+    let capacity = (needed as usize)
+        .saturating_add(entry_size.saturating_mul(32))
+        .min(libc::c_int::MAX as usize);
+    let mut entries = vec![libc::proc_fdinfo {
+        proc_fd: 0,
+        proc_fdtype: 0,
+    }; capacity / entry_size];
+    // SAFETY: `entries` owns `capacity` writable bytes and libproc fills at
+    // most the supplied byte count.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            entries.as_mut_ptr() as *mut libc::c_void,
+            capacity as libc::c_int,
+        )
+    };
+    if filled <= 0 {
+        return false;
+    }
+    entries.truncate((filled as usize / entry_size).min(entries.len()));
+    entries.into_iter().any(|entry| {
+        if entry.proc_fdtype != libc::PROX_FDTYPE_VNODE as u32 {
+            return false;
+        }
+        let mut info: VnodeFdInfo = unsafe { std::mem::zeroed() };
+        let info_size = std::mem::size_of::<VnodeFdInfo>() as libc::c_int;
+        // SAFETY: `info` is a correctly sized writable C-layout buffer for
+        // PROC_PIDFDVNODEINFO.
+        let read = unsafe {
+            libc::proc_pidfdinfo(
+                pid,
+                entry.proc_fd,
+                PROC_PIDFDVNODEINFO,
+                &mut info as *mut _ as *mut libc::c_void,
+                info_size,
+            )
+        };
+        read == info_size
+            && u64::from(info.vnode.vi_stat.vst_dev) == device
+            && info.vnode.vi_stat.vst_ino == inode
+    })
 }
 
 // ── 口径:is_ours / count ────────────────────────────────────────────────────
@@ -886,6 +1508,204 @@ mod tests {
         assert!(
             !registered().iter().any(|r| r.pid == reg.pid()),
             "reap deregisters the child"
+        );
+    }
+
+    #[tokio::test]
+    async fn inherited_fd_marker_reaps_a_background_child_after_its_parent_exits() {
+        let _g = test_guard();
+        let marker = InheritedProcessMarker::create("proc-registry-test")
+            .expect("create inherited process marker");
+        let root = tempfile::tempdir().expect("marker fixture directory");
+        let pid_file = root.path().join("background.pid");
+        let mut command = null_cmd("sh");
+        command
+            .env("WEFT_PROC_REGISTRY_TEST_PID_FILE", &pid_file)
+            .arg("-c")
+            .arg("sleep 30 >/dev/null 2>&1 & printf '%s\\n' \"$!\" > \"$WEFT_PROC_REGISTRY_TEST_PID_FILE\"");
+        marker
+            .attach(&mut command)
+            .expect("attach inherited process marker");
+        let configured = configure(&mut command, Owner::other("marker-parent-exit"));
+        let mut child = command.spawn().expect("spawn marker fixture");
+        let registration = configured.register(&child);
+        child.wait().await.expect("wait direct shell");
+
+        let background_pid = std::fs::read_to_string(&pid_file)
+            .expect("background child records pid")
+            .trim()
+            .parse::<i32>()
+            .expect("numeric background pid");
+        let mut marker_visible = false;
+        for _ in 0..40 {
+            if process_has_open_file(background_pid, marker.device, marker.inode) {
+                marker_visible = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            marker_visible,
+            "the inherited fd marker must remain visible on reparented pid {background_pid}"
+        );
+
+        let killed = marker.sweep();
+        assert!(
+            killed > 0,
+            "the inherited fd must retain ownership after the shell is reparented away"
+        );
+        let mut still_alive = true;
+        for _ in 0..40 {
+            if proc_ppid_pgid(background_pid).is_none() {
+                still_alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let _ = marker.sweep();
+        }
+        assert!(!still_alive, "the marked background process must be gone");
+        drop(registration);
+    }
+
+    #[tokio::test]
+    async fn dropping_inherited_fd_marker_queues_reparented_child_cleanup() {
+        let _g = test_guard();
+        let marker = InheritedProcessMarker::create("proc-registry-drop-test")
+            .expect("create Drop cleanup marker");
+        let root = tempfile::tempdir().expect("Drop cleanup fixture directory");
+        let pid_file = root.path().join("drop-background.pid");
+        let mut command = null_cmd("sh");
+        command
+            .env("WEFT_PROC_REGISTRY_TEST_PID_FILE", &pid_file)
+            .arg("-c")
+            .arg("sleep 30 >/dev/null 2>&1 & printf '%s\\n' \"$!\" > \"$WEFT_PROC_REGISTRY_TEST_PID_FILE\"");
+        marker
+            .attach(&mut command)
+            .expect("attach Drop cleanup marker");
+        let configured = configure(&mut command, Owner::other("marker-drop-parent-exit"));
+        let mut child = command.spawn().expect("spawn Drop cleanup fixture");
+        let registration = configured.register(&child);
+        child.wait().await.expect("wait Drop cleanup shell");
+
+        let background_pid = std::fs::read_to_string(&pid_file)
+            .expect("Drop cleanup child records pid")
+            .trim()
+            .parse::<i32>()
+            .expect("numeric Drop cleanup pid");
+        assert!(
+            process_has_open_file(background_pid, marker.device, marker.inode),
+            "the Drop fixture must inherit the ownership marker"
+        );
+
+        drop(marker);
+        for _ in 0..80 {
+            if proc_ppid_pgid(background_pid).is_none() {
+                drop(registration);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if let Some((_, group)) = proc_ppid_pgid(background_pid) {
+            kill_group(group);
+        }
+        drop(registration);
+        panic!("Drop cleanup did not reap marked child {background_pid}");
+    }
+
+    #[test]
+    fn deadline_aware_snapshot_and_tree_walk_stop_before_full_input() {
+        let mut snapshot_checks = 0;
+        let mut fact_reads = 0;
+        let snapshot = snapshot_from_pids_until(
+            (1..=100).collect::<Vec<_>>().into_iter(),
+            || {
+                snapshot_checks += 1;
+                snapshot_checks < 4
+            },
+            |_| {
+                fact_reads += 1;
+                Some((0, 1))
+            },
+        );
+        assert!(matches!(snapshot, DeadlineWork::Incomplete));
+        assert_eq!(
+            fact_reads, 1,
+            "the deadline check must stop PID enumeration before every record is read"
+        );
+
+        let mut walk_checks = 0;
+        let walk = tree_groups_from_snapshot_until(
+            1,
+            1,
+            &[(1, 0, 1), (2, 1, 2), (3, 2, 3)],
+            || {
+                walk_checks += 1;
+                walk_checks < 4
+            },
+        );
+        assert!(matches!(walk, DeadlineWork::Incomplete));
+    }
+
+    #[test]
+    fn deadline_aware_tree_walk_keeps_each_discovered_process_group() {
+        let walk = tree_groups_from_snapshot_until(
+            1,
+            1,
+            &[(1, 0, 1), (2, 1, 2), (3, 2, 3)],
+            || true,
+        );
+        match walk {
+            DeadlineWork::Complete(groups) => {
+                assert!(groups.contains(&1));
+                assert!(groups.contains(&2));
+                assert!(groups.contains(&3));
+            }
+            DeadlineWork::Incomplete => {
+                panic!("an unlimited synthetic snapshot must finish its tree walk")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_reap_zero_budget_kills_root_but_keeps_registration_until_owner_teardown() {
+        let _g = test_guard();
+        let mut cmd = null_cmd("sh");
+        cmd.arg("-c").arg("sleep 30");
+        let configured = configure(&mut cmd, Owner::other("bounded-reap-zero-budget"));
+        let mut child = cmd.spawn().expect("spawn bounded reaper fixture");
+        let registration = configured.register(&child);
+        let pid = registration.pid();
+
+        let outcome = reap_bounded(&mut child, &registration, Duration::ZERO).await;
+        assert_eq!(outcome, BoundedReapOutcome::Incomplete);
+        assert!(
+            registered().iter().any(|entry| entry.pid == pid),
+            "an incomplete reap must retain the live-child registration for its owner"
+        );
+
+        let waited = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+        assert!(
+            matches!(waited, Ok(Ok(_))),
+            "the incomplete fallback must still terminate the known root group"
+        );
+        drop(registration);
+    }
+
+    #[tokio::test]
+    async fn bounded_reap_reports_completed_when_its_child_wait_wins_the_deadline() {
+        let _g = test_guard();
+        let mut cmd = null_cmd("sh");
+        cmd.arg("-c").arg("sleep 30");
+        let configured = configure(&mut cmd, Owner::other("bounded-reap-completed"));
+        let mut child = cmd.spawn().expect("spawn bounded completed fixture");
+        let registration = configured.register(&child);
+        let pid = registration.pid();
+
+        let outcome = reap_bounded(&mut child, &registration, Duration::from_secs(1)).await;
+        assert_eq!(outcome, BoundedReapOutcome::Completed);
+        assert!(
+            !registered().iter().any(|entry| entry.pid == pid),
+            "a completed bounded reap must deregister its reaped root"
         );
     }
 

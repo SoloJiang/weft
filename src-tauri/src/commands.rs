@@ -2500,6 +2500,13 @@ pub struct RepoLite {
     pub name: String,
 }
 
+#[derive(serde::Serialize)]
+pub struct ReadinessWorktreeSignature {
+    pub direction_id: i32,
+    pub worktree_id: i32,
+    pub exists: bool,
+}
+
 /// A thread's roll-up for the workspace board (cards = threads). Live state
 /// (sessions / needs / asks) is overlaid client-side; this is the structure.
 #[derive(serde::Serialize)]
@@ -2507,39 +2514,164 @@ pub struct ThreadOverview {
     pub thread_id: i32,
     pub title: String,
     pub kind: String,
+    /// Durable plan state used by the board's readiness refresh key. `None`
+    /// means this thread has never stored a plan.
+    pub plan_status: Option<String>,
+    /// Proposal version (the plan's `created_at`) paired with `plan_status`.
+    /// A re-proposal may retain its status while changing this value; `None`
+    /// means this thread has never stored a plan.
+    #[serde(default)]
+    pub plan_created_at: Option<String>,
     pub direction_ids: Vec<i32>,
     /// Stored lifecycle status of each direction (same order as direction_ids),
     /// so the workspace board derives the thread's phase deterministically.
     pub statuses: Vec<String>,
+    /// Every registered worktree row needed by an unopened workspace card's
+    /// readiness key. This avoids depending on the selected thread's hydrated
+    /// `worktreesByDirection` cache.
+    #[serde(default)]
+    pub readiness_worktrees: Vec<ReadinessWorktreeSignature>,
     /// distinct repos this thread WRITES (across its directions).
     pub write_repos: Vec<RepoLite>,
+}
+
+const WORKSPACE_OVERVIEW_PATH_PROBE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(1);
+const MAX_CONCURRENT_WORKSPACE_PATH_PROBES: usize = 4;
+
+fn workspace_path_probe_limit() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static LIMIT: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    LIMIT.get_or_init(|| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_WORKSPACE_PATH_PROBES,
+        ))
+    })
+}
+
+async fn bounded_path_probe_with<F>(
+    path: std::path::PathBuf,
+    timeout: std::time::Duration,
+    limit: std::sync::Arc<tokio::sync::Semaphore>,
+    probe: F,
+) -> bool
+where
+    F: FnOnce(&std::path::Path) -> bool + Send + 'static,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let permit = match tokio::time::timeout_at(deadline, limit.acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) | Err(_) => return false,
+    };
+    let task = tokio::task::spawn_blocking(move || {
+        // A timed-out filesystem call keeps its permit in the detached
+        // blocking task. At most four stalled mounts can accumulate; later
+        // overviews fail closed without spawning more blocking work.
+        let _permit = permit;
+        probe(&path)
+    });
+    match tokio::time::timeout_at(deadline, task).await {
+        Ok(Ok(exists)) => exists,
+        Ok(Err(_)) | Err(_) => false,
+    }
+}
+
+async fn bounded_workspace_path_exists(path: std::path::PathBuf) -> bool {
+    bounded_path_probe_with(
+        path,
+        WORKSPACE_OVERVIEW_PATH_PROBE_TIMEOUT,
+        std::sync::Arc::clone(workspace_path_probe_limit()),
+        |path| match path.try_exists() {
+            Ok(exists) => exists,
+            Err(_) => false,
+        },
+    )
+    .await
 }
 
 /// Portfolio view of a workspace: every thread with its directions + write set,
 /// so the board can show roll-ups and the repositories each task writes.
 #[tauri::command]
 pub async fn workspace_overview(db: State<'_, Db>, workspace_id: i32) -> R<Vec<ThreadOverview>> {
-    let threads: Vec<_> = repo::list_threads(&db, workspace_id)
+    workspace_overview_inner(&db, workspace_id).await
+}
+
+async fn workspace_overview_inner(db: &Db, workspace_id: i32) -> R<Vec<ThreadOverview>> {
+    let threads: Vec<_> = repo::list_threads(db, workspace_id)
         .await
         .map_err(e)?
         .into_iter()
         .filter(|t| t.kind != "curator") // hidden curator-chat thread is not a board issue
         .collect();
+    let mut directions_by_thread =
+        std::collections::HashMap::<i32, Vec<entities::direction::Model>>::new();
+    let mut workspace_direction_ids = std::collections::HashSet::<i32>::new();
+    for thread in &threads {
+        let directions = repo::list_directions(db, thread.id).await.map_err(e)?;
+        workspace_direction_ids.extend(directions.iter().map(|direction| direction.id));
+        directions_by_thread.insert(thread.id, directions);
+    }
+    // One portfolio snapshot, grouped in memory. Querying worktrees inside the
+    // thread/direction loop makes a board refresh add one DB round trip per
+    // lane and scales poorly precisely when the portfolio view is most useful.
+    // Filter before touching the filesystem so a slow mount owned by another
+    // workspace cannot consume this workspace's bounded probe slots.
+    let worktree_probes = repo::list_worktrees(db, None)
+        .await
+        .map_err(e)?
+        .into_iter()
+        .filter(|worktree| workspace_direction_ids.contains(&worktree.direction_id))
+        .map(|worktree| async move {
+            let exists =
+                bounded_workspace_path_exists(std::path::PathBuf::from(&worktree.path)).await;
+            (worktree, exists)
+        });
+    let mut worktrees_by_direction = std::collections::HashMap::<
+        i32,
+        Vec<(entities::worktree::Model, bool)>,
+    >::new();
+    for (worktree, exists) in futures::future::join_all(worktree_probes).await {
+        worktrees_by_direction
+            .entry(worktree.direction_id)
+            .or_default()
+            .push((worktree, exists));
+    }
     let mut out = Vec::new();
     for t in threads {
-        let dirs = repo::list_directions(&db, t.id).await.map_err(e)?;
+        let dirs = match directions_by_thread.remove(&t.id) {
+            Some(directions) => directions,
+            None => Vec::new(),
+        };
+        let (plan_status, plan_created_at) = match repo::get_plan(db, t.id).await.map_err(e)? {
+            Some(plan) => (Some(plan.status), Some(plan.created_at)),
+            None => (None, None),
+        };
         let mut seen = std::collections::BTreeMap::<i32, String>::new();
+        let mut readiness_worktrees = Vec::new();
         for d in &dirs {
-            if let Some(r) = repo::direction_repo_of(&db, d.id).await.map_err(e)? {
+            if let Some(r) = repo::direction_repo_of(db, d.id).await.map_err(e)? {
                 seen.entry(r.id).or_insert(r.name);
             }
+            if let Some(worktrees) = worktrees_by_direction.get(&d.id) {
+                for (worktree, exists) in worktrees {
+                    readiness_worktrees.push(ReadinessWorktreeSignature {
+                        direction_id: d.id,
+                        worktree_id: worktree.id,
+                        exists: *exists,
+                    });
+                }
+            }
         }
+        readiness_worktrees.sort_by_key(|worktree| (worktree.direction_id, worktree.worktree_id));
         out.push(ThreadOverview {
             thread_id: t.id,
             title: t.title,
             kind: t.kind,
+            plan_status,
+            plan_created_at,
             direction_ids: dirs.iter().map(|d| d.id).collect(),
             statuses: dirs.iter().map(|d| d.status.clone()).collect(),
+            readiness_worktrees,
             write_repos: seen
                 .into_iter()
                 .map(|(id, name)| RepoLite { id, name })
@@ -2560,6 +2692,35 @@ pub async fn list_directions(
     thread_id: i32,
 ) -> R<Vec<entities::direction::Model>> {
     repo::list_directions(&db, thread_id).await.map_err(e)
+}
+
+/// One fail-closed, derived delivery verdict for an issue and its active lanes.
+/// It reads current local/host evidence but never writes a readiness snapshot.
+async fn collect_issue_readiness(
+    db: &Db,
+    bus: &crate::bus::BusRegistry,
+    asks: &crate::ask::AskRegistry,
+    thread_id: i32,
+) -> R<crate::readiness::IssueReadinessDto> {
+    crate::readiness::collect_with_check_execution(
+        db,
+        bus,
+        asks,
+        thread_id,
+        crate::readiness::CheckExecution::RunAllowed,
+    )
+    .await
+    .map_err(e)
+}
+
+#[tauri::command]
+pub async fn issue_readiness(
+    db: State<'_, Db>,
+    bus: State<'_, crate::bus::BusRegistry>,
+    asks: State<'_, crate::ask::AskRegistry>,
+    thread_id: i32,
+) -> R<crate::readiness::IssueReadinessDto> {
+    collect_issue_readiness(&db, &bus, &asks, thread_id).await
 }
 
 /// The lead's proposed decomposition for a thread, resolved against the
@@ -2707,45 +2868,17 @@ pub async fn preview_brief(db: State<'_, Db>, direction_id: i32) -> R<String> {
     crate::brief::assemble(&db, direction_id).await.map_err(e)
 }
 
-/// Executable verification results per write repo of a direction (§4.13).
-#[derive(serde::Serialize)]
-pub struct RepoChecks {
-    pub repo: String,
-    pub worktree: String,
-    pub checks: Vec<crate::check::CheckResult>,
-}
+pub use crate::readiness::RepoChecks;
 
 /// Run the inferred check rungs in each of a direction's write worktrees.
-/// "worker done = checks green, not self-report." Runs off the async runtime.
+/// "worker done = checks green, not self-report." This delegates to the
+/// shared bounded readiness runner so explicit verification cannot race its
+/// cache, single-flight, or target-validation contract.
 #[tauri::command]
 pub async fn verify_direction(db: State<'_, Db>, direction_id: i32) -> R<Vec<RepoChecks>> {
-    let wts = repo::list_worktrees(&db, Some(direction_id))
+    crate::readiness::verify_direction(&db, direction_id)
         .await
-        .map_err(e)?;
-    let mut targets: Vec<(String, String)> = Vec::new();
-    for w in wts {
-        let name = repo::get_repo(&db, w.repo_id)
-            .await
-            .map_err(e)?
-            .map(|r| r.name)
-            .unwrap_or_else(|| format!("repo {}", w.repo_id));
-        targets.push((name, w.path));
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        targets
-            .into_iter()
-            .map(|(repo, worktree)| {
-                let checks = crate::check::run_checks(std::path::Path::new(&worktree));
-                RepoChecks {
-                    repo,
-                    worktree,
-                    checks,
-                }
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    .map_err(e)
+        .map_err(e)
 }
 
 // The built-in review-agent rung is gone: review now runs as the user's global
@@ -4633,7 +4766,7 @@ pub async fn db_change_password(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[test]
     fn waiting_dingtalk_bridge_retries_after_copy_was_already_initialized() {
@@ -4649,6 +4782,238 @@ mod tests {
             crate::im::DingTalkCopyUpdate::Updated,
             "online"
         ));
+    }
+
+    #[tokio::test]
+    async fn issue_readiness_injects_open_permission_asks() {
+        let db = Db::connect("sqlite::memory:").await.expect("memory db");
+        let workspace = repo::create_workspace(&db, "readiness command workspace")
+            .await
+            .expect("workspace");
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "readiness-command-repo",
+            "/tmp/readiness-command-repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .expect("repo reference");
+        let thread = repo::create_thread(
+            &db,
+            workspace.id,
+            "readiness command issue",
+            "feature",
+            "claude",
+        )
+        .await
+        .expect("thread");
+        let direction = repo::create_direction(
+            &db,
+            thread.id,
+            "implementation",
+            "claude",
+            repo_ref.id,
+            "exercise command injection",
+            "impl-only",
+            "main",
+        )
+        .await
+        .expect("direction");
+        let asks = crate::ask::AskRegistry::new();
+        let bus = crate::bus::BusRegistry::new();
+        let (_ask_id, _answer) = asks.request(
+            thread.id,
+            &direction.id.to_string(),
+            "shell",
+            "Run: protected command",
+            "protected command",
+            crate::ask::RiskLevel::Unknown,
+            "protected command",
+        );
+
+        let readiness = collect_issue_readiness(&db, &bus, &asks, thread.id)
+            .await
+            .expect("readiness command collection");
+
+        assert_eq!(
+            readiness.readiness,
+            crate::readiness::IssueReadiness::NeedsYou
+        );
+        assert!(readiness.lanes.iter().any(|lane| {
+            lane.direction_id == direction.id
+                && lane.readiness == crate::readiness::LaneReadiness::NeedsYou
+                && lane.reasons.first().is_some_and(|reason| {
+                    reason.code == crate::readiness::ReasonCode::OpenNeed
+                        && reason.direction_id == Some(direction.id)
+                })
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_path_probe_is_deadline_bounded_and_caps_stalled_mounts() {
+        let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let release = std::sync::Arc::new(AtomicBool::new(false));
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let first_limit = std::sync::Arc::clone(&limit);
+        let first_release = std::sync::Arc::clone(&release);
+        let first_started = std::sync::Arc::clone(&started);
+        let first = tokio::spawn(async move {
+            bounded_path_probe_with(
+                std::path::PathBuf::from("/stalled-overview-path"),
+                std::time::Duration::from_millis(100),
+                first_limit,
+                move |_| {
+                    first_started.notify_one();
+                    while !first_release.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    true
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("stalled overview path probe starts");
+        assert!(
+            !first.await.expect("bounded path probe joins"),
+            "a stalled mount must fail closed at the async deadline"
+        );
+
+        let second_started = std::sync::Arc::new(AtomicBool::new(false));
+        let second_observed = std::sync::Arc::clone(&second_started);
+        let second = bounded_path_probe_with(
+            std::path::PathBuf::from("/second-overview-path"),
+            std::time::Duration::from_millis(20),
+            std::sync::Arc::clone(&limit),
+            move |_| {
+                second_observed.store(true, Ordering::SeqCst);
+                true
+            },
+        )
+        .await;
+        assert!(!second);
+        assert!(
+            !second_started.load(Ordering::SeqCst),
+            "a detached stalled mount must retain the only permit"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while limit.available_permits() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("stalled overview path fixture releases its permit");
+    }
+
+    #[tokio::test]
+    async fn workspace_overview_refreshes_plan_version_when_status_is_unchanged() {
+        let db = Db::connect("sqlite::memory:").await.expect("memory db");
+        let workspace = repo::create_workspace(&db, "workspace overview plans")
+            .await
+            .expect("workspace");
+        let unplanned = repo::create_thread(
+            &db,
+            workspace.id,
+            "unplanned issue",
+            "feature",
+            "codex",
+        )
+        .await
+        .expect("unplanned thread");
+        let planned = repo::create_thread(
+            &db,
+            workspace.id,
+            "planned issue",
+            "feature",
+            "codex",
+        )
+        .await
+        .expect("planned thread");
+        repo::upsert_plan(&db, planned.id, "{}", "proposed", "plan-v1")
+            .await
+            .expect("initial plan");
+        let worktree_root = tempfile::tempdir().expect("workspace overview worktree");
+        let worktree_path = worktree_root.path().display().to_string();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "overview-repo",
+            &worktree_path,
+            "main",
+            "",
+            true,
+        )
+        .await
+        .expect("overview repo");
+        let direction = repo::create_direction(
+            &db,
+            planned.id,
+            "implementation",
+            "codex",
+            repo_ref.id,
+            "exercise portfolio worktree signatures",
+            "impl-only",
+            "main",
+        )
+        .await
+        .expect("overview direction");
+        let worktree = repo::record_worktree(
+            &db,
+            repo_ref.id,
+            direction.id,
+            "main",
+            &worktree_path,
+            false,
+            false,
+            "",
+        )
+        .await
+        .expect("overview worktree row");
+
+        let before = workspace_overview_inner(&db, workspace.id)
+            .await
+            .expect("initial workspace overview");
+        let unplanned_overview = before
+            .iter()
+            .find(|overview| overview.thread_id == unplanned.id)
+            .expect("unplanned overview");
+        assert_eq!(unplanned_overview.plan_status.as_deref(), None);
+        assert_eq!(unplanned_overview.plan_created_at.as_deref(), None);
+        let planned_overview = before
+            .iter()
+            .find(|overview| overview.thread_id == planned.id)
+            .expect("planned overview");
+        assert_eq!(planned_overview.plan_status.as_deref(), Some("proposed"));
+        assert_eq!(planned_overview.plan_created_at.as_deref(), Some("plan-v1"));
+        assert_eq!(planned_overview.readiness_worktrees.len(), 1);
+        assert_eq!(
+            planned_overview.readiness_worktrees[0].worktree_id,
+            worktree.id
+        );
+        assert!(planned_overview.readiness_worktrees[0].exists);
+
+        repo::set_plan_created_at(&db, planned.id, "plan-v2")
+            .await
+            .expect("same-status re-proposal");
+
+        let after = workspace_overview_inner(&db, workspace.id)
+            .await
+            .expect("updated workspace overview");
+        let refreshed_overview = after
+            .iter()
+            .find(|overview| overview.thread_id == planned.id)
+            .expect("refreshed overview");
+        assert_eq!(refreshed_overview.plan_status.as_deref(), Some("proposed"));
+        assert_eq!(
+            refreshed_overview.plan_created_at.as_deref(),
+            Some("plan-v2")
+        );
     }
 
     #[tokio::test]

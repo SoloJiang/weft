@@ -134,8 +134,8 @@ async fn apply_probe_result(
                 &snapshot.conflict,
                 &upstream,
             );
-            let changed = snapshot_changed(pr, snapshot, &readiness);
             let axis_error = snapshot.unreadable_axis_error();
+            let changed = snapshot_changed(pr, snapshot, &readiness, axis_error.is_some());
             let fail_count = match repo::apply_pull_request_snapshot(
                 db,
                 pr.id,
@@ -202,12 +202,18 @@ fn emit_pr_changed(app: &AppHandle, pr: &pull_request::Model) {
 /// `last_checked_at` honest even on a sweep where nothing else moved). This is
 /// the OTHER function this PR's mutation self-check targets alongside
 /// `judge::merge_readiness`: flip any comparison below and a test must fail.
-fn snapshot_changed(old: &pull_request::Model, snapshot: &PrSnapshot, readiness: &MergeReadiness) -> bool {
+fn snapshot_changed(
+    old: &pull_request::Model,
+    snapshot: &PrSnapshot,
+    readiness: &MergeReadiness,
+    new_probe_failed: bool,
+) -> bool {
     let new_ci = serde_json::to_string(&snapshot.ci).unwrap_or_default();
     let new_review = serde_json::to_string(&snapshot.review).unwrap_or_default();
     let new_threads = serde_json::to_string(&snapshot.threads).unwrap_or_default();
     let new_conflict = serde_json::to_string(&snapshot.conflict).unwrap_or_default();
     let new_readiness = serde_json::to_string(readiness).unwrap_or_default();
+    let old_probe_failed = !old.last_error.trim().is_empty() || old.probe_fail_count > 0;
     old.head_sha != snapshot.head_sha
         || old.lifecycle != snapshot.lifecycle.as_str()
         || old.ci_status != new_ci
@@ -215,6 +221,9 @@ fn snapshot_changed(old: &pull_request::Model, snapshot: &PrSnapshot, readiness:
         || old.thread_status != new_threads
         || old.conflict_status != new_conflict
         || old.merge_readiness != new_readiness
+        // Probe health is a state transition, not a comparison of the error
+        // text or retry count, so repeated failures do not emit every sweep.
+        || old_probe_failed != new_probe_failed
 }
 
 #[cfg(test)]
@@ -296,7 +305,32 @@ mod tests {
         let old = base_row();
         let snap = base_snapshot();
         let readiness = MergeReadiness::Ready;
-        assert!(!snapshot_changed(&old, &snap, &readiness));
+        assert!(!snapshot_changed(&old, &snap, &readiness, false));
+    }
+
+    #[test]
+    fn a_successful_probe_recovery_is_a_change_even_when_snapshot_is_identical() {
+        let mut old = base_row();
+        old.last_error = "previous probe failure".to_string();
+        old.probe_fail_count = 1;
+        let snap = base_snapshot();
+
+        assert_eq!(snap.unreadable_axis_error(), None);
+        assert!(snapshot_changed(&old, &snap, &MergeReadiness::Ready, false));
+    }
+
+    #[test]
+    fn an_unchanged_probe_failure_is_not_a_change() {
+        let mut old = base_row();
+        let mut snap = base_snapshot();
+        snap.threads = ThreadStatus::Unknown { reason: "latest probe failure".to_string() };
+        old.thread_status = serde_json::to_string(&snap.threads).unwrap();
+        old.last_error = "previous probe failure".to_string();
+        old.probe_fail_count = 1;
+        let new_probe_failed = snap.unreadable_axis_error().is_some();
+
+        assert!(new_probe_failed);
+        assert!(!snapshot_changed(&old, &snap, &MergeReadiness::Ready, new_probe_failed));
     }
 
     #[test]
@@ -304,7 +338,7 @@ mod tests {
         let old = base_row();
         let mut snap = base_snapshot();
         snap.head_sha = "bbb".to_string();
-        assert!(snapshot_changed(&old, &snap, &MergeReadiness::Ready));
+        assert!(snapshot_changed(&old, &snap, &MergeReadiness::Ready, false));
     }
 
     #[test]
@@ -318,7 +352,7 @@ mod tests {
         let old = base_row();
         let mut snap = base_snapshot();
         snap.ci = CiStatus::NotConfigured;
-        assert!(snapshot_changed(&old, &snap, &MergeReadiness::Ready));
+        assert!(snapshot_changed(&old, &snap, &MergeReadiness::Ready, false));
     }
 
     #[test]
@@ -326,7 +360,7 @@ mod tests {
         let old = base_row();
         let mut snap = base_snapshot();
         snap.lifecycle = PrLifecycle::Merged;
-        assert!(snapshot_changed(&old, &snap, &MergeReadiness::Ready));
+        assert!(snapshot_changed(&old, &snap, &MergeReadiness::Ready, false));
     }
 
     #[test]
@@ -338,7 +372,7 @@ mod tests {
         let old = base_row();
         let snap = base_snapshot();
         let readiness = MergeReadiness::Blocked { reasons: vec!["something".to_string()] };
-        assert!(snapshot_changed(&old, &snap, &readiness));
+        assert!(snapshot_changed(&old, &snap, &readiness, false));
     }
 
 }

@@ -12,6 +12,7 @@ import type {
   GrantSnapshot,
   ImageAttachment,
   ImRoute,
+  IssueReadinessDto,
   LeadMessage,
   LeadStateInfo,
   LiveWorkerSlot,
@@ -146,6 +147,8 @@ export const api = {
 
   listDirections: (threadId: number) =>
     invoke<Direction[]>("list_directions", { threadId }),
+  issueReadiness: (threadId: number) =>
+    invoke<IssueReadinessDto>("issue_readiness", { threadId }),
   setTaskStatus: (directionId: number, status: string) =>
     invoke<void>("set_task_status", { directionId, status }),
   renameDirection: (directionId: number, name: string) =>

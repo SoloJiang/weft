@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import * as DM from "@radix-ui/react-dropdown-menu";
+import { listen } from "@tauri-apps/api/event";
 import {
   Check,
   ChevronDown,
@@ -19,23 +20,45 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { attentionDirectionId, useStore } from "../state/store";
-import type { Direction, RepoChecks, SessionStatus, Worktree } from "../lib/types";
+import { attentionDirectionId, attentionThreadId, useStore } from "../state/store";
+import type {
+  Direction,
+  IssueReadinessDto,
+  LaneReadiness,
+  RepoChecks,
+  SessionStatus,
+  Worktree,
+} from "../lib/types";
+import { api } from "../lib/api";
 import { Button } from "../components/ui/Button";
 import { Dialog, DialogPanel } from "../components/ui/Dialog";
 import { StatusDot } from "../components/ui/StatusChip";
 import { Tooltip } from "../components/ui/Tooltip";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
+import { ReadinessChip } from "../components/ReadinessChip";
 import { ScopeReview } from "./ScopeReview";
 import { DeleteWorktreeDialog, RenameDialog } from "../nav/dialogs";
 import { LeadTab } from "../session/LeadTab";
 import { cn } from "../lib/cn";
+import {
+  beginReadinessRefresh,
+  buildReadinessWorktreeSignatures,
+  buildReadinessKey,
+  completeReadinessRefresh,
+  failReadinessRefresh,
+  isDirectionUrgent,
+  isReadinessResponseApplicable,
+  selectVisibleReadiness,
+  type ReadinessFetchState,
+  type StoredReadiness,
+} from "../lib/readinessKey";
 
 /** Task lifecycle column. Needs-you is a tag on the card (amber chip), never
  *  a stage: an open ask leaves the task in its lifecycle column and bubbles it
  *  to the top. Under automation-first, queued/planning/working all mean "weft
  *  is driving it" — one column, with the stored sub-state as a chip. */
 type TaskState = "working" | "review" | "done";
+type PrChangedEvent = { thread_id: number };
 
 const COLUMNS: { key: TaskState; label: string; dot: string }[] = [
   { key: "working", label: "thread.colRunning", dot: "bg-running" },
@@ -67,20 +90,158 @@ export function ThreadBoard() {
     setReviewingProposal,
     threadTab,
     setThreadTab,
+    renameDirection,
     attentionItems,
     checksByDirection,
-    renameDirection,
+    worktreesByDirection,
+    sessions,
   } = useStore();
   const { t } = useTranslation();
   const thread = threads.find((th) => th.id === activeThreadId);
   const [renamingDirectionId, setRenamingDirectionId] = useState<number | null>(null);
+  const [storedIssueReadiness, setStoredIssueReadiness] = useState<
+    StoredReadiness<IssueReadinessDto> | null
+  >(null);
+  const [prReadinessRevision, setPrReadinessRevision] = useState(0);
+  const [readinessPollRevision, setReadinessPollRevision] = useState(0);
+  const activeThreadIdRef = useRef<number | null>(activeThreadId);
+  const readinessRequestRevisionRef = useRef(0);
+  activeThreadIdRef.current = activeThreadId;
+  const activeDirections = activeThreadId == null ? [] : directionsByThread[activeThreadId] ?? [];
+  // Include issue/lead attention too. It has no materialized direction card,
+  // but the backend represents it as a virtual readiness lane and must be
+  // refreshed immediately rather than waiting for the poll.
+  const attentionIds = attentionItems
+    .filter((item) => attentionThreadId(item) === activeThreadId)
+    .map((item) => item.id);
+  const worktreeSignatures = buildReadinessWorktreeSignatures(
+    activeDirections,
+    worktreesByDirection,
+  );
+  // `created_at` is the opaque proposal version. A re-proposal can change its
+  // policy directions and decisions without changing its lifecycle status.
+  let planReadinessSignature: string | null = null;
+  if (proposal) {
+    planReadinessSignature = `${proposal.status}:${proposal.created_at}`;
+  }
+  const readinessKey = buildReadinessKey({
+    directions: activeDirections,
+    attentionIds,
+    worktrees: worktreeSignatures,
+    workerSessions: Object.values(sessions).map((session) => ({
+      directionId: session.directionId,
+      repoId: session.repoId,
+      sessionId: session.info.session_id,
+      status: session.status,
+    })),
+    planStatus: planReadinessSignature,
+    prRevision: prReadinessRevision,
+  });
+  const visibleReadiness = selectVisibleReadiness(
+    storedIssueReadiness,
+    activeThreadId,
+    readinessKey,
+  );
+  let issueReadiness: IssueReadinessDto | null = null;
+  if (visibleReadiness.kind === "ready") {
+    issueReadiness = visibleReadiness.dto;
+  }
+
+  useEffect(() => {
+    if (activeThreadId == null) {
+      readinessRequestRevisionRef.current += 1;
+      setStoredIssueReadiness(null);
+      return;
+    }
+    const request = {
+      threadId: activeThreadId,
+      revision: readinessRequestRevisionRef.current + 1,
+    };
+    const requestKey = readinessKey;
+    readinessRequestRevisionRef.current = request.revision;
+    setStoredIssueReadiness({
+      threadId: request.threadId,
+      key: requestKey,
+      state: beginReadinessRefresh(),
+    });
+    let cancelled = false;
+    const storeResponse = (state: ReadinessFetchState<IssueReadinessDto>) => {
+      setStoredIssueReadiness((current) => {
+        if (
+          !isReadinessResponseApplicable(
+            request,
+            activeThreadIdRef.current,
+            readinessRequestRevisionRef.current,
+          )
+        ) {
+          return current;
+        }
+        return { threadId: request.threadId, key: requestKey, state };
+      });
+    };
+    void api
+      .issueReadiness(request.threadId)
+      .then((readiness) => {
+        if (cancelled) {
+          return;
+        }
+        storeResponse(completeReadinessRefresh(readiness));
+      })
+      .catch(() => {
+        if (cancelled) {
+          return;
+        }
+        storeResponse(failReadinessRefresh());
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeThreadId, readinessKey, readinessPollRevision]);
+
+  useEffect(() => {
+    if (activeThreadId == null) {
+      return;
+    }
+    const poll = setInterval(() => {
+      setReadinessPollRevision((revision) => revision + 1);
+    }, 60_000);
+    return () => {
+      clearInterval(poll);
+    };
+  }, [activeThreadId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void listen<PrChangedEvent>("pr://changed", (event) => {
+      if (!cancelled && event.payload.thread_id === activeThreadIdRef.current) {
+        setPrReadinessRevision((revision) => revision + 1);
+      }
+    })
+      .then((nextUnlisten) => {
+        if (cancelled) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+        // Close the fetch/listen handoff: a PR change that landed before the
+        // async listener registration is recovered by one fresh request after
+        // registration. Request revisions reject any older response.
+        setPrReadinessRevision((revision) => revision + 1);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
   // Resetting the sub-tab here (on mount) is what made backing out of a worker
   // snap to the lead chat: opening the worker unmounts the board, closing it
   // remounts and re-ran this reset. The reset now lives in the store, keyed on a
   // real thread change, so the board tab survives the worker overlay.
 
   if (!thread) return null;
-  const dirs = directionsByThread[thread.id] ?? [];
+  const dirs = activeDirections;
   // Derive `initial` from the live directions slice rather than capturing it
   // at click time — keeps the dialog in sync with concurrent rename/refresh.
   const renamingDirection =
@@ -94,9 +255,23 @@ export function ThreadBoard() {
     return "working";
   };
 
-  const urgent = (d: Direction): boolean =>
-    attentionItems.some((item) => attentionDirectionId(item) === d.id) ||
-    (checksByDirection[d.id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail"));
+  const laneVerdicts = new Map<number, LaneReadiness>();
+  for (const lane of issueReadiness?.lanes ?? []) {
+    laneVerdicts.set(lane.direction_id, lane.readiness);
+  }
+  const urgent = (d: Direction): boolean => {
+    const verdict = laneVerdicts.get(d.id);
+    const hasAttention = attentionItems.some(
+      (item) => attentionDirectionId(item) === d.id,
+    );
+    const hasFailingCheck = (checksByDirection[d.id] ?? []).some((repoChecks) =>
+      repoChecks.checks.some((check) => check.status === "fail"),
+    );
+    // Delivery readiness remains exclusively backend-derived. This only keeps
+    // the board's pre-existing sorting affinity stable during refreshes and
+    // for non-bus attention/check signals that readiness intentionally skips.
+    return isDirectionUrgent({ readiness: verdict, hasAttention, hasFailingCheck });
+  };
 
   // One tab body, one obvious branch each (no nested ternary): the lead chat,
   // the empty-discuss prompt, or the task board columns. Scope review is no
@@ -141,6 +316,13 @@ export function ThreadBoard() {
 
   return (
     <section className="flex min-w-0 flex-1 flex-col overflow-hidden bg-bg">
+      <header className="flex shrink-0 items-center gap-2 border-b border-border px-5 py-2.5">
+        <h1 className="min-w-0 flex-1 truncate text-[13px] font-semibold text-ink">{thread.title}</h1>
+        <ReadinessChip
+          state={visibleReadiness}
+          className="max-w-[min(60%,28rem)]"
+        />
+      </header>
       <div className="flex min-h-0 flex-1 flex-col">{renderTabBody()}</div>
 
       {/* Scope review, in place: a dialog over the chat rather than a tab swap.

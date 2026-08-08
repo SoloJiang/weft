@@ -137,7 +137,7 @@ pub async fn call_global(
             let Some(tid) = issue_id_arg(args) else {
                 return text_result("error: issue_id required".into());
             };
-            match issue_status(db, asks, tid).await {
+            match issue_status(db, asks, bus, tid).await {
                 Ok(v) => json_result(v),
                 Err(e) => text_result(format!("error: {e}")),
             }
@@ -352,16 +352,30 @@ async fn list_issues(db: &Db, ws: Option<i32>) -> anyhow::Result<Value> {
     Ok(Value::Array(out))
 }
 
-async fn issue_status(db: &Db, asks: &AskRegistry, tid: i32) -> anyhow::Result<Value> {
+async fn issue_status(
+    db: &Db,
+    asks: &AskRegistry,
+    bus: &BusRegistry,
+    tid: i32,
+) -> anyhow::Result<Value> {
     let t = repo::get_thread(db, tid)
         .await?
         .ok_or_else(|| anyhow::anyhow!("thread {tid} not found"))?;
     let open_asks = asks.open_in(tid).len();
+    let readiness = crate::readiness::collect_with_check_execution(
+        db,
+        bus,
+        asks,
+        tid,
+        crate::readiness::CheckExecution::CachedOnly,
+    )
+    .await?;
     Ok(json!({
         "issue_id": t.id,
         "title": t.title,
         "kind": t.kind,
         "open_asks_count": open_asks,
+        "readiness": readiness,
     }))
 }
 
@@ -1319,6 +1333,8 @@ mod tests {
             serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(parsed["open_asks_count"], 2);
         assert_eq!(parsed["title"], "issue");
+        assert_eq!(parsed["readiness"]["readiness"], "needs_you");
+        assert_eq!(parsed["readiness"]["reasons"][0]["code"], "open_need");
     }
 
     #[test]

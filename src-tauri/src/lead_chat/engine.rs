@@ -31,14 +31,62 @@ pub const STATUS_STOPPED: &str = "stopped";
 pub const BUS_WAKE_PROMPT: &str =
     "You have new messages on the thread bus. Call bus_inbox to read them. After incorporating any durable human answers that carry request_id, call bus_ack with those ids.";
 
+const WORKER_ACTIVITY_RETRY_INITIAL: std::time::Duration =
+    std::time::Duration::from_millis(25);
+const WORKER_ACTIVITY_RETRY_MAX: std::time::Duration = std::time::Duration::from_millis(200);
+const WORKER_ACTIVITY_RETRY_ATTEMPTS: u32 = 5;
+
+/// A worker's durable activity row is the readiness/worktree-ownership fence.
+/// Retry transient SQLite errors before exposing the transition. Callers hold
+/// the engine mutex across this await, so a later start/stop cannot overtake
+/// these writes. If SQLite remains unavailable, readiness still consumes the
+/// process-live activity recorded at the same serialized transition; retries
+/// are bounded so Stop/control cannot be wedged forever by a broken database.
+async fn persist_worker_activity_with_retry<F, Fut>(
+    session_id: i32,
+    status: &str,
+    mut persist: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let mut delay = WORKER_ACTIVITY_RETRY_INITIAL;
+    for attempt in 1..=WORKER_ACTIVITY_RETRY_ATTEMPTS {
+        match persist().await {
+            Ok(()) => return,
+            Err(error) => {
+                if attempt == 1 {
+                    eprintln!(
+                        "[weft] session {session_id} status {status:?} persistence failed; retrying: {error}"
+                    );
+                } else if attempt == WORKER_ACTIVITY_RETRY_ATTEMPTS {
+                    eprintln!(
+                        "[weft] session {session_id} status {status:?} remains unpersisted after {attempt} attempts; using live engine activity: {error}"
+                    );
+                }
+                if attempt == WORKER_ACTIVITY_RETRY_ATTEMPTS {
+                    break;
+                }
+                tokio::time::sleep(delay).await;
+                delay = std::cmp::min(delay.saturating_mul(2), WORKER_ACTIVITY_RETRY_MAX);
+            }
+        }
+    }
+}
+
 /// Persist the turn-activity status for whichever surface this engine drives:
 /// a worker session row (`Some`) or the lead's per-thread meta row (`None`).
 async fn persist_activity(db: &Db, session_id: Option<i32>, thread_id: i32, status: &str) {
     match session_id {
         Some(sid) => {
-            let _ = repo::set_session_status(db, sid, status).await;
+            persist_worker_activity_with_retry(sid, status, || {
+                repo::set_session_status(db, sid, status)
+            })
+            .await;
         }
         None => {
+            // Lead metadata is not a worktree/readiness ownership fence; retain
+            // its historical best-effort behavior.
             let _ = repo::set_lead_status(db, thread_id, status).await;
         }
     }
@@ -476,6 +524,7 @@ fn hidden_delivery(tool: &str, busy: bool, has_stdin: bool, stopped: bool) -> Hi
     }
 }
 
+#[cfg(test)]
 fn mark_hidden_turn_started(inner: &mut EngineInner) -> i32 {
     mark_hidden_turn_started_with_delivery(inner, None)
 }
@@ -993,17 +1042,152 @@ fn finish_hidden_receipt(inner: &mut EngineInner, delivery_id: i32, consumed: bo
     }
 }
 
+/// Returns the readiness direction for a worker engine. Leads deliberately have
+/// no numeric direction and therefore never participate in verification
+/// admission.
+fn worker_direction_id(inner: &EngineInner) -> anyhow::Result<Option<i32>> {
+    if inner.session_id.is_none() {
+        return Ok(None);
+    }
+    let direction_id = inner
+        .ask_dir
+        .parse::<i32>()
+        .map_err(|_| anyhow::anyhow!("invalid worker direction identity"))?;
+    if direction_id <= 0 {
+        anyhow::bail!("invalid worker direction identity");
+    }
+    Ok(Some(direction_id))
+}
+
+/// A worker-start candidate captured before waiting on readiness verification.
+/// Every true idle-to-running path acquires this lease before taking either the
+/// per-surface admission gate or the engine mutex. That one lock order keeps
+/// Stop/control paths responsive and makes visible, hidden, and promoted turns
+/// obey the same verification boundary.
+struct WorkerStartAdmission {
+    session_id: i32,
+    direction_id: i32,
+    reset_epoch: u64,
+    _verification: crate::readiness::VerificationAdmission,
+}
+
+/// Acquire a direction lease without holding any engine/session fence. Worker
+/// sends acquire it even when their first snapshot is busy: a queued message
+/// may need to promote if the active turn drains while its row is persisted.
+/// Leads return `None` because they have no worktree verification identity.
+async fn acquire_worker_start_admission(
+    eng: &EngineRef,
+) -> anyhow::Result<Option<WorkerStartAdmission>> {
+    let candidate = {
+        let inner = eng.lock().await;
+        let Some(session_id) = inner.session_id else {
+            return Ok(None);
+        };
+        let Some(direction_id) = worker_direction_id(&inner)? else {
+            return Ok(None);
+        };
+        (session_id, direction_id, inner.reset_epoch)
+    };
+
+    let (session_id, direction_id, reset_epoch) = candidate;
+    let verification = crate::readiness::acquire_verification_admission(direction_id).await?;
+    Ok(Some(WorkerStartAdmission {
+        session_id,
+        direction_id,
+        reset_epoch,
+        _verification: verification,
+    }))
+}
+
+fn worker_start_admission_matches(
+    inner: &EngineInner,
+    admission: &WorkerStartAdmission,
+) -> anyhow::Result<bool> {
+    Ok(inner.session_id == Some(admission.session_id)
+        && worker_direction_id(inner)? == Some(admission.direction_id)
+        && inner.reset_epoch == admission.reset_epoch)
+}
+
+/// Rebase the same held direction lease after this send deliberately bounced
+/// its own resident process for a skill/command refresh. The lease never
+/// released, so updating only the owned reset epoch preserves linearization;
+/// an identity change still cancels the send.
+fn rebase_worker_start_admission(
+    inner: &EngineInner,
+    admission: &mut WorkerStartAdmission,
+) -> anyhow::Result<()> {
+    let owned_bounce_epoch = admission.reset_epoch.saturating_add(1);
+    if inner.session_id != Some(admission.session_id)
+        || worker_direction_id(inner)? != Some(admission.direction_id)
+        || inner.reset_epoch != owned_bounce_epoch
+    {
+        anyhow::bail!("worker changed or reset unexpectedly during the refresh bounce");
+    }
+    admission.reset_epoch = inner.reset_epoch;
+    Ok(())
+}
+
+/// Commit the durable side of one idle-to-running transition while the caller
+/// holds both the direction lease and the engine mutex. Cache invalidation is
+/// ordered before the strict SQLite write; if persistence fails, callers must
+/// leave the in-memory turn idle and return the error.
+async fn persist_running_for_turn_start(
+    db: &Db,
+    inner: &EngineInner,
+    admission: Option<&WorkerStartAdmission>,
+) -> anyhow::Result<()> {
+    let Some(session_id) = inner.session_id else {
+        // Lead metadata is not a readiness fact. Preserve its historical
+        // best-effort behavior instead of making a lead send depend on it.
+        persist_activity(db, None, inner.thread_id, "running").await;
+        return Ok(());
+    };
+    let Some(admission) = admission else {
+        anyhow::bail!("worker turn start is missing verification admission");
+    };
+    if !worker_start_admission_matches(inner, admission)? {
+        anyhow::bail!("worker changed or was stopped while waiting for verification");
+    }
+    crate::readiness::invalidate_verification_memo(admission.direction_id)?;
+    repo::set_existing_session_status(db, session_id, "running").await?;
+    Ok(())
+}
+
+/// Persist `running` before reserving a visible direct turn. The engine mutex
+/// orders this write before a later Stop write; the direction lease prevents a
+/// verifier from observing the short persistence/reservation boundary.
+async fn reserve_direct_turn(
+    db: &Db,
+    inner: &mut EngineInner,
+    origin_tag: Option<String>,
+    admission: Option<&WorkerStartAdmission>,
+) -> anyhow::Result<i32> {
+    if inner.turn.busy {
+        anyhow::bail!("cannot reserve a direct turn while the engine is busy");
+    }
+    persist_running_for_turn_start(db, inner, admission).await?;
+    if !inner.turn.try_begin_send() {
+        anyhow::bail!("direct turn became unavailable while persisting running state");
+    }
+    inner.turn_id += 1;
+    inner.clock.begin_turn();
+    inner.current_origin_tag = origin_tag;
+    Ok(inner.turn_id)
+}
+
 async fn begin_hidden_turn(
     app: &AppHandle,
     db: &Db,
     inner: &mut EngineInner,
     hidden_delivery_id: Option<i32>,
-) -> i32 {
+    admission: Option<&WorkerStartAdmission>,
+) -> anyhow::Result<i32> {
+    if inner.turn.busy {
+        anyhow::bail!("cannot begin a hidden turn while the engine is busy");
+    }
+    persist_running_for_turn_start(db, inner, admission).await?;
     let turn_id = mark_hidden_turn_started_with_delivery(inner, hidden_delivery_id);
     crate::power::on_turn_began(app);
-    // Hidden delivery is a turn-start too, so persist `running`; otherwise a
-    // crash mid-action can leave stale `idle` state and skip boot revive.
-    persist_activity(db, inner.session_id, inner.thread_id, "running").await;
     emit_turn_state(
         app,
         inner.thread_id,
@@ -1011,7 +1195,7 @@ async fn begin_hidden_turn(
         inner.turn.busy,
         queue_items(&inner.turn),
     );
-    turn_id
+    Ok(turn_id)
 }
 
 fn queue_hidden_delivery(app: &AppHandle, inner: &mut EngineInner, out: Outgoing) {
@@ -2821,6 +3005,20 @@ impl LeadChatState {
         !inner.stopped && inner.turn.busy
     }
 
+    /// Process-live worktree ownership used by readiness. Unlike
+    /// `worker_is_running`'s routing meaning, a stopped/manual-takeover engine
+    /// still owns its checkout. A contended engine mutex is conservatively
+    /// active; an idle cached engine is the authoritative override for a stale
+    /// durable `running` row after a terminal status write failure.
+    pub fn worker_activity(&self, session_id: i32) -> Option<bool> {
+        let engine = self.get(i64::from(session_id))?;
+        let activity = match engine.try_lock() {
+            Ok(inner) => Some(inner.stopped || inner.turn.busy),
+            Err(_) => Some(true),
+        };
+        activity
+    }
+
     /// Remove an engine only when the caller still owns the exact cached Arc.
     /// An initial-open failure must not tear down a newer engine that won a
     /// concurrent reconstruction race.
@@ -2829,6 +3027,27 @@ impl LeadChatState {
             .remove_if(&key, |_, current| Arc::ptr_eq(current, expected))
             .map(|(_, engine)| engine)
     }
+}
+
+/// Resolve one worker against the current app's live engine registry. Wait
+/// briefly for a terminal transition that is still holding the engine mutex;
+/// this closes the idle-push/verification race without letting a long stdin or
+/// tool operation stall readiness. Tests and startup paths without a managed
+/// app return `None`, leaving the durable session status authoritative.
+pub(crate) async fn live_worker_activity(session_id: i32) -> Option<bool> {
+    let app = crate::APP_HANDLE.get()?;
+    let state = app.try_state::<LeadChatState>()?;
+    let engine = state.get(i64::from(session_id))?;
+    let activity = match tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        engine.lock(),
+    )
+    .await
+    {
+        Ok(inner) => Some(inner.stopped || inner.turn.busy),
+        Err(_) => Some(true),
+    };
+    activity
 }
 
 /// Serialize a worker's first-route ownership across planner pinning and engine
@@ -3558,12 +3777,14 @@ pub(crate) async fn admit_pending_durable_batch_existing(
     db: &Db,
     eng: &EngineRef,
 ) -> anyhow::Result<bool> {
+    let worker_start = acquire_worker_start_admission(eng).await?;
     let _admission = engine_admission_guard(app, db, eng).await?;
     admit_pending_durable_batch_admitted(
         app,
         db,
         eng,
         DurableResumeAuthorization::Background,
+        worker_start.as_ref(),
     )
     .await
 }
@@ -3572,12 +3793,14 @@ async fn admit_pending_durable_hidden_for_visible(
     app: &AppHandle,
     db: &Db,
     eng: &EngineRef,
+    worker_start: Option<&WorkerStartAdmission>,
 ) -> anyhow::Result<()> {
     let _ = admit_pending_durable_batch_admitted(
         app,
         db,
         eng,
         DurableResumeAuthorization::Visible,
+        worker_start,
     )
     .await?;
     Ok(())
@@ -3590,6 +3813,7 @@ async fn admit_pending_durable_batch_admitted(
     db: &Db,
     eng: &EngineRef,
     authorization: DurableResumeAuthorization,
+    worker_start: Option<&WorkerStartAdmission>,
 ) -> anyhow::Result<bool> {
     let mut inner = eng.lock().await;
     if inner.tearing_down {
@@ -3690,7 +3914,8 @@ async fn admit_pending_durable_batch_admitted(
                 admitted = true;
             }
             HiddenDelivery::WriteResident => {
-                let turn_id = begin_hidden_turn(app, db, &mut inner, Some(row.id)).await;
+                let turn_id =
+                    begin_hidden_turn(app, db, &mut inner, Some(row.id), worker_start).await?;
                 if let Err(error) = write_user(&mut inner, &out).await {
                     drop(inner);
                     rollback_failed_turn(app, db, eng, turn_id, "error").await;
@@ -3700,7 +3925,8 @@ async fn admit_pending_durable_batch_admitted(
                 admitted = true;
             }
             HiddenDelivery::SpawnTurn => {
-                let turn_id = begin_hidden_turn(app, db, &mut inner, Some(row.id)).await;
+                let turn_id =
+                    begin_hidden_turn(app, db, &mut inner, Some(row.id), worker_start).await?;
                 let reset_epoch = inner.reset_epoch;
                 drop(inner);
                 if let Err(error) = spawn_hidden_turn_after_admission(
@@ -4148,6 +4374,11 @@ pub async fn send(
     files: Vec<String>,
     origin_tag: Option<String>,
 ) -> anyhow::Result<()> {
+    // All worker sends acquire verification before either engine fence. The
+    // lease remains available through Phase 3 because an initially queued send
+    // may need an idle-to-running promotion after its durable row is written.
+    // Leads have no direction identity and therefore skip this gate.
+    let mut worker_start = acquire_worker_start_admission(eng).await?;
     let _engine_admission = engine_admission_guard(app, db, eng).await?;
     crate::process_quota::admit_new_work(app)?;
     // A rewind holds its reservation from the busy check to the final
@@ -4155,6 +4386,11 @@ pub async fn send(
     // rewind's stop/truncate steps.
     {
         let inner = eng.lock().await;
+        if let Some(admission) = worker_start.as_ref() {
+            if !worker_start_admission_matches(&inner, admission)? {
+                anyhow::bail!("send was cancelled while waiting for verification");
+            }
+        }
         if inner.rewinding {
             return Err(anyhow::anyhow!("会话正在回退，请稍后重试"));
         }
@@ -4201,6 +4437,10 @@ pub async fn send(
                 g.pending_command_refresh = false;
             }
         }
+        if let Some(admission) = worker_start.as_mut() {
+            let inner = eng.lock().await;
+            rebase_worker_start_admission(&inner, admission)?;
+        }
         // The bounce fires from idle, so orphans is normally empty; finalize
         // defensively so a still-open tool row can't outlive the bounce.
         finalize_orphan_tool_rows(app, db, tid, orphans, "interrupted").await;
@@ -4208,7 +4448,7 @@ pub async fn send(
     // A visible send is the explicit resume boundary. Admit every pending
     // durable hidden handoff before any visible-send preflight can succeed, so
     // a replay/admission failure blocks the visible send itself.
-    admit_pending_durable_hidden_for_visible(app, db, eng).await?;
+    admit_pending_durable_hidden_for_visible(app, db, eng, worker_start.as_ref()).await?;
 
     // Pre-flight agent resolution: if the configured CLI can't be found on PATH, a
     // spawn would fail deep inside with a raw "No such file or directory (os error
@@ -4311,24 +4551,18 @@ pub async fn send(
         {
             return Err(anyhow::anyhow!("该 worktree 正在回退代码，请稍后重试"));
         }
-        let direct = inner.turn.try_begin_send();
-        // Count only tracked (user-visible) items: hidden plumbing deliveries
-        // (queue_id == None) are filtered out of the UI, so they must not eat the budget.
-        if !direct && visible_queued(&inner.turn) >= MAX_QUEUED {
-            return Err(anyhow::anyhow!("queue_full"));
-        }
-        if direct {
-            inner.turn_id += 1;
-            inner.clock.begin_turn();
-            // This send starts a turn now → its tag IS the in-flight turn's tag.
-            inner.current_origin_tag = origin_tag.clone();
+        let direct = if inner.turn.busy {
+            // Count only tracked (user-visible) items: hidden plumbing deliveries
+            // (queue_id == None) are filtered out of the UI, so they must not eat the budget.
+            if visible_queued(&inner.turn) >= MAX_QUEUED {
+                return Err(anyhow::anyhow!("queue_full"));
+            }
+            false
+        } else {
+            reserve_direct_turn(db, &mut inner, origin_tag.clone(), worker_start.as_ref()).await?;
             crate::power::on_turn_began(app);
-            // Persist "running" WHILE holding the lock so it is ordered before any
-            // concurrent stop's "stopped" write: stop_quiet must take this same lock
-            // first, so its later "stopped" write can't be overtaken and leave a
-            // stopped session recorded as running (which boot-revive would resume).
-            persist_activity(db, inner.session_id, inner.thread_id, "running").await;
-        }
+            true
+        };
         SendContext {
             thread_id: inner.thread_id,
             session_id: inner.session_id,
@@ -4340,7 +4574,6 @@ pub async fn send(
             reset_epoch: inner.reset_epoch,
         }
     };
-
     let kind = if ctx.is_command { "command" } else { "text" };
     let status = if ctx.direct { "complete" } else { "queued" };
     let image_uris: Vec<String> = images
@@ -4634,18 +4867,25 @@ pub async fn send(
                 // The active turn ENDED while this send persisted: nothing drains
                 // an idle queue, so deliver NOW by promoting into a fresh direct
                 // turn — the same commit-time decision a direct send makes.
-                promoted = Some(promote_queued_reservation(
-                    &mut inner,
-                    ctx.origin_tag.clone(),
-                ));
-                // Same pre-turn checkpoint as a direct send, taken between the
-                // promotion and the dispatch (the resident write below; per-turn
-                // / codex spawns in Phase 4).
-                snapshot_turn_checkpoint(app, db, inner.session_id, inner.turn_id, row_id).await;
+                // This is another true idle-to-running boundary. The worker
+                // lease was acquired before the surface gate at function entry,
+                // so strict persistence cannot deadlock Stop or verification.
+                if let Err(error) =
+                    persist_running_for_turn_start(db, &inner, worker_start.as_ref()).await
+                {
+                    drop(inner);
+                    let _ = repo::update_lead_message(db, row_id, &content, "error").await;
+                    emit_finalize(app, ctx.thread_id, row_id, "error");
+                    return Err(error);
+                }
+                let promoted_turn =
+                    promote_queued_reservation(&mut inner, ctx.origin_tag.clone());
                 crate::power::on_turn_began(app);
-                // Under the lock for the same ordering reason as Phase 1's direct
-                // write: a concurrent stop's "stopped" write must not be overtaken.
-                persist_activity(db, inner.session_id, inner.thread_id, "running").await;
+                promoted = Some(promoted_turn);
+                // Same pre-turn checkpoint as a direct send, taken after the
+                // worker-start admission and before the resident write / Phase-4
+                // spawn dispatch.
+                snapshot_turn_checkpoint(app, db, inner.session_id, promoted_turn, row_id).await;
                 if !per_turn(&ctx.tool) && !is_connection {
                     // Resident tool: deliver through the live stdin under this
                     // lock, exactly like a direct resident send.
@@ -5886,6 +6126,7 @@ async fn acp_emit_turn_end(
         let still_busy = inner.turn.busy;
         let client = inner.acp_client.clone();
         let native = inner.native_id.clone();
+        inner.clock.on_turn_end(still_busy);
         persist_activity(
             &db,
             inner.session_id,
@@ -5893,7 +6134,6 @@ async fn acp_emit_turn_end(
             if still_busy { "running" } else { "idle" },
         )
         .await;
-        inner.clock.on_turn_end(still_busy);
         let _ = app.emit(
             EVENT,
             Push::Turn {
@@ -7051,6 +7291,7 @@ async fn codex_consumer(
                 // but the epoch has advanced — the canceled message must not launch.
                 let dequeue_epoch = inner.reset_epoch;
                 let still_busy = inner.turn.busy;
+                inner.clock.on_turn_end(still_busy);
                 persist_activity(
                     &db,
                     inner.session_id,
@@ -7058,7 +7299,6 @@ async fn codex_consumer(
                     if still_busy { "running" } else { "idle" },
                 )
                 .await;
-                inner.clock.on_turn_end(still_busy);
                 let _ = app.emit(
                     EVENT,
                     Push::Turn {
@@ -8022,6 +8262,7 @@ async fn send_hidden_inner(
     plan_guard: Option<(i32, i32, bool)>,
     hidden_delivery_id: Option<i32>,
 ) -> anyhow::Result<bool> {
+    let worker_start = acquire_worker_start_admission(eng).await?;
     let _engine_admission = engine_admission_guard(app, db, eng).await?;
     if let Err(err) = crate::process_quota::admit_new_work(app) {
         if bus_read {
@@ -8030,6 +8271,14 @@ async fn send_hidden_inner(
         return Err(err);
     }
     let mut inner = eng.lock().await;
+    if let Some(admission) = worker_start.as_ref() {
+        if !worker_start_admission_matches(&inner, admission)? {
+            if bus_read || hidden_delivery_id.is_some() {
+                return Ok(false);
+            }
+            anyhow::bail!("hidden send was cancelled while waiting for verification");
+        }
+    }
     if let Some(delivery_id) = hidden_delivery_id {
         let Some(row) = crate::store::repo::get_lead_hidden_delivery(db, delivery_id).await?
         else {
@@ -8147,7 +8396,14 @@ async fn send_hidden_inner(
             Ok(true)
         }
         HiddenDelivery::WriteResident => {
-            let turn_id = begin_hidden_turn(app, db, &mut inner, hidden_delivery_id).await;
+            let turn_id = begin_hidden_turn(
+                app,
+                db,
+                &mut inner,
+                hidden_delivery_id,
+                worker_start.as_ref(),
+            )
+            .await?;
             if let Err(e) = write_user(&mut inner, &out).await {
                 drop(inner);
                 rollback_failed_turn(app, db, eng, turn_id, "error").await;
@@ -8161,7 +8417,14 @@ async fn send_hidden_inner(
             // on the same thread. ACP tools similarly stay on the ACP runtime.
             let codex_appserver = inner.tool == "codex" && codex_appserver_enabled();
             let acp = is_acp_tool(&inner.tool);
-            let turn_id = begin_hidden_turn(app, db, &mut inner, hidden_delivery_id).await;
+            let turn_id = begin_hidden_turn(
+                app,
+                db,
+                &mut inner,
+                hidden_delivery_id,
+                worker_start.as_ref(),
+            )
+            .await?;
             // Captured under the lock: a stop-then-restart before the spawn task
             // runs clears `stopped` but bumps the epoch — a canceled hidden turn
             // (bus read / tool-result nudge) must not launch on the restarted
@@ -10137,6 +10400,7 @@ fn spawn_reader(
                         }
                     }
                     let still_busy = inner.turn.busy;
+                    inner.clock.on_turn_end(still_busy);
                     persist_activity(
                         &db,
                         inner.session_id,
@@ -10144,7 +10408,6 @@ fn spawn_reader(
                         if still_busy { "running" } else { "idle" },
                     )
                     .await;
-                    inner.clock.on_turn_end(still_busy);
                     let state = if still_busy { "busy" } else { "idle" };
                     let _ = app.emit(
                         EVENT,
@@ -10300,6 +10563,7 @@ fn spawn_reader(
                 });
             }
             let still_busy = inner.turn.busy;
+            inner.clock.on_turn_end(still_busy);
             persist_activity(
                 &db,
                 inner.session_id,
@@ -10307,7 +10571,6 @@ fn spawn_reader(
                 if still_busy { "running" } else { "idle" },
             )
             .await;
-            inner.clock.on_turn_end(still_busy);
             let state = if still_busy { "busy" } else { "idle" };
             let _ = app.emit(
                 EVENT,
@@ -10500,6 +10763,262 @@ pub(super) fn test_inner(tool: &str) -> EngineInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn next_worker_admission_test_direction() -> i32 {
+        static NEXT_DIRECTION: std::sync::atomic::AtomicI32 =
+            std::sync::atomic::AtomicI32::new(1_800_000_000);
+        NEXT_DIRECTION.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn failed_idle_write_is_retried_before_terminal_activity_returns() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let retry_started = Arc::new(tokio::sync::Notify::new());
+        let release_retry = Arc::new(tokio::sync::Notify::new());
+        let persisted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = tokio::spawn({
+            let attempts = Arc::clone(&attempts);
+            let retry_started = Arc::clone(&retry_started);
+            let release_retry = Arc::clone(&release_retry);
+            let persisted = Arc::clone(&persisted);
+            async move {
+                persist_worker_activity_with_retry(42, "idle", move || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    let retry_started = Arc::clone(&retry_started);
+                    let release_retry = Arc::clone(&release_retry);
+                    let persisted = Arc::clone(&persisted);
+                    async move {
+                        if attempt == 0 {
+                            anyhow::bail!("injected transient SQLite failure");
+                        }
+                        retry_started.notify_one();
+                        release_retry.notified().await;
+                        persisted.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }
+                })
+                .await;
+            }
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            retry_started.notified(),
+        )
+        .await
+        .expect("terminal status retry starts");
+        assert!(
+            !task.is_finished(),
+            "the terminal transition must not return before idle is durable"
+        );
+        assert!(
+            !persisted.load(Ordering::SeqCst),
+            "a failed write cannot be trusted as terminal activity"
+        );
+
+        release_retry.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("terminal status retry completes")
+            .expect("terminal status task joins");
+        assert!(persisted.load(Ordering::SeqCst));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn persistent_activity_failure_keeps_control_wait_bounded() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_attempts = Arc::clone(&attempts);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            persist_worker_activity_with_retry(42, "idle", move || {
+                observed_attempts.fetch_add(1, Ordering::SeqCst);
+                async { anyhow::bail!("injected persistent SQLite failure") }
+            }),
+        )
+        .await
+        .expect("persistent status failure must not wedge Stop/control forever");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            WORKER_ACTIVITY_RETRY_ATTEMPTS as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_direct_start_waits_for_a_check_that_already_holds_admission() {
+        let direction_id = next_worker_admission_test_direction();
+        let mut inner = test_inner("codex");
+        inner.session_id = Some(direction_id - 1_000);
+        inner.ask_dir = direction_id.to_string();
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+        let check_admission = crate::readiness::acquire_verification_admission(direction_id)
+            .await
+            .expect("check admission");
+        let worker_engine = eng.clone();
+        let worker = tokio::spawn(async move {
+            acquire_worker_start_admission(&worker_engine)
+                .await
+                .expect("worker admission")
+                .expect("worker lease")
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !worker.is_finished(),
+            "worker must wait while verification owns the direction lease"
+        );
+        drop(check_admission);
+        let lease = worker.await.expect("worker task joins");
+        let inner = eng.lock().await;
+        assert!(
+            worker_start_admission_matches(&inner, &lease).expect("lease identity")
+        );
+    }
+
+    #[tokio::test]
+    async fn check_after_worker_direct_start_waits_for_running_persistence() {
+        let direction_id = next_worker_admission_test_direction();
+        let mut inner = test_inner("codex");
+        inner.session_id = Some(direction_id - 1_000);
+        inner.ask_dir = direction_id.to_string();
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+        let worker_lease = acquire_worker_start_admission(&eng)
+            .await
+            .expect("worker admission")
+            .expect("worker lease");
+        let running_persisted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let check = tokio::spawn({
+            let running_persisted = std::sync::Arc::clone(&running_persisted);
+            async move {
+                let admission = crate::readiness::acquire_verification_admission(direction_id)
+                    .await
+                    .expect("check admission after worker start");
+                assert!(
+                    running_persisted.load(std::sync::atomic::Ordering::SeqCst),
+                    "a check must not pass worker admission before session running is persisted"
+                );
+                drop(admission);
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !check.is_finished(),
+            "verification must wait through the durable running-state boundary"
+        );
+        running_persisted.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(worker_lease);
+        check.await.expect("check task joins");
+    }
+
+    #[tokio::test]
+    async fn failed_running_persistence_leaves_worker_unreserved_before_verification_follows() {
+        let direction_id = next_worker_admission_test_direction();
+        let mut inner = test_inner("codex");
+        inner.session_id = Some(direction_id - 1_000);
+        inner.ask_dir = direction_id.to_string();
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+        let db = Db::connect("sqlite::memory:").await.expect("memory db");
+        let worker_lease = acquire_worker_start_admission(&eng)
+            .await
+            .expect("worker admission")
+            .expect("worker lease");
+        let mut inner = eng.lock().await;
+        let error = reserve_direct_turn(
+            &db,
+            &mut inner,
+            Some("reply-tag".to_string()),
+            Some(&worker_lease),
+        )
+        .await
+        .expect_err("a failed running-state write must reject the direct worker start");
+        assert!(!error.to_string().is_empty());
+        assert!(!inner.turn.busy, "failed persistence must not reserve busy");
+        assert_eq!(inner.turn_id, 0, "failed persistence must not consume a turn");
+        assert_eq!(inner.current_origin_tag, None);
+        assert_eq!(inner.clock.started_millis, 0);
+        drop(inner);
+        drop(worker_lease);
+
+        // The failed start drops its direction guard only after it has left no
+        // in-memory turn to race a following verification request.
+        let verification = crate::readiness::acquire_verification_admission(direction_id)
+            .await
+            .expect("verification follows failed worker admission");
+        drop(verification);
+    }
+
+    #[tokio::test]
+    async fn direct_send_wait_does_not_hold_stop_controls_and_revalidates_stop_epoch() {
+        let direction_id = next_worker_admission_test_direction();
+        let session_id = direction_id - 2_000;
+        let mut inner = test_inner("codex");
+        inner.session_id = Some(session_id);
+        inner.ask_dir = direction_id.to_string();
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+        let held_verification = crate::readiness::acquire_verification_admission(direction_id)
+            .await
+            .expect("held verification admission");
+        let waiting_engine = eng.clone();
+        let waiting = tokio::spawn(async move {
+            let admission = acquire_worker_start_admission(&waiting_engine)
+                .await?
+                .expect("worker needs start admission");
+            let inner = waiting_engine.lock().await;
+            worker_start_admission_matches(&inner, &admission)
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "worker is waiting on verification");
+        // `stop_quiet` obtains the same per-session control gate as a real
+        // Stop. It must complete while direct send is waiting for verification;
+        // a timeout here would reproduce the old outer-gate/engine-lock hold.
+        let stop_engine = eng.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::spawn(async move { stop_quiet(&stop_engine).await }),
+        )
+        .await
+        .expect("Stop must not wait for a held verification gate")
+        .expect("Stop task joins");
+
+        drop(held_verification);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("direct-send waiter completes after verification releases")
+            .expect("direct-send waiter joins")
+            .expect("direct-send revalidation result");
+        assert!(!outcome, "Stop must invalidate the pre-wait worker identity");
+        let inner = eng.lock().await;
+        assert!(
+            !inner.turn.busy,
+            "Stop wins before a worker turn is reserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_refresh_bounce_rebases_the_held_worker_lease() {
+        let direction_id = next_worker_admission_test_direction();
+        let mut inner = test_inner("codex");
+        inner.session_id = Some(direction_id - 3_000);
+        inner.ask_dir = direction_id.to_string();
+        let eng: EngineRef = Arc::new(tokio::sync::Mutex::new(inner));
+        let mut admission = acquire_worker_start_admission(&eng)
+            .await
+            .expect("worker admission")
+            .expect("worker lease");
+
+        let mut inner = eng.lock().await;
+        inner.reset_epoch = inner.reset_epoch.saturating_add(1);
+        assert!(
+            !worker_start_admission_matches(&inner, &admission)
+                .expect("old epoch no longer matches")
+        );
+        rebase_worker_start_admission(&inner, &mut admission)
+            .expect("the same worker may rebase its owned refresh bounce");
+        assert!(
+            worker_start_admission_matches(&inner, &admission)
+                .expect("rebased epoch matches")
+        );
+    }
 
     // —— hardened codex app-server attachment write ——
 
@@ -11012,10 +11531,29 @@ mod tests {
         state.get_or_insert(42, engine.clone());
 
         assert!(!state.worker_is_running(42));
+        assert_eq!(state.worker_activity(42), Some(false));
         engine.lock().await.turn.busy = true;
         assert!(state.worker_is_running(42));
+        assert_eq!(state.worker_activity(42), Some(true));
         engine.lock().await.turn.busy = false;
         assert!(!state.worker_is_running(42));
+        let idle_guard = engine.lock().await;
+        assert_eq!(
+            state.worker_activity(42),
+            Some(true),
+            "a contended live engine must fail active"
+        );
+        drop(idle_guard);
+        engine.lock().await.stopped = true;
+        assert!(
+            !state.worker_is_running(42),
+            "manual takeover is not a headless routing turn"
+        );
+        assert_eq!(
+            state.worker_activity(42),
+            Some(true),
+            "manual takeover still owns the worktree for readiness"
+        );
     }
 
     #[tokio::test]
