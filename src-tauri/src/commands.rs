@@ -3018,6 +3018,229 @@ pub async fn list_evidence(
         .collect())
 }
 
+// ---- AuthorityPolicy (issue #172) ----
+
+/// One AuthorityPolicy revision as sent to the frontend. `rules` is already
+/// parsed (never a raw JSON string the UI has to re-parse itself).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct AuthorityPolicyDto {
+    pub id: i32,
+    pub scope: String,
+    pub scope_id: i32,
+    pub revision: String,
+    pub rules: crate::authority::PolicyRules,
+    pub source: String,
+    pub created_at: String,
+    pub revoked_at: String,
+}
+
+fn authority_policy_dto(row: crate::store::entities::authority_policy::Model) -> AuthorityPolicyDto {
+    AuthorityPolicyDto {
+        id: row.id,
+        scope: row.scope,
+        scope_id: row.scope_id,
+        revision: row.revision,
+        rules: serde_json::from_str(&row.rules).unwrap_or_default(),
+        source: row.source,
+        created_at: row.created_at,
+        revoked_at: row.revoked_at,
+    }
+}
+
+/// The active AuthorityPolicy for a workspace, or `None` when no policy has
+/// ever been configured (the hard-coded conservative default is in effect —
+/// see `authority::default_policy`).
+#[tauri::command]
+pub async fn get_authority_policy(db: State<'_, Db>, workspace_id: i32) -> R<Option<AuthorityPolicyDto>> {
+    crate::store::repo::get_active_authority_policy(&db, "workspace", workspace_id)
+        .await
+        .map(|row| row.map(authority_policy_dto))
+        .map_err(e)
+}
+
+/// Newest-first full revision history for a workspace's AuthorityPolicy —
+/// the audit trail behind every tighten/loosen/revoke.
+#[tauri::command]
+pub async fn list_authority_policy_revisions(
+    db: State<'_, Db>,
+    workspace_id: i32,
+) -> R<Vec<AuthorityPolicyDto>> {
+    crate::store::repo::list_authority_policy_revisions(&db, "workspace", workspace_id)
+        .await
+        .map(|rows| rows.into_iter().map(authority_policy_dto).collect())
+        .map_err(e)
+}
+
+/// Configure (or tighten/loosen) the AuthorityPolicy for a workspace: always
+/// inserts the NEXT revision, never mutates an existing one (see
+/// `store::repo::create_authority_policy`'s own doc). `rules` is the
+/// frontend's already-validated `authority::PolicyRules` shape; this command
+/// re-serializes it server-side rather than trusting a raw string, so a
+/// malformed frontend payload fails the `tauri::command` deserialization step
+/// instead of silently storing unparseable JSON. Also refreshes the
+/// in-memory Permission Bridge snapshot the CLI-facing `AskRegistry::
+/// auto_decision` consults, so the new policy applies to the next CLI
+/// permission ask immediately, not just the next Lane materialize.
+#[tauri::command]
+pub async fn set_authority_policy(
+    db: State<'_, Db>,
+    asks: State<'_, crate::ask::AskRegistry>,
+    workspace_id: i32,
+    rules: crate::authority::PolicyRules,
+) -> R<AuthorityPolicyDto> {
+    let rules_json = serde_json::to_string(&rules).map_err(e)?;
+    let row = crate::store::repo::create_authority_policy(&db, "workspace", workspace_id, &rules_json, "user")
+        .await
+        .map_err(e)?;
+    refresh_authority_bridge_snapshot(&db, &asks, workspace_id).await;
+    Ok(authority_policy_dto(row))
+}
+
+/// Revoke the active AuthorityPolicy for a workspace — reverts the WHOLE
+/// scope to the hard-coded conservative default (see `store::repo::
+/// revoke_authority_policy`'s own doc on why there is no fallback to an
+/// older, still-unrevoked revision).
+#[tauri::command]
+pub async fn revoke_authority_policy(
+    db: State<'_, Db>,
+    asks: State<'_, crate::ask::AskRegistry>,
+    workspace_id: i32,
+) -> R<()> {
+    crate::store::repo::revoke_authority_policy(&db, "workspace", workspace_id)
+        .await
+        .map_err(e)?;
+    refresh_authority_bridge_snapshot(&db, &asks, workspace_id).await;
+    Ok(())
+}
+
+/// Re-read the workspace's active AuthorityPolicy (or the hard-coded default)
+/// and install it as the `AskRegistry`'s cached Permission Bridge snapshot —
+/// the ONLY thing that lets the CLI-facing `auto_decision` synchronous hot
+/// path consult a policy without an async DB round trip per ask. Best-effort:
+/// a read failure here leaves the previous snapshot in place (the bridge
+/// simply keeps deferring to the existing AskRegistry/human flow, never fails
+/// closed on a transient read error by BLOCKING every CLI action).
+async fn refresh_authority_bridge_snapshot(db: &Db, asks: &crate::ask::AskRegistry, workspace_id: i32) {
+    match crate::store::repo::get_active_authority_policy(db, "workspace", workspace_id).await {
+        Ok(Some(row)) => asks.set_authority_snapshot(Some(crate::authority::PolicySnapshot {
+            id: row.id,
+            scope: crate::authority::PolicyScope::Workspace(workspace_id),
+            revision: row.revision,
+            rules: serde_json::from_str(&row.rules).unwrap_or_default(),
+            source: row.source,
+            created_at: row.created_at,
+            revoked_at: row.revoked_at,
+        })),
+        Ok(None) => asks.set_authority_snapshot(None),
+        Err(error) => {
+            eprintln!("[weft][authority] bridge snapshot refresh for workspace {workspace_id}: {error}");
+        }
+    }
+}
+
+/// A Lane's pending Gate (issue #172): a direction with no worktree yet whose
+/// most recent `decision` Evidence row recorded `needs_gate`. Minimal view for
+/// the ScopeReview Gate card — enough to explain WHY without the frontend
+/// re-deriving policy logic itself.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LaneGateDto {
+    pub direction_id: i32,
+    pub thread_id: i32,
+    pub name: String,
+    pub reason: String,
+    pub base_branch: String,
+    pub policy_revision: String,
+    pub verdict_reason: String,
+    pub hit_rule: Option<String>,
+    pub observed_at: String,
+}
+
+/// Every Lane currently blocked on a Gate for a thread — a direction with no
+/// registered worktree whose latest `decision` evidence names `needs_gate`.
+#[tauri::command]
+pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGateDto>> {
+    let directions = crate::store::repo::list_directions(&db, thread_id).await.map_err(e)?;
+    let mut out = Vec::new();
+    for dir in directions {
+        let has_worktree = crate::store::repo::worktree_for(&db, dir.id, dir.repo_id)
+            .await
+            .map_err(e)?
+            .is_some();
+        if has_worktree {
+            continue;
+        }
+        let evidence = crate::store::repo::list_evidence(&db, thread_id, Some(dir.id), 20)
+            .await
+            .map_err(e)?;
+        let Some(latest_decision) = evidence
+            .into_iter()
+            .find(|row| row.kind == crate::store::repo::EVIDENCE_KIND_DECISION)
+        else {
+            continue;
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&latest_decision.payload).unwrap_or_default();
+        if parsed.get("decision").and_then(|v| v.as_str()) != Some("needs_gate") {
+            continue;
+        }
+        out.push(LaneGateDto {
+            direction_id: dir.id,
+            thread_id,
+            name: dir.name,
+            reason: dir.reason,
+            base_branch: dir.base_branch,
+            policy_revision: latest_decision.policy_revision,
+            verdict_reason: parsed
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            hit_rule: parsed.get("hit_rule").and_then(|v| v.as_str()).map(str::to_string),
+            observed_at: latest_decision.observed_at,
+        });
+    }
+    Ok(out)
+}
+
+/// Resolve one Lane's Gate: record the human's decision, keyed to the EXACT
+/// policy revision it was decided under (see `store::repo::
+/// record_gate_decision`'s own doc on why), then re-run materialize so an
+/// approval takes effect immediately rather than waiting for the next
+/// unrelated dispatch. `decision` must be `"approved"` or `"denied"`.
+#[tauri::command]
+pub async fn resolve_lane_gate(
+    db: State<'_, Db>,
+    direction_id: i32,
+    policy_revision: String,
+    decision: String,
+    reason: Option<String>,
+) -> R<Vec<crate::store::entities::worktree::Model>> {
+    crate::store::repo::record_gate_decision(
+        &db,
+        direction_id,
+        &policy_revision,
+        &decision,
+        reason.as_deref().unwrap_or(""),
+    )
+    .await
+    .map_err(e)?;
+    crate::materialize::materialize_direction(&db, direction_id)
+        .await
+        .map_err(e)
+}
+
+/// Newest-first scope revision history for a thread (issue #172's versioned
+/// dynamic scope) — every `save_proposal`/confirm snapshot, for audit.
+#[tauri::command]
+pub async fn list_plan_revisions(
+    db: State<'_, Db>,
+    thread_id: i32,
+    limit: Option<u32>,
+) -> R<Vec<crate::store::entities::plan_revision::Model>> {
+    crate::store::repo::list_plan_revisions(&db, thread_id, u64::from(limit.unwrap_or(50)))
+        .await
+        .map_err(e)
+}
+
 // The built-in review-agent rung is gone: review now runs as the user's global
 // review skill INSIDE the worker's own conversation (frontend sends the slash
 // command), and the repo's PR harness stays the authority (§7: 别重造 review/CI).
