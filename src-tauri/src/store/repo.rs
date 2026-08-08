@@ -1,9 +1,9 @@
 //! All DB reads/writes go through here. Keeps SeaORM specifics out of commands.
 
 use super::entities::{
-    app_setting, code_checkpoint, direction, evidence, human_card_terminal_outbox, human_request,
-    im_route, lead_hidden_delivery, lead_message, plan, pull_request, repo_action_execution,
-    repo_profile, repo_ref, session,
+    app_setting, code_checkpoint, direction, direction_dependency, evidence,
+    human_card_terminal_outbox, human_request, im_route, lead_hidden_delivery, lead_message, plan,
+    pull_request, repo_action_execution, repo_profile, repo_ref, session,
     skill_enable, skill_source, test_plan, thread, workspace, worktree,
 };
 use super::Db;
@@ -12,8 +12,8 @@ use crate::slug::unique_slug;
 use anyhow::Result;
 use sea_orm::{
     sea_query::{Alias, Expr, OnConflict},
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, NotSet, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, NotSet,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use std::collections::HashMap;
 
@@ -2928,6 +2928,17 @@ pub async fn delete_direction(db: &Db, direction_id: i32) -> Result<()> {
         .filter(worktree::Column::DirectionId.eq(direction_id))
         .exec(&db.0)
         .await?;
+    // The direction's OWN dependency rows die with it — leftover rows would both leak
+    // deleted-issue content and let `thread_creates_cycle` keep walking a ghost's edges
+    // (a later write naming this id could be rejected for a "cycle" through a direction
+    // that no longer exists). Rows on OTHER directions that NAME this one as upstream are
+    // deliberately kept: a dangling resolved reference reads `Unknown` (blocked) in
+    // `upstream_merge_state`, which is the fail-closed answer a consumer whose declared
+    // producer vanished must keep giving until a re-proposal rewrites its edge set.
+    direction_dependency::Entity::delete_many()
+        .filter(direction_dependency::Column::DirectionId.eq(direction_id))
+        .exec(&db.0)
+        .await?;
     direction::Entity::delete_by_id(direction_id)
         .exec(&db.0)
         .await?;
@@ -3128,68 +3139,338 @@ pub(crate) const DENIED_UPSTREAM_SENTINEL: i32 = -1;
 /// scratch and upgrades the sentinel to the real id.
 pub(crate) const UNRESOLVED_UPSTREAM_SENTINEL: i32 = -2;
 
-/// Record (or clear, with `0`) the task this one must merge after.
-///
-/// Deliberately refuses a SELF edge: a task waiting on itself can never
-/// resolve, and `upstream_merge_state` would report it as permanently
-/// `Pending` — a task no human could ever merge, with a reason that reads like
-/// a bug.
-///
-/// Also refuses any LONGER cycle (A→B→C→A, …). A single upstream per task
-/// cannot express a fan-in graph, but it can still express a cycle: each hop
-/// only needs its own one upstream slot to point back around. Every task on a
-/// cycle would report the OTHER as still-`Pending` forever — both PRs
-/// permanently unmergeable, with no reason that names the actual problem. See
-/// [`creates_cycle`]; the day this becomes a real many-to-many graph it needs
-/// a real graph-level cycle check (see `M0046DirectionUpstream`).
-///
-/// `upstream_id == DENIED_UPSTREAM_SENTINEL` is accepted like any other
-/// non-zero id — it never collides with `direction_id` (a real row's id) or
-/// with a real chain (the sentinel has no row, so `creates_cycle`'s walk
-/// dead-ends there immediately).
+/// A cap on how many direct predecessors ONE Lane may declare in a single
+/// [`set_direction_upstreams`] call — issue #173's "大图可设置合理上限并测试拒绝"
+/// acceptance bar. Chosen generously above any real join dependency (interface
+/// repo + SDK + release repo, say) while still bounding the per-write and
+/// per-cycle-check work to a small constant.
+pub const MAX_DIRECT_PREDECESSORS_PER_LANE: usize = 8;
+
+/// A cap on how many total dependency edges (of any state) one THREAD's
+/// directions may accumulate — the whole-graph counterpart to
+/// [`MAX_DIRECT_PREDECESSORS_PER_LANE`], guarding against an unbounded
+/// re-propose loop slowly amassing edges no UI could usefully render as
+/// adjacency text anyway.
+pub const MAX_EDGES_PER_THREAD: usize = 128;
+
+/// One row's worth of state in `direction_dependency`, as three-state
+/// discriminated data (CLAUDE.md "derive ONE discriminated value") rather
+/// than a magic string compared ad hoc at every call site. `Ord`/`PartialOrd`
+/// exist only so callers (`planner::edge_sets_equal`) can sort an edge list
+/// into a canonical order for unordered-set comparison — the relative order
+/// between variants carries no meaning of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UpstreamEdgeState {
+    /// A real, materialized upstream Lane — `upstream_direction_id` is that
+    /// Lane's row id.
+    Resolved,
+    /// The declared upstream was explicitly denied — a permanent, decided
+    /// fact. `upstream_direction_id` is always `0` ("not applicable").
+    Denied,
+    /// The declared upstream could not (yet, or ever) be pinned to exactly
+    /// one materialized Lane. `upstream_direction_id` is always `0`.
+    Unresolved,
+}
+
+impl UpstreamEdgeState {
+    fn as_str(self) -> &'static str {
+        match self {
+            UpstreamEdgeState::Resolved => "resolved",
+            UpstreamEdgeState::Denied => "denied",
+            UpstreamEdgeState::Unresolved => "unresolved",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "resolved" => Some(UpstreamEdgeState::Resolved),
+            "denied" => Some(UpstreamEdgeState::Denied),
+            "unresolved" => Some(UpstreamEdgeState::Unresolved),
+            _ => None,
+        }
+    }
+}
+
+/// One desired upstream edge for a Lane — the unit [`set_direction_upstreams`]
+/// writes. Callers build the FULL desired set for a direction and pass it in
+/// one call; the function replaces that direction's entire edge set
+/// transactionally rather than diffing individual edges in and out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpstreamEdge {
+    pub upstream_direction_id: i32,
+    pub state: UpstreamEdgeState,
+}
+
+impl UpstreamEdge {
+    pub fn resolved(upstream_direction_id: i32) -> Self {
+        Self { upstream_direction_id, state: UpstreamEdgeState::Resolved }
+    }
+    pub fn denied() -> Self {
+        Self { upstream_direction_id: 0, state: UpstreamEdgeState::Denied }
+    }
+    pub fn unresolved() -> Self {
+        Self { upstream_direction_id: 0, state: UpstreamEdgeState::Unresolved }
+    }
+}
+
+/// Compat single-upstream entry point (issue #110 T4's original API), now a
+/// thin wrapper over [`set_direction_upstreams`]. `0` clears every edge (no
+/// upstream); the two legacy sentinels become a single denied/unresolved
+/// edge; any other value becomes a single resolved edge. Every existing
+/// caller/test that only ever needed ONE upstream slot keeps working
+/// unchanged — this function's OWN validation (self-edge, cycle) is now
+/// performed by `set_direction_upstreams` against the full thread graph.
 pub async fn set_direction_upstream(db: &Db, direction_id: i32, upstream_id: i32) -> Result<()> {
-    if upstream_id == direction_id {
-        anyhow::bail!("a task cannot depend on itself");
+    let edges: Vec<UpstreamEdge> = match upstream_id {
+        0 => Vec::new(),
+        DENIED_UPSTREAM_SENTINEL => vec![UpstreamEdge::denied()],
+        UNRESOLVED_UPSTREAM_SENTINEL => vec![UpstreamEdge::unresolved()],
+        id => vec![UpstreamEdge::resolved(id)],
+    };
+    set_direction_upstreams(db, direction_id, &edges).await
+}
+
+/// Replace `direction_id`'s ENTIRE upstream edge set — the sole writer of
+/// `direction_dependency` (issue #173's DAG upgrade from a single
+/// `depends_on_direction_id` slot). Validates, then transactionally deletes
+/// the direction's existing rows, inserts `edges`, and refreshes the
+/// fail-closed mirror column (`direction.depends_on_direction_id`) so every
+/// OLD reader keeps working off the exact same sentinel convention it always
+/// has (see the mirror's own doc on that column).
+///
+/// Validation (all fail closed — a rejected call changes nothing):
+/// - at most [`MAX_DIRECT_PREDECESSORS_PER_LANE`] edges;
+/// - no RESOLVED edge naming `direction_id` itself (a self-edge can never
+///   resolve, and `upstream_merge_state` would report it `Pending` forever);
+/// - no two RESOLVED edges naming the same upstream (a duplicate edge);
+/// - no RESOLVED edge naming a direction from a DIFFERENT thread (cross-Issue
+///   reference — out of this issue's scope, so it is rejected outright rather
+///   than silently allowed). A RESOLVED edge naming an id that does not exist
+///   at all is still accepted (unchanged legacy behavior): `upstream_merge_
+///   state` fails IT closed too, reading `Unknown` for a dangling reference,
+///   the same as it always has — there is nothing to validate against for an
+///   id nobody registered;
+/// - no cycle anywhere in the thread's resolved-edge graph once this
+///   direction's new edges are added (see [`thread_creates_cycle`]);
+/// - at most [`MAX_EDGES_PER_THREAD`] edges total across the whole thread
+///   after this write — EXCEPT a single blocking-sentinel edge, which is
+///   always accepted (see the inline comment on the cap check: rejecting the
+///   fail-closed placeholder/fallback would strand a lane fail-open).
+///
+/// A missing `direction_id` row is a silent no-op (nothing to write ON),
+/// matching the legacy single-slot function's own behavior.
+pub async fn set_direction_upstreams(
+    db: &Db,
+    direction_id: i32,
+    edges: &[UpstreamEdge],
+) -> Result<()> {
+    if edges.len() > MAX_DIRECT_PREDECESSORS_PER_LANE {
+        anyhow::bail!(
+            "a lane may declare at most {MAX_DIRECT_PREDECESSORS_PER_LANE} direct predecessors \
+             (got {})",
+            edges.len()
+        );
     }
-    if creates_cycle(db, direction_id, upstream_id).await? {
-        anyhow::bail!("this would create a dependency cycle");
-    }
-    let Some(row) = direction::Entity::find_by_id(direction_id)
+    let Some(dir) = direction::Entity::find_by_id(direction_id)
         .one(&db.0)
         .await?
     else {
         return Ok(());
     };
-    let mut a: direction::ActiveModel = row.into();
-    a.depends_on_direction_id = Set(upstream_id);
-    a.update(&db.0).await?;
+
+    let mut seen_resolved: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    for edge in edges {
+        if edge.state != UpstreamEdgeState::Resolved {
+            continue;
+        }
+        if edge.upstream_direction_id == direction_id {
+            anyhow::bail!("a lane cannot depend on itself");
+        }
+        if !seen_resolved.insert(edge.upstream_direction_id) {
+            anyhow::bail!(
+                "a lane cannot depend on the same upstream twice (direction {})",
+                edge.upstream_direction_id
+            );
+        }
+        if let Some(upstream_dir) = direction::Entity::find_by_id(edge.upstream_direction_id)
+            .one(&db.0)
+            .await?
+        {
+            if upstream_dir.thread_id != dir.thread_id {
+                anyhow::bail!(
+                    "a lane cannot depend on direction {} from another Issue",
+                    edge.upstream_direction_id
+                );
+            }
+        }
+    }
+
+    if thread_creates_cycle(db, direction_id, edges).await? {
+        anyhow::bail!("this would create a dependency cycle");
+    }
+
+    // A single blocking-sentinel edge — the planner's pass-1 placeholder and its
+    // rejected-write fallback both write exactly this shape — is EXEMPT from the
+    // thread-wide cap: it REPLACES the lane's whole set with one row whose only
+    // effect is to block, and rejecting it would strand the lane EMPTY ("no
+    // upstream, free to merge") — the precise fail-open that write exists to
+    // prevent. Growth stays bounded regardless: replace semantics allow at most
+    // one such row per direction.
+    let blocking_sentinel_only =
+        matches!(edges, [only] if only.state != UpstreamEdgeState::Resolved);
+    if !blocking_sentinel_only {
+        let existing_thread_edges =
+            thread_edge_count_excluding(db, dir.thread_id, direction_id).await?;
+        if existing_thread_edges + edges.len() > MAX_EDGES_PER_THREAD {
+            anyhow::bail!(
+                "this thread would exceed the {MAX_EDGES_PER_THREAD}-edge dependency cap \
+                 ({existing_thread_edges} existing + {} new)",
+                edges.len()
+            );
+        }
+    }
+
+    let txn = db.0.begin().await?;
+    if let Err(e) = direction_dependency::Entity::delete_many()
+        .filter(direction_dependency::Column::DirectionId.eq(direction_id))
+        .exec(&txn)
+        .await
+    {
+        let _ = txn.rollback().await;
+        return Err(e.into());
+    }
+    for edge in edges {
+        let row = direction_dependency::ActiveModel {
+            direction_id: Set(direction_id),
+            upstream_direction_id: Set(edge.upstream_direction_id),
+            state: Set(edge.state.as_str().to_string()),
+            created_at: Set(now_unix()),
+            ..Default::default()
+        };
+        if let Err(e) = row.insert(&txn).await {
+            let _ = txn.rollback().await;
+            return Err(e.into());
+        }
+    }
+    let mirror = mirror_upstream_value(edges);
+    if let Err(e) = direction::Entity::update_many()
+        .col_expr(direction::Column::DependsOnDirectionId, Expr::value(mirror))
+        .filter(direction::Column::Id.eq(direction_id))
+        .exec(&txn)
+        .await
+    {
+        let _ = txn.rollback().await;
+        return Err(e.into());
+    }
+    txn.commit().await?;
     Ok(())
 }
 
-/// Would recording `direction_id → upstream_id` close a cycle? Walks
-/// `upstream_id`'s OWN chain (its upstream, that task's upstream, …): if the
-/// walk ever reaches `direction_id`, adding the new edge would complete a
-/// loop back to where it started. A `visited` set bounds the walk at the
-/// number of distinct tasks touched even if the existing data already
-/// contains a cycle (defense in depth — this function is the only writer, so
-/// that should not be reachable, but the walk must still terminate if it
-/// somehow is). `0` (no upstream) and a dangling/missing row both end the
-/// walk with "no cycle" — a chain that runs out is not a loop.
-async fn creates_cycle(db: &Db, direction_id: i32, upstream_id: i32) -> Result<bool> {
+/// `direction_id`'s CURRENT upstream edge set, as typed [`UpstreamEdge`]s — the read side of
+/// [`set_direction_upstreams`]. Used by `planner::record_upstream_edges` to decide whether a
+/// lane's stored edges already match its freshly computed target (skip the write) or are stale
+/// (need the two-pass placeholder treatment) — see that function's doc.
+pub async fn direction_upstream_edges(db: &Db, direction_id: i32) -> Result<Vec<UpstreamEdge>> {
+    let rows = direction_dependency::Entity::find()
+        .filter(direction_dependency::Column::DirectionId.eq(direction_id))
+        .all(&db.0)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let state = UpstreamEdgeState::parse(&row.state)?;
+            Some(UpstreamEdge { upstream_direction_id: row.upstream_direction_id, state })
+        })
+        .collect())
+}
+
+/// The fail-closed mirror value for `direction.depends_on_direction_id`,
+/// derived from a direction's full edge set (ADR, issue #173): `0` when there
+/// are no edges at all; the real upstream id when there is EXACTLY one edge
+/// and it is resolved; `UNRESOLVED_UPSTREAM_SENTINEL` for every other shape —
+/// a fan-in of 2+ resolved edges (the mirror has only one slot and cannot
+/// name all of them), any denied edge, or any unresolved edge. A mirror
+/// reader only ever needs "is this blocked" (both sentinels already read
+/// `Unknown`, i.e. blocked, in the legacy single-slot code this replaces) —
+/// never which specific edge is the reason, so collapsing a denied-only set
+/// to the SAME sentinel as an unresolved-only set loses no old reader
+/// behavior.
+fn mirror_upstream_value(edges: &[UpstreamEdge]) -> i32 {
+    match edges {
+        [] => 0,
+        [only] if only.state == UpstreamEdgeState::Resolved => only.upstream_direction_id,
+        _ => UNRESOLVED_UPSTREAM_SENTINEL,
+    }
+}
+
+/// Total dependency edges (any state) across every direction in `thread_id`,
+/// excluding `exclude_direction_id`'s own current rows (the ones this same
+/// write is about to replace) — the live count [`set_direction_upstreams`]
+/// adds its new edge count to when enforcing [`MAX_EDGES_PER_THREAD`].
+async fn thread_edge_count_excluding(
+    db: &Db,
+    thread_id: i32,
+    exclude_direction_id: i32,
+) -> Result<usize> {
+    let thread_direction_ids: Vec<i32> = direction::Entity::find()
+        .filter(direction::Column::ThreadId.eq(thread_id))
+        .all(&db.0)
+        .await?
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    let count = direction_dependency::Entity::find()
+        .filter(direction_dependency::Column::DirectionId.is_in(thread_direction_ids))
+        .filter(direction_dependency::Column::DirectionId.ne(exclude_direction_id))
+        .count(&db.0)
+        .await?;
+    Ok(count as usize)
+}
+
+/// Would applying `direction_id`'s new RESOLVED edges (from `edges`) close a
+/// cycle anywhere in the graph? Real graph-level DFS/BFS (issue #173),
+/// replacing the old single-column chain walk: starts from each NEW resolved
+/// target, then follows every OTHER direction's CURRENT resolved rows in
+/// `direction_dependency` — never `direction_id`'s OWN existing rows, which
+/// this same call is about to replace (reading them here would let a lane's
+/// OLD edge falsely "detect" a cycle against the very edge replacing it).
+///
+/// A `visited` set bounds the walk at the number of distinct directions
+/// touched even if the graph already (should never happen — this function is
+/// the sole gate) contains a cycle. `0` and a dangling id both end that
+/// branch of the walk with "no cycle" — a chain that runs out is not a loop.
+///
+/// Note: a caller that writes MULTIPLE directions in the same logical batch
+/// (e.g. `planner::record_upstream_edges`, reversing which of two lanes
+/// depends on the other) can still see a transient false-positive here if it
+/// applies the new edges before clearing the OTHER lane's stale one — this
+/// function only ever reflects the CURRENT DB state on each call. That is
+/// why such callers clear stale edges (to `Unresolved`) in their own first
+/// pass before applying real edges in a second — see that function's doc.
+async fn thread_creates_cycle(db: &Db, direction_id: i32, edges: &[UpstreamEdge]) -> Result<bool> {
     let mut visited: std::collections::HashSet<i32> = std::collections::HashSet::new();
-    let mut current = upstream_id;
-    loop {
+    let mut stack: Vec<i32> = edges
+        .iter()
+        .filter(|e| e.state == UpstreamEdgeState::Resolved)
+        .map(|e| e.upstream_direction_id)
+        .collect();
+    while let Some(current) = stack.pop() {
         if current == direction_id {
             return Ok(true);
         }
         if current == 0 || !visited.insert(current) {
-            return Ok(false);
+            continue;
         }
-        current = match direction::Entity::find_by_id(current).one(&db.0).await? {
-            Some(row) => row.depends_on_direction_id,
-            None => return Ok(false),
-        };
+        let rows = direction_dependency::Entity::find()
+            .filter(direction_dependency::Column::DirectionId.eq(current))
+            .filter(direction_dependency::Column::State.eq(UpstreamEdgeState::Resolved.as_str()))
+            .all(&db.0)
+            .await?;
+        for row in rows {
+            stack.push(row.upstream_direction_id);
+        }
     }
+    Ok(false)
 }
 
 pub async fn set_direction_engine_pinned(db: &Db, direction_id: i32, pinned: bool) -> Result<()> {
@@ -4380,6 +4661,15 @@ async fn delete_thread_cascade_with_action_cleanups(
         }
         session::Entity::delete_many()
             .filter(session::Column::DirectionId.eq(d.id))
+            .exec(&txn)
+            .await?;
+        // Dependency edges die with their direction (issue #173). Deleting by
+        // consumer side alone is complete here: cross-Issue references are
+        // rejected at write time, so every edge row naming one of this
+        // thread's directions as upstream is itself owned by a direction in
+        // this same loop.
+        direction_dependency::Entity::delete_many()
+            .filter(direction_dependency::Column::DirectionId.eq(d.id))
             .exec(&txn)
             .await?;
         direction::Entity::delete_by_id(d.id).exec(&txn).await?;
@@ -7165,6 +7455,19 @@ pub async fn reload_pull_request_merge_candidate(
 /// unresolvable default branch must never optimistically release the merge on
 /// a guess, so it returns `Unknown`, same as every other failure in this
 /// function.
+///
+/// Issue #173: this now aggregates over the direction's FULL edge set in
+/// `direction_dependency` rather than a single `depends_on_direction_id`
+/// slot, fail-closed exactly the same way at every step: any `denied` edge
+/// → `Unknown`; any `unresolved` edge → `Unknown`; no edges at all → `None`;
+/// otherwise every RESOLVED upstream is independently resolved by
+/// [`single_upstream_state`] (the SAME per-upstream logic this function
+/// always used) and the axis is the worst of that set — any `Unknown` wins
+/// outright, else any `Pending` (their names joined for the human, "waits
+/// for A, B"), else `Merged` only once EVERY upstream is. The `UpstreamStatus`
+/// enum itself, and what each variant means to every consumer
+/// (`host::judge`, `host::automerge`, `host::monitor`, `readiness.rs`), is
+/// UNCHANGED — this is a pure aggregation change behind the same contract.
 pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamStatus {
     if direction_id == 0 {
         // The pre-existing "no owning direction" convention (`direction.repo_id`'s own
@@ -7182,8 +7485,8 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
         // `no_upstream_is_indistinguishable_from_the_three_axis_judgement`).
         return host::UpstreamStatus::None;
     }
-    let dir = match get_direction(db, direction_id).await {
-        Ok(Some(d)) => d,
+    match get_direction(db, direction_id).await {
+        Ok(Some(_)) => {}
         Ok(None) => {
             return host::UpstreamStatus::Unknown {
                 reason: "找不到这个任务".into(),
@@ -7195,32 +7498,71 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
             }
         }
     };
-    if dir.depends_on_direction_id == 0 {
+    let edges = match direction_dependency::Entity::find()
+        .filter(direction_dependency::Column::DirectionId.eq(direction_id))
+        .all(&db.0)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            return host::UpstreamStatus::Unknown {
+                reason: format!("读取依赖关系失败: {e}"),
+            }
+        }
+    };
+    if edges.is_empty() {
         return host::UpstreamStatus::None;
     }
-    if dir.depends_on_direction_id == DENIED_UPSTREAM_SENTINEL {
+    if edges.iter().any(|e| e.state == UpstreamEdgeState::Denied.as_str()) {
         return host::UpstreamStatus::Unknown {
             reason: "所依赖的上游任务已被拒绝,这个任务的前提不再成立".into(),
         };
     }
-    if dir.depends_on_direction_id == UNRESOLVED_UPSTREAM_SENTINEL {
+    if edges
+        .iter()
+        .any(|e| e.state == UpstreamEdgeState::Unresolved.as_str())
+    {
         return host::UpstreamStatus::Unknown {
             reason: "上游任务尚未确定(可能还未审批,或依赖的名字有歧义),暂时无法判断是否可以合并"
                 .into(),
         };
     }
-    let upstream = match get_direction(db, dir.depends_on_direction_id).await {
+    let mut pending_names: Vec<String> = Vec::new();
+    for edge in &edges {
+        match single_upstream_state(db, edge.upstream_direction_id).await {
+            SingleUpstreamOutcome::Unknown(reason) => {
+                return host::UpstreamStatus::Unknown { reason }
+            }
+            SingleUpstreamOutcome::Pending(name) => pending_names.push(name),
+            SingleUpstreamOutcome::Merged => {}
+        }
+    }
+    if pending_names.is_empty() {
+        host::UpstreamStatus::Merged
+    } else {
+        host::UpstreamStatus::Pending { what: pending_names.join(", ") }
+    }
+}
+
+/// One RESOLVED upstream's own merge state — extracted from what used to be
+/// `upstream_merge_state`'s single-upstream body so [`upstream_merge_state`]
+/// can independently resolve EACH upstream in a Lane's join dependency and
+/// take the worst outcome across the set (issue #173).
+enum SingleUpstreamOutcome {
+    Merged,
+    Pending(String),
+    Unknown(String),
+}
+
+async fn single_upstream_state(db: &Db, upstream_direction_id: i32) -> SingleUpstreamOutcome {
+    let upstream = match get_direction(db, upstream_direction_id).await {
         Ok(Some(u)) => u,
         Ok(None) => {
-            return host::UpstreamStatus::Unknown {
-                reason: format!("上游任务 #{} 不存在", dir.depends_on_direction_id),
-            }
+            return SingleUpstreamOutcome::Unknown(format!(
+                "上游任务 #{upstream_direction_id} 不存在"
+            ))
         }
-        Err(e) => {
-            return host::UpstreamStatus::Unknown {
-                reason: format!("读取上游任务失败: {e}"),
-            }
-        }
+        Err(e) => return SingleUpstreamOutcome::Unknown(format!("读取上游任务失败: {e}")),
     };
     let prs = match pull_request::Entity::find()
         .filter(pull_request::Column::DirectionId.eq(upstream.id))
@@ -7228,11 +7570,7 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
         .await
     {
         Ok(rows) => rows,
-        Err(e) => {
-            return host::UpstreamStatus::Unknown {
-                reason: format!("读取上游 PR 失败: {e}"),
-            }
-        }
+        Err(e) => return SingleUpstreamOutcome::Unknown(format!("读取上游 PR 失败: {e}")),
     };
     // Merged only when EVERY registered PR for the upstream reads "merged" — a CLOSED-without-
     // merging row blocks, exactly like an OPEN one (Codex review, PR #159 repo.rs:3850,
@@ -7277,17 +7615,13 @@ pub async fn upstream_merge_state(db: &Db, direction_id: i32) -> host::UpstreamS
                 // branch (offline, repo row gone, local clone doesn't provably match
                 // the PR's own recorded host repo) — the honest answer is "can't
                 // tell", the same rule every other failure branch above follows.
-                return host::UpstreamStatus::Unknown {
-                    reason: "无法确认上游仓库的默认分支".into(),
-                };
+                return SingleUpstreamOutcome::Unknown("无法确认上游仓库的默认分支".into());
             }
-            Some(true) => return host::UpstreamStatus::Merged,
+            Some(true) => return SingleUpstreamOutcome::Merged,
             Some(false) => {} // fall through to Pending below
         }
     }
-    host::UpstreamStatus::Pending {
-        what: upstream.name.clone(),
-    }
+    SingleUpstreamOutcome::Pending(upstream.name.clone())
 }
 
 /// A [`parse_remote_host_and_path`] result.
@@ -15260,6 +15594,409 @@ mod tests {
         let c2 = get_direction(&db, consumer_2).await.unwrap().unwrap();
         assert_eq!(c1.depends_on_direction_id, producer);
         assert_eq!(c2.depends_on_direction_id, producer);
+    }
+
+    // ---- Issue #173 (R1-03): multi-predecessor DAG on `set_direction_upstreams` ----
+
+    /// A real JOIN: one consumer with TWO upstream producers, both resolved. This is the
+    /// shape a single-slot `depends_on_direction_id` could never express at all.
+    #[tokio::test]
+    async fn set_direction_upstreams_records_a_fan_in_join() {
+        let db = mem().await;
+        let ids = bare_directions(&db, 3).await;
+        let (interface_repo, sdk_repo, consumer) = (ids[0], ids[1], ids[2]);
+
+        set_direction_upstreams(
+            &db,
+            consumer,
+            &[UpstreamEdge::resolved(interface_repo), UpstreamEdge::resolved(sdk_repo)],
+        )
+        .await
+        .expect("a join of two independent resolved upstreams must be accepted");
+
+        let edges = direction_upstream_edges(&db, consumer).await.unwrap();
+        assert_eq!(edges.len(), 2, "both upstreams must be recorded as separate rows");
+        assert!(edges.iter().any(|e| e.upstream_direction_id == interface_repo
+            && e.state == UpstreamEdgeState::Resolved));
+        assert!(edges
+            .iter()
+            .any(|e| e.upstream_direction_id == sdk_repo && e.state == UpstreamEdgeState::Resolved));
+    }
+
+    /// A cycle reachable ONLY through a fan-in join: A depends on {B, C}; C then tries to
+    /// depend on A. B/C alone are not a cycle (a plain fan-out), but A -> C -> A closes one.
+    /// The old single-column `creates_cycle` walk could never even construct the fan-in half
+    /// of this graph shape; the graph-wide DFS must still catch it.
+    #[tokio::test]
+    async fn set_direction_upstreams_rejects_a_cycle_reachable_only_through_a_fan_in_join() {
+        let db = mem().await;
+        let ids = bare_directions(&db, 3).await;
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+
+        set_direction_upstreams(&db, a, &[UpstreamEdge::resolved(b), UpstreamEdge::resolved(c)])
+            .await
+            .expect("A depending on both B and C (a join) must be accepted");
+
+        let err = set_direction_upstreams(&db, c, &[UpstreamEdge::resolved(a)])
+            .await
+            .expect_err("C depending on A must be rejected — A already depends on C via the join");
+        assert!(err.to_string().contains("cycle"), "error should name the problem: {err}");
+
+        let c_edges = direction_upstream_edges(&db, c).await.unwrap();
+        assert!(c_edges.is_empty(), "the rejected edge must not persist");
+    }
+
+    /// A lane may not depend on itself even when it is only ONE entry among several in a
+    /// larger join.
+    #[tokio::test]
+    async fn set_direction_upstreams_rejects_a_self_edge_within_a_larger_set() {
+        let db = mem().await;
+        let ids = bare_directions(&db, 2).await;
+        let (a, b) = (ids[0], ids[1]);
+
+        let err = set_direction_upstreams(&db, a, &[UpstreamEdge::resolved(b), UpstreamEdge::resolved(a)])
+            .await
+            .expect_err("a self-edge anywhere in the set must be rejected");
+        assert!(err.to_string().contains("itself"), "error should name the problem: {err}");
+        assert!(direction_upstream_edges(&db, a).await.unwrap().is_empty(), "nothing must persist");
+    }
+
+    /// The SAME upstream named twice in one call — a duplicate resolved edge — is rejected,
+    /// not silently deduplicated (issue #173: "校验...重复边").
+    #[tokio::test]
+    async fn set_direction_upstreams_rejects_a_duplicate_resolved_edge() {
+        let db = mem().await;
+        let ids = bare_directions(&db, 2).await;
+        let (producer, consumer) = (ids[0], ids[1]);
+
+        let err = set_direction_upstreams(
+            &db,
+            consumer,
+            &[UpstreamEdge::resolved(producer), UpstreamEdge::resolved(producer)],
+        )
+        .await
+        .expect_err("the same upstream declared twice must be rejected");
+        assert!(err.to_string().contains("twice"), "error should name the problem: {err}");
+        assert!(direction_upstream_edges(&db, consumer).await.unwrap().is_empty());
+    }
+
+    /// A resolved edge naming a direction that exists but belongs to a DIFFERENT thread (a
+    /// different Issue) is a cross-Issue reference — explicitly out of scope, rejected fail
+    /// closed rather than silently allowed (issue #173: "校验...跨 Issue 引用").
+    #[tokio::test]
+    async fn set_direction_upstreams_rejects_a_cross_thread_reference() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws_cross_thread").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "api", "/tmp/cross-thread-api", "main", "", true)
+            .await
+            .unwrap();
+        let t1 = create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        let t2 = create_thread(&db, ws.id, "t2", "feature", "claude").await.unwrap();
+        let consumer = create_direction(&db, t1.id, "consumer", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+        let other_thread_direction =
+            create_direction(&db, t2.id, "unrelated", "claude", r.id, "r", "impl-only", "")
+                .await
+                .unwrap();
+
+        let err = set_direction_upstreams(
+            &db,
+            consumer.id,
+            &[UpstreamEdge::resolved(other_thread_direction.id)],
+        )
+        .await
+        .expect_err("a resolved edge into another thread's direction must be rejected");
+        assert!(
+            err.to_string().to_lowercase().contains("issue") || err.to_string().contains("thread"),
+            "error should name the problem: {err}"
+        );
+        assert!(direction_upstream_edges(&db, consumer.id).await.unwrap().is_empty());
+    }
+
+    /// A resolved edge naming an id that exists but belongs to no direction row at all
+    /// (dangling — a typo, a deleted direction) is still ACCEPTED at write time, unchanged
+    /// legacy behavior: there is no row to validate a cross-thread/self/duplicate check
+    /// against, and `upstream_merge_state` already fails this closed as `Unknown` on read (see
+    /// `a_dangling_upstream_edge_is_unknown_never_none`). Fail-closed happens at the READ, not
+    /// by refusing the write.
+    #[tokio::test]
+    async fn set_direction_upstreams_accepts_a_dangling_resolved_edge_write() {
+        let db = mem().await;
+        let ids = bare_directions(&db, 1).await;
+        let consumer = ids[0];
+
+        set_direction_upstreams(&db, consumer, &[UpstreamEdge::resolved(999_999)])
+            .await
+            .expect("a dangling upstream id is accepted at write time");
+        let edges = direction_upstream_edges(&db, consumer).await.unwrap();
+        assert_eq!(edges, vec![UpstreamEdge::resolved(999_999)]);
+    }
+
+    /// More than `MAX_DIRECT_PREDECESSORS_PER_LANE` edges in one call is rejected with a clear
+    /// error (issue #173: "大图可设置合理上限并测试拒绝").
+    #[tokio::test]
+    async fn set_direction_upstreams_rejects_more_than_the_per_lane_cap() {
+        let db = mem().await;
+        let ids = bare_directions(&db, MAX_DIRECT_PREDECESSORS_PER_LANE + 2).await;
+        let consumer = ids[0];
+        let edges: Vec<UpstreamEdge> = ids[1..]
+            .iter()
+            .map(|&id| UpstreamEdge::resolved(id))
+            .collect();
+        assert!(edges.len() > MAX_DIRECT_PREDECESSORS_PER_LANE);
+
+        let err = set_direction_upstreams(&db, consumer, &edges)
+            .await
+            .expect_err("exceeding the per-lane predecessor cap must be rejected");
+        assert!(
+            err.to_string().contains(&MAX_DIRECT_PREDECESSORS_PER_LANE.to_string()),
+            "error should name the cap: {err}"
+        );
+        assert!(direction_upstream_edges(&db, consumer).await.unwrap().is_empty());
+    }
+
+    /// More than `MAX_EDGES_PER_THREAD` total edges across a thread is rejected — the
+    /// whole-graph counterpart to the per-lane cap.
+    #[tokio::test]
+    async fn set_direction_upstreams_rejects_more_than_the_per_thread_cap() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws_edge_cap").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "api", "/tmp/edge-cap-api", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        // One shared producer, and enough OTHER single-edge consumers to fill the thread's
+        // edge budget right up to the cap.
+        let producer = create_direction(&db, t.id, "producer", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+        for i in 0..MAX_EDGES_PER_THREAD {
+            let consumer = create_direction(
+                &db,
+                t.id,
+                &format!("filler-{i}"),
+                "claude",
+                r.id,
+                "r",
+                "impl-only",
+                "",
+            )
+            .await
+            .unwrap();
+            set_direction_upstreams(&db, consumer.id, &[UpstreamEdge::resolved(producer.id)])
+                .await
+                .unwrap();
+        }
+        let one_more = create_direction(&db, t.id, "one-more", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+
+        let err = set_direction_upstreams(&db, one_more.id, &[UpstreamEdge::resolved(producer.id)])
+            .await
+            .expect_err("exceeding the per-thread edge cap must be rejected");
+        assert!(
+            err.to_string().contains(&MAX_EDGES_PER_THREAD.to_string()),
+            "error should name the cap: {err}"
+        );
+        assert!(direction_upstream_edges(&db, one_more.id).await.unwrap().is_empty());
+
+        // The ONE exemption: a single blocking-sentinel edge (the planner's pass-1
+        // placeholder / rejected-write fallback) must still be accepted at the cap —
+        // rejecting it would leave this lane's edge set EMPTY, reading "no upstream,
+        // free to merge", the precise fail-open that write exists to prevent.
+        set_direction_upstreams(&db, one_more.id, &[UpstreamEdge::unresolved()])
+            .await
+            .expect("the blocking sentinel is exempt from the thread-wide cap");
+        let edges = direction_upstream_edges(&db, one_more.id).await.unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].state, UpstreamEdgeState::Unresolved);
+        assert_eq!(
+            get_direction(&db, one_more.id).await.unwrap().unwrap().depends_on_direction_id,
+            UNRESOLVED_UPSTREAM_SENTINEL,
+            "the mirror column blocks too"
+        );
+    }
+
+    /// A deleted direction's OWN dependency rows die with it — no ghost edges for
+    /// `thread_creates_cycle` to walk and no deleted-issue content leaking — while a
+    /// CONSUMER's edge NAMING the deleted direction is kept and reads fail-closed
+    /// `Unknown` (its declared producer vanished; that must block, not release).
+    #[tokio::test]
+    async fn delete_direction_removes_its_own_edges_but_keeps_consumers_dangling_edge() {
+        let db = mem().await;
+        let ids = bare_directions(&db, 3).await;
+        let (upstream, middle, consumer) = (ids[0], ids[1], ids[2]);
+        set_direction_upstreams(&db, middle, &[UpstreamEdge::resolved(upstream)])
+            .await
+            .unwrap();
+        set_direction_upstreams(&db, consumer, &[UpstreamEdge::resolved(middle)])
+            .await
+            .unwrap();
+
+        delete_direction(&db, middle).await.unwrap();
+
+        assert!(
+            direction_dependency::Entity::find()
+                .filter(direction_dependency::Column::DirectionId.eq(middle))
+                .all(&db.0)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the deleted direction's own edge rows are gone"
+        );
+        let consumer_edges = direction_upstream_edges(&db, consumer).await.unwrap();
+        assert_eq!(consumer_edges.len(), 1, "the consumer's declared dependency is kept");
+        assert_eq!(consumer_edges[0].upstream_direction_id, middle);
+        assert!(
+            matches!(
+                upstream_merge_state(&db, consumer).await,
+                crate::host::UpstreamStatus::Unknown { .. }
+            ),
+            "a dangling reference reads Unknown (blocked), never \"no upstream\""
+        );
+    }
+
+    /// Thread deletion sweeps dependency edges with the rest of the thread-owned rows —
+    /// same contract as every other table in the cascade: deleted-issue content must not
+    /// linger in weft.db and backups.
+    #[tokio::test]
+    async fn delete_thread_cascade_removes_dependency_edges() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws_dep_cascade").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "api", "/tmp/dep-cascade-api", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let producer = create_direction(&db, t.id, "p", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+        let consumer = create_direction(&db, t.id, "c", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+        set_direction_upstreams(&db, consumer.id, &[UpstreamEdge::resolved(producer.id)])
+            .await
+            .unwrap();
+        set_direction_upstreams(&db, producer.id, &[UpstreamEdge::unresolved()])
+            .await
+            .unwrap();
+
+        delete_thread_cascade(&db, t.id).await.unwrap();
+
+        assert!(
+            direction_dependency::Entity::find().all(&db.0).await.unwrap().is_empty(),
+            "no dependency edge may outlive its issue"
+        );
+    }
+
+    /// The fail-closed mirror column (`direction.depends_on_direction_id`) truth table (ADR,
+    /// issue #173): empty edge set -> 0; exactly one resolved edge -> that id; anything else
+    /// (a join of 2+ resolved, a denied edge, an unresolved edge) -> the blocking sentinel.
+    #[tokio::test]
+    async fn mirror_column_reflects_the_edge_set_shape() {
+        let db = mem().await;
+        let ids = bare_directions(&db, 3).await;
+        let (p1, p2, consumer) = (ids[0], ids[1], ids[2]);
+
+        set_direction_upstreams(&db, consumer, &[]).await.unwrap();
+        assert_eq!(
+            get_direction(&db, consumer).await.unwrap().unwrap().depends_on_direction_id,
+            0,
+            "no edges -> mirror 0"
+        );
+
+        set_direction_upstreams(&db, consumer, &[UpstreamEdge::resolved(p1)]).await.unwrap();
+        assert_eq!(
+            get_direction(&db, consumer).await.unwrap().unwrap().depends_on_direction_id,
+            p1,
+            "exactly one resolved edge -> mirror is that upstream's id"
+        );
+
+        set_direction_upstreams(&db, consumer, &[UpstreamEdge::resolved(p1), UpstreamEdge::resolved(p2)])
+            .await
+            .unwrap();
+        assert_eq!(
+            get_direction(&db, consumer).await.unwrap().unwrap().depends_on_direction_id,
+            UNRESOLVED_UPSTREAM_SENTINEL,
+            "a join of 2+ resolved edges -> the blocking sentinel (the mirror has only one slot)"
+        );
+
+        set_direction_upstreams(&db, consumer, &[UpstreamEdge::denied()]).await.unwrap();
+        assert_eq!(
+            get_direction(&db, consumer).await.unwrap().unwrap().depends_on_direction_id,
+            UNRESOLVED_UPSTREAM_SENTINEL,
+            "a single denied edge -> the blocking sentinel too (old readers only need \"blocked\")"
+        );
+
+        set_direction_upstreams(&db, consumer, &[UpstreamEdge::unresolved()]).await.unwrap();
+        assert_eq!(
+            get_direction(&db, consumer).await.unwrap().unwrap().depends_on_direction_id,
+            UNRESOLVED_UPSTREAM_SENTINEL,
+            "a single unresolved edge -> the blocking sentinel"
+        );
+    }
+
+    /// `upstream_merge_state`'s aggregation truth table over a multi-edge set (issue #173):
+    /// no edges -> None; any denied -> Unknown; any unresolved -> Unknown; a dangling resolved
+    /// edge -> Unknown; any pending (unmerged) upstream -> Pending; every upstream merged on
+    /// its default branch -> Merged.
+    #[tokio::test]
+    async fn upstream_merge_state_aggregates_the_edge_set_fail_closed() {
+        let db = mem().await;
+        let ids = bare_directions(&db, 3).await;
+        let (p1, p2, consumer) = (ids[0], ids[1], ids[2]);
+
+        // No edges at all -> None.
+        assert_eq!(upstream_merge_state(&db, consumer).await, crate::host::UpstreamStatus::None);
+
+        // Any denied edge -> Unknown, even alongside a resolved one.
+        set_direction_upstreams(
+            &db,
+            consumer,
+            &[UpstreamEdge::resolved(p1), UpstreamEdge::denied()],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            upstream_merge_state(&db, consumer).await,
+            crate::host::UpstreamStatus::Unknown { .. }
+        ));
+
+        // Any unresolved edge -> Unknown.
+        set_direction_upstreams(
+            &db,
+            consumer,
+            &[UpstreamEdge::resolved(p1), UpstreamEdge::unresolved()],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            upstream_merge_state(&db, consumer).await,
+            crate::host::UpstreamStatus::Unknown { .. }
+        ));
+
+        // A dangling resolved edge alongside a real one -> Unknown (can't tell about the
+        // dangling half, so the whole axis is Unknown).
+        set_direction_upstreams(
+            &db,
+            consumer,
+            &[UpstreamEdge::resolved(p1), UpstreamEdge::resolved(999_999)],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            upstream_merge_state(&db, consumer).await,
+            crate::host::UpstreamStatus::Unknown { .. }
+        ));
+
+        // Both real, neither has a registered PR yet -> Pending (a fact, not "can't tell").
+        set_direction_upstreams(&db, consumer, &[UpstreamEdge::resolved(p1), UpstreamEdge::resolved(p2)])
+            .await
+            .unwrap();
+        assert!(matches!(
+            upstream_merge_state(&db, consumer).await,
+            crate::host::UpstreamStatus::Pending { .. }
+        ));
     }
 
     #[tokio::test]

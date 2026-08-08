@@ -1,6 +1,6 @@
 //! Integration coverage for the storage/process collector behind issue #171.
 
-use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1529,6 +1529,79 @@ async fn persisted_dangling_upstream_edge_is_remote_unknown() {
         .expect("consumer lane");
     assert_eq!(consumer.readiness, LaneReadiness::Unknown);
     assert_eq!(consumer.reasons[0].code, ReasonCode::RemoteUnknown);
+}
+
+/// Issue #173 (R1-03): a Lane can now join on TWO OR MORE upstreams, not just one. Readiness
+/// (and the underlying `upstream_merge_state` aggregation) must wait for EVERY upstream, not
+/// any one of them — one merged upstream must never release a consumer whose OTHER upstream is
+/// still pending.
+#[tokio::test]
+async fn join_dependency_blocks_until_every_upstream_is_merged_then_releases() {
+    let (fixture, host) = fixture_with_origin(None).await;
+    add_passing_build_script(&fixture).await;
+    let upstream_a = add_review_direction(&fixture, "interface repo change").await;
+    let upstream_b = add_review_direction(&fixture, "sdk repo change").await;
+
+    // One upstream merged, the other still open: the join must stay blocked.
+    weft::store::repo::set_direction_upstreams(
+        &fixture.db,
+        fixture.direction_id,
+        &[
+            weft::store::repo::UpstreamEdge::resolved(upstream_a.id),
+            weft::store::repo::UpstreamEdge::resolved(upstream_b.id),
+        ],
+    )
+    .await
+    .expect("join edge set");
+    insert_upstream_pr(&fixture, upstream_a.id, &host, 801, "merged").await;
+    insert_upstream_pr(&fixture, upstream_b.id, &host, 802, "open").await;
+
+    assert!(
+        matches!(
+            repo::upstream_merge_state(&fixture.db, fixture.direction_id).await,
+            UpstreamStatus::Pending { .. }
+        ),
+        "one merged + one pending upstream must still read Pending — a join waits for ALL"
+    );
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
+        .await
+        .expect("readiness");
+    assert_eq!(result.readiness, IssueReadiness::Blocked);
+    let consumer = result
+        .lanes
+        .iter()
+        .find(|lane| lane.direction_id == fixture.direction_id)
+        .expect("consumer lane");
+    assert_eq!(consumer.readiness, LaneReadiness::Blocked);
+    assert_eq!(consumer.reasons[0].code, ReasonCode::UpstreamUnmet);
+
+    // The second upstream lands too: NOW the join releases.
+    let second = pull_request::Entity::find()
+        .filter(pull_request::Column::DirectionId.eq(upstream_b.id))
+        .filter(pull_request::Column::Number.eq(802))
+        .one(&fixture.db.0)
+        .await
+        .expect("find second upstream pr")
+        .expect("second upstream pr row");
+    let mut active: pull_request::ActiveModel = second.into();
+    active.lifecycle = Set("merged".to_string());
+    active.update(&fixture.db.0).await.expect("mark second upstream merged");
+
+    assert_eq!(
+        repo::upstream_merge_state(&fixture.db, fixture.direction_id).await,
+        UpstreamStatus::Merged,
+        "once EVERY upstream in the join is merged on the default branch, the axis clears"
+    );
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
+        .await
+        .expect("readiness");
+    assert_eq!(result.readiness, IssueReadiness::ReviewReady);
+    let consumer = result
+        .lanes
+        .iter()
+        .find(|lane| lane.direction_id == fixture.direction_id)
+        .expect("consumer lane");
+    assert_eq!(consumer.readiness, LaneReadiness::ReviewReady);
 }
 
 #[tokio::test]
