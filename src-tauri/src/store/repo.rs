@@ -1,10 +1,10 @@
 //! All DB reads/writes go through here. Keeps SeaORM specifics out of commands.
 
 use super::entities::{
-    app_setting, code_checkpoint, direction, direction_dependency, evidence,
-    human_card_terminal_outbox, human_request, im_route, lead_hidden_delivery, lead_message, plan,
-    pull_request, repo_action_execution, repo_profile, repo_ref, session,
-    skill_enable, skill_source, test_plan, thread, workspace, worktree,
+    app_setting, authority_policy, code_checkpoint, direction, direction_dependency, evidence,
+    human_card_terminal_outbox, human_request, im_route, lane_gate_decision, lead_hidden_delivery,
+    lead_message, plan, plan_revision, pull_request, repo_action_execution, repo_profile, repo_ref,
+    session, skill_enable, skill_source, test_plan, thread, workspace, worktree,
 };
 use super::Db;
 use crate::host;
@@ -2338,6 +2338,233 @@ pub async fn set_plan_created_at(db: &Db, thread_id: i32, created_at: &str) -> R
         }
     }
     Ok(())
+}
+
+// ---- plan_revision (issue #172: versioned dynamic scope) ----
+
+/// Append one immutable scope snapshot for a thread (see
+/// `entities::plan_revision`'s own doc). Called alongside every
+/// `upsert_plan`/`set_plan_created_at` pair that advances the working plan's
+/// version — `version` is that SAME OCC token, so a `plan_revision` row and
+/// the `plan` row it snapshot always agree on which revision is "current" the
+/// instant after the write. Never updates or deletes an existing row.
+pub async fn insert_plan_revision(
+    db: &Db,
+    thread_id: i32,
+    version: &str,
+    proposal: &str,
+    source: &str,
+) -> Result<plan_revision::Model> {
+    let inserted = plan_revision::Entity::insert(plan_revision::ActiveModel {
+        id: NotSet,
+        thread_id: Set(thread_id),
+        version: Set(version.to_string()),
+        proposal: Set(proposal.to_string()),
+        source: Set(source.to_string()),
+        created_at: Set(now()),
+    })
+    .exec(&db.0)
+    .await?;
+    plan_revision::Entity::find_by_id(inserted.last_insert_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("plan_revision row disappeared after insert"))
+}
+
+/// The most recently appended scope revision for a thread — the "current
+/// scope revision" `authority::adjudicate_lane` callers pass in. `None` for a
+/// thread that has never saved a proposal (nothing to adjudicate yet).
+pub async fn latest_plan_revision(db: &Db, thread_id: i32) -> Result<Option<plan_revision::Model>> {
+    Ok(plan_revision::Entity::find()
+        .filter(plan_revision::Column::ThreadId.eq(thread_id))
+        .order_by_desc(plan_revision::Column::Id)
+        .one(&db.0)
+        .await?)
+}
+
+/// Newest-first bounded page of a thread's scope history — the full "what did
+/// the scope look like, and who changed it" audit trail issue #172 asks for.
+pub async fn list_plan_revisions(
+    db: &Db,
+    thread_id: i32,
+    limit: u64,
+) -> Result<Vec<plan_revision::Model>> {
+    Ok(plan_revision::Entity::find()
+        .filter(plan_revision::Column::ThreadId.eq(thread_id))
+        .order_by_desc(plan_revision::Column::Id)
+        .limit(limit.clamp(1, 500))
+        .all(&db.0)
+        .await?)
+}
+
+// ---- authority_policy (issue #172: AuthorityPolicy judgment) ----
+
+/// Create the next AuthorityPolicy revision for a (scope, scope_id) —
+/// "create" covers both an initial configuration AND a later tighten/loosen:
+/// this ALWAYS inserts a new row at `previous_revision + 1` (starting at
+/// `"1"`), never mutates an existing one, so the full policy history stays
+/// intact. `rules` is the caller's already-serialized `authority::
+/// PolicyRules` JSON.
+pub async fn create_authority_policy(
+    db: &Db,
+    scope: &str,
+    scope_id: i32,
+    rules: &str,
+    source: &str,
+) -> Result<authority_policy::Model> {
+    let previous = authority_policy::Entity::find()
+        .filter(authority_policy::Column::Scope.eq(scope))
+        .filter(authority_policy::Column::ScopeId.eq(scope_id))
+        .order_by_desc(authority_policy::Column::Id)
+        .one(&db.0)
+        .await?;
+    let next_revision = previous
+        .and_then(|p| p.revision.parse::<i64>().ok())
+        .unwrap_or(0)
+        + 1;
+    let inserted = authority_policy::Entity::insert(authority_policy::ActiveModel {
+        id: NotSet,
+        scope: Set(scope.to_string()),
+        scope_id: Set(scope_id),
+        revision: Set(next_revision.to_string()),
+        rules: Set(rules.to_string()),
+        source: Set(source.to_string()),
+        created_at: Set(now()),
+        revoked_at: Set(String::new()),
+    })
+    .exec(&db.0)
+    .await?;
+    authority_policy::Entity::find_by_id(inserted.last_insert_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("authority_policy row disappeared after insert"))
+}
+
+/// The active AuthorityPolicy for a scope: the row at the HIGHEST `revision`
+/// number overall (revoked or not) — but returned ONLY when that latest row's
+/// `revoked_at` is empty. There is deliberately no fallback to an older,
+/// still-unrevoked revision: revoking is "undo my most recent configuration",
+/// not "retire one specific historical row while an earlier one keeps
+/// governing" — so revoking the latest revision reverts the WHOLE scope to
+/// `authority::default_policy` (the hard-coded conservative default) even if
+/// older configured revisions exist. `None` means "no configured policy is in
+/// effect"; callers must never treat `None` as permissive.
+pub async fn get_active_authority_policy(
+    db: &Db,
+    scope: &str,
+    scope_id: i32,
+) -> Result<Option<authority_policy::Model>> {
+    let rows = authority_policy::Entity::find()
+        .filter(authority_policy::Column::Scope.eq(scope))
+        .filter(authority_policy::Column::ScopeId.eq(scope_id))
+        .all(&db.0)
+        .await?;
+    let latest = rows
+        .into_iter()
+        .max_by_key(|p| p.revision.parse::<i64>().unwrap_or(0));
+    Ok(latest.filter(|p| p.revoked_at.is_empty()))
+}
+
+/// Revoke the active AuthorityPolicy for a scope (sets `revoked_at`; never
+/// deletes). A no-op if no active row exists. After this, `get_active_
+/// authority_policy` returns `None` and callers fall back to `authority::
+/// default_policy` — revoking a policy can only make a scope MORE
+/// conservative, never more permissive, because the fallback is the
+/// hard-coded conservative default (never an older, still-unrevoked
+/// revision — see that function's own doc).
+pub async fn revoke_authority_policy(db: &Db, scope: &str, scope_id: i32) -> Result<()> {
+    let Some(active) = get_active_authority_policy(db, scope, scope_id).await? else {
+        return Ok(());
+    };
+    let mut a: authority_policy::ActiveModel = active.into();
+    a.revoked_at = Set(now());
+    a.update(&db.0).await?;
+    Ok(())
+}
+
+/// Newest-first full revision history for a scope — the audit trail behind
+/// every tighten/loosen/revoke.
+pub async fn list_authority_policy_revisions(
+    db: &Db,
+    scope: &str,
+    scope_id: i32,
+) -> Result<Vec<authority_policy::Model>> {
+    let mut rows: Vec<authority_policy::Model> = authority_policy::Entity::find()
+        .filter(authority_policy::Column::Scope.eq(scope))
+        .filter(authority_policy::Column::ScopeId.eq(scope_id))
+        .all(&db.0)
+        .await?;
+    rows.sort_by_key(|p| std::cmp::Reverse(p.revision.parse::<i64>().unwrap_or(0)));
+    Ok(rows)
+}
+
+// ---- lane_gate_decision (issue #172: per-Lane Gate resolution) ----
+
+/// Record a human's Gate resolution for one Lane, keyed to the EXACT policy
+/// revision it was decided under (see `entities::lane_gate_decision`'s own
+/// doc on why). `decision` is `"approved"` or `"denied"`; anything else is
+/// rejected outright rather than silently stored as an unrecognized state a
+/// later reader could misinterpret as either.
+pub async fn record_gate_decision(
+    db: &Db,
+    direction_id: i32,
+    policy_revision: &str,
+    decision: &str,
+    reason: &str,
+) -> Result<lane_gate_decision::Model> {
+    if decision != "approved" && decision != "denied" {
+        anyhow::bail!("gate decision must be \"approved\" or \"denied\", got {decision:?}");
+    }
+    let inserted = lane_gate_decision::Entity::insert(lane_gate_decision::ActiveModel {
+        id: NotSet,
+        direction_id: Set(direction_id),
+        policy_revision: Set(policy_revision.to_string()),
+        decision: Set(decision.to_string()),
+        reason: Set(reason.to_string()),
+        created_at: Set(now()),
+    })
+    .exec(&db.0)
+    .await?;
+    lane_gate_decision::Entity::find_by_id(inserted.last_insert_id)
+        .one(&db.0)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("lane_gate_decision row disappeared after insert"))
+}
+
+/// The newest Gate resolution for one Lane AT one EXACT policy revision.
+/// `None` when nothing was ever decided for this (direction, revision) pair
+/// — including when the revision has since moved on: a resolution recorded
+/// under an OLDER revision is never returned here, which is what makes a
+/// policy tighten/loosen silently invalidate every outstanding Gate approval
+/// (issue #172's "stale policy decision" rule, applied to Gate overrides).
+pub async fn get_gate_decision(
+    db: &Db,
+    direction_id: i32,
+    policy_revision: &str,
+) -> Result<Option<lane_gate_decision::Model>> {
+    Ok(lane_gate_decision::Entity::find()
+        .filter(lane_gate_decision::Column::DirectionId.eq(direction_id))
+        .filter(lane_gate_decision::Column::PolicyRevision.eq(policy_revision))
+        .order_by_desc(lane_gate_decision::Column::Id)
+        .one(&db.0)
+        .await?)
+}
+
+/// Every direction that names `direction_id` as a RESOLVED upstream — the
+/// downstream set a Gate on `direction_id` must also block (issue #172:
+/// "needs-gate 只阻塞该 Lane 及其依赖"). Only `resolved` edges count: a
+/// `denied`/`unresolved` edge already blocks its own consumer independently
+/// (see `direction_dependency`'s own doc), and re-blocking it here would be
+/// redundant, not additionally correct.
+pub async fn downstream_direction_ids(db: &Db, direction_id: i32) -> Result<Vec<i32>> {
+    Ok(direction_dependency::Entity::find()
+        .filter(direction_dependency::Column::UpstreamDirectionId.eq(direction_id))
+        .filter(direction_dependency::Column::State.eq("resolved"))
+        .all(&db.0)
+        .await?
+        .into_iter()
+        .map(|edge| edge.direction_id)
+        .collect())
 }
 
 /// Compare-and-swap the stored proposal: write `new_proposal` + `status` ONLY if the
@@ -17609,5 +17836,146 @@ mod tests {
         let rows = list_evidence(&db, thread_id, Some(12345), 10).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].direction_id, 12345);
+    }
+
+    // ---- issue #172: plan_revision / authority_policy / lane_gate_decision / downstream ----
+
+    #[tokio::test]
+    async fn plan_revision_history_is_newest_first_and_never_mutated() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "issue", "claude").await.unwrap();
+
+        insert_plan_revision(&db, t.id, "1-0", "{\"a\":1}", "lead").await.unwrap();
+        insert_plan_revision(&db, t.id, "1-0", "{\"a\":1,\"confirmed\":true}", "user")
+            .await
+            .unwrap();
+        insert_plan_revision(&db, t.id, "2-0", "{\"a\":2}", "lead").await.unwrap();
+
+        let history = list_plan_revisions(&db, t.id, 10).await.unwrap();
+        assert_eq!(history.len(), 3, "every append survives — no row is ever mutated");
+        assert_eq!(history[0].version, "2-0", "newest first");
+        assert_eq!(history[0].source, "lead");
+        // Two rows may legitimately share a version (a lead propose, then a
+        // user confirm of that SAME version) — never deduped or collapsed.
+        assert_eq!(
+            history.iter().filter(|r| r.version == "1-0").count(),
+            2,
+            "a shared version is not a duplicate — both the propose and the confirm survive"
+        );
+
+        let latest = latest_plan_revision(&db, t.id).await.unwrap().unwrap();
+        assert_eq!(latest.version, "2-0");
+
+        // A thread with no proposal at all has no history.
+        let other = create_thread(&db, ws.id, "t2", "issue", "claude").await.unwrap();
+        assert!(latest_plan_revision(&db, other.id).await.unwrap().is_none());
+        assert!(list_plan_revisions(&db, other.id, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn authority_policy_revision_increments_and_revoke_falls_back_to_none() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+
+        assert!(
+            get_active_authority_policy(&db, "workspace", ws.id).await.unwrap().is_none(),
+            "no configured policy yet — callers fall back to authority::default_policy"
+        );
+
+        let first = create_authority_policy(&db, "workspace", ws.id, "{}", "user").await.unwrap();
+        assert_eq!(first.revision, "1");
+        let second = create_authority_policy(&db, "workspace", ws.id, "{\"auto_materialize\":true}", "user")
+            .await
+            .unwrap();
+        assert_eq!(second.revision, "2", "tightening/loosening always mints the next revision");
+
+        let active = get_active_authority_policy(&db, "workspace", ws.id).await.unwrap().unwrap();
+        assert_eq!(active.id, second.id, "the active row is the highest revision");
+
+        revoke_authority_policy(&db, "workspace", ws.id).await.unwrap();
+        assert!(
+            get_active_authority_policy(&db, "workspace", ws.id).await.unwrap().is_none(),
+            "revoking clears the active row — falls back to the conservative default, never to the older revision"
+        );
+
+        let history = list_authority_policy_revisions(&db, "workspace", ws.id).await.unwrap();
+        assert_eq!(history.len(), 2, "revoke never deletes history");
+        assert_eq!(history[0].revision, "2", "newest first");
+        assert!(!history[0].revoked_at.is_empty(), "the revoked row is marked, not removed");
+
+        // A second, unrelated workspace's revision counter starts independently at 1.
+        let ws2 = create_workspace(&db, "ws2").await.unwrap();
+        let ws2_first = create_authority_policy(&db, "workspace", ws2.id, "{}", "user").await.unwrap();
+        assert_eq!(ws2_first.revision, "1");
+    }
+
+    #[tokio::test]
+    async fn gate_decision_is_keyed_to_the_exact_policy_revision() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "svc", "/tmp/svc-gate", "main", "", true).await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "issue", "claude").await.unwrap();
+        let dir = create_direction(&db, t.id, "x", "claude", r.id, "because", "plan+impl", "")
+            .await
+            .unwrap();
+
+        assert!(get_gate_decision(&db, dir.id, "1").await.unwrap().is_none());
+        record_gate_decision(&db, dir.id, "1", "approved", "looks fine").await.unwrap();
+        let g = get_gate_decision(&db, dir.id, "1").await.unwrap().unwrap();
+        assert_eq!(g.decision, "approved");
+
+        // A resolution recorded under revision "1" must NOT answer a lookup at
+        // revision "2" — a policy tighten/loosen orphans every older override.
+        assert!(
+            get_gate_decision(&db, dir.id, "2").await.unwrap().is_none(),
+            "a Gate override recorded under an older policy revision must not apply to a newer one"
+        );
+
+        let err = record_gate_decision(&db, dir.id, "2", "maybe", "").await.unwrap_err();
+        assert!(
+            err.to_string().contains("approved") || err.to_string().contains("denied"),
+            "an unrecognized decision value must be rejected outright: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn downstream_direction_ids_finds_only_resolved_consumers() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "svc", "/tmp/svc-downstream", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "t", "issue", "claude").await.unwrap();
+        let upstream = create_direction(&db, t.id, "producer", "claude", r.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+        let consumer_a = create_direction(&db, t.id, "consumer-a", "claude", r.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+        let consumer_b = create_direction(&db, t.id, "consumer-b", "claude", r.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+        let unrelated = create_direction(&db, t.id, "unrelated", "claude", r.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+
+        set_direction_upstreams(&db, consumer_a.id, &[UpstreamEdge::resolved(upstream.id)])
+            .await
+            .unwrap();
+        set_direction_upstreams(&db, consumer_b.id, &[UpstreamEdge::unresolved()])
+            .await
+            .unwrap();
+
+        let mut downstream = downstream_direction_ids(&db, upstream.id).await.unwrap();
+        downstream.sort();
+        assert_eq!(
+            downstream,
+            vec![consumer_a.id],
+            "only the RESOLVED edge naming upstream counts as downstream — unresolved/denied edges \
+             already block their own consumer independently"
+        );
+        assert!(downstream_direction_ids(&db, unrelated.id).await.unwrap().is_empty());
+        assert!(downstream_direction_ids(&db, consumer_b.id).await.unwrap().is_empty());
     }
 }

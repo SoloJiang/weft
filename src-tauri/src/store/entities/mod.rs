@@ -1,4 +1,5 @@
 pub mod app_setting;
+pub mod authority_policy;
 pub mod backup_config;
 pub mod code_checkpoint;
 pub mod direction;
@@ -7,9 +8,11 @@ pub mod evidence;
 pub mod human_card_terminal_outbox;
 pub mod human_request;
 pub mod im_route;
+pub mod lane_gate_decision;
 pub mod lead_hidden_delivery;
 pub mod lead_message;
 pub mod plan;
+pub mod plan_revision;
 pub mod pull_request;
 pub mod repo_action_execution;
 pub mod repo_profile;

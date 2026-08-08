@@ -1,8 +1,9 @@
 use crate::store::entities::{
-    app_setting, backup_config, code_checkpoint, direction, direction_dependency, evidence,
-    human_card_terminal_outbox, human_request, im_route, lead_hidden_delivery, lead_message, plan,
-    pull_request, repo_action_execution, repo_profile, repo_ref, session, skill_enable,
-    skill_source, test_plan, thread, workspace, worktree,
+    app_setting, authority_policy, backup_config, code_checkpoint, direction, direction_dependency,
+    evidence, human_card_terminal_outbox, human_request, im_route, lane_gate_decision,
+    lead_hidden_delivery, lead_message, plan, plan_revision, pull_request, repo_action_execution,
+    repo_profile, repo_ref, session, skill_enable, skill_source, test_plan, thread, workspace,
+    worktree,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -68,6 +69,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0053LeadHiddenDelivery),
             Box::new(M0054DirectionDependency),
             Box::new(M0055Evidence),
+            Box::new(M0056AuthorityPolicy),
         ]
     }
 }
@@ -2651,6 +2653,98 @@ impl MigrationTrait for M0055Evidence {
     }
 }
 
+/// Issue #172: versioned dynamic scope + AuthorityPolicy judgment. Three
+/// tables:
+///
+/// - `plan_revision`: the append-only scope history behind `plan`'s working
+///   head (see that entity's own doc).
+/// - `authority_policy`: the append-only AuthorityPolicy log (see that
+///   entity's own doc) — active row = highest `revision` per (scope,
+///   scope_id) with an empty `revoked_at`.
+/// - `lane_gate_decision`: a human's per-Lane Gate resolution, keyed to the
+///   exact policy revision it was decided under.
+pub struct M0056AuthorityPolicy;
+impl MigrationName for M0056AuthorityPolicy {
+    fn name(&self) -> &str {
+        "m0056_authority_policy"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0056AuthorityPolicy {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+
+        let mut plan_revision_stmt = schema.create_table_from_entity(plan_revision::Entity);
+        plan_revision_stmt.if_not_exists();
+        manager.create_table(plan_revision_stmt).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_plan_revision_thread")
+                    .table(Alias::new("plan_revision"))
+                    .col(Alias::new("thread_id"))
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_plan_revision_thread_version")
+                    .table(Alias::new("plan_revision"))
+                    .col(Alias::new("thread_id"))
+                    .col(Alias::new("version"))
+                    .to_owned(),
+            )
+            .await?;
+
+        let mut authority_policy_stmt = schema.create_table_from_entity(authority_policy::Entity);
+        authority_policy_stmt.if_not_exists();
+        manager.create_table(authority_policy_stmt).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_authority_policy_scope")
+                    .table(Alias::new("authority_policy"))
+                    .col(Alias::new("scope"))
+                    .col(Alias::new("scope_id"))
+                    .col(Alias::new("revoked_at"))
+                    .to_owned(),
+            )
+            .await?;
+
+        let mut lane_gate_decision_stmt = schema.create_table_from_entity(lane_gate_decision::Entity);
+        lane_gate_decision_stmt.if_not_exists();
+        manager.create_table(lane_gate_decision_stmt).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_lane_gate_decision_direction_revision")
+                    .table(Alias::new("lane_gate_decision"))
+                    .col(Alias::new("direction_id"))
+                    .col(Alias::new("policy_revision"))
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Alias::new("lane_gate_decision")).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(Alias::new("authority_policy")).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(Alias::new("plan_revision")).to_owned())
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2658,7 +2752,7 @@ mod tests {
         M0046DirectionUpstream, M0047PullRequestThreadStatus, M0048HumanRequest,
         M0049HumanRequestSourceMessage, M0050HumanRequestImRoutes,
         M0051HumanCardTerminalOutbox, M0052RepoActionExecution, M0053LeadHiddenDelivery,
-        M0054DirectionDependency, M0055Evidence,
+        M0054DirectionDependency, M0055Evidence, M0056AuthorityPolicy,
     };
 
     #[test]
@@ -3770,5 +3864,104 @@ mod tests {
             1,
             "a rerun must not duplicate the already-lifted denied edge"
         );
+    }
+
+    /// M0056: `plan_revision`, `authority_policy`, and `lane_gate_decision` are
+    /// created from scratch (a fresh DB has none of the three), a row can be
+    /// written+read through each entity's real accessors end to end, and a
+    /// rerun of `up` tolerates the already-existing tables/indexes (mirrors
+    /// every other migration's own `if_not_exists` rerun tolerance test).
+    #[tokio::test]
+    async fn m0056_authority_policy_tables_created_and_rerun_safe() {
+        use crate::store::repo;
+        use crate::store::Db;
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(&db, ws.id, "svc", "/tmp/svc", "main", "", true)
+            .await
+            .unwrap();
+        let thread = repo::create_thread(&db, ws.id, "t", "issue", "claude")
+            .await
+            .unwrap();
+
+        // plan_revision: insert + read back through the real accessor.
+        let rev = repo::insert_plan_revision(&db, thread.id, "1-0", "{}", "lead")
+            .await
+            .unwrap();
+        assert_eq!(rev.thread_id, thread.id);
+        let latest = repo::latest_plan_revision(&db, thread.id).await.unwrap();
+        assert_eq!(latest.map(|r| r.id), Some(rev.id));
+
+        // authority_policy: create + read back as the active row.
+        let policy = repo::create_authority_policy(&db, "workspace", ws.id, "{}", "user")
+            .await
+            .unwrap();
+        assert_eq!(policy.revision, "1");
+        let active = repo::get_active_authority_policy(&db, "workspace", ws.id)
+            .await
+            .unwrap();
+        assert_eq!(active.map(|p| p.id), Some(policy.id));
+
+        // lane_gate_decision: needs a real direction row (FK-free, but the
+        // accessor's own contract is "one row per direction+policy_revision").
+        let dir = repo::create_direction(
+            &db,
+            thread.id,
+            "lane-a",
+            "claude",
+            repo_ref.id,
+            "because",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        repo::record_gate_decision(&db, dir.id, &policy.revision, "approved", "looked fine")
+            .await
+            .unwrap();
+        let gate = repo::get_gate_decision(&db, dir.id, &policy.revision)
+            .await
+            .unwrap();
+        assert_eq!(gate.map(|g| g.decision), Some("approved".to_string()));
+
+        // Rerun tolerance: `up` again must not fail on already-existing tables/indexes.
+        M0056AuthorityPolicy
+            .up(&SchemaManager::new(&db.0))
+            .await
+            .unwrap();
+        // The pre-rerun rows must survive untouched.
+        let still_active = repo::get_active_authority_policy(&db, "workspace", ws.id)
+            .await
+            .unwrap();
+        assert_eq!(still_active.map(|p| p.id), Some(policy.id));
+    }
+
+    /// M0056 `down` drops all three tables it created, leaving nothing behind
+    /// — the rollback-compatibility bar every migration in this file carries.
+    #[tokio::test]
+    async fn m0056_authority_policy_down_drops_every_table() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let manager = SchemaManager::new(&db);
+        M0056AuthorityPolicy.up(&manager).await.unwrap();
+        M0056AuthorityPolicy.down(&manager).await.unwrap();
+
+        let backend = db.get_database_backend();
+        for table in ["plan_revision", "authority_policy", "lane_gate_decision"] {
+            let rows = db
+                .query_all(Statement::from_string(
+                    backend,
+                    format!(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'"
+                    ),
+                ))
+                .await
+                .unwrap();
+            assert!(rows.is_empty(), "{table} must not exist after down()");
+        }
     }
 }
