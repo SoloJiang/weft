@@ -4428,6 +4428,16 @@ async fn delete_thread_cascade_with_action_cleanups(
         .filter(pull_request::Column::ThreadId.eq(thread_id))
         .exec(&txn)
         .await?;
+    // Evidence rows are keyed by thread and carry real (if redacted+bounded)
+    // issue content — check output tails, PR state, decision summaries. Same
+    // contract as every other table in this sweep: deleted-issue content must
+    // not linger in weft.db and backups. (Surviving a deleted LANE is by
+    // design — `list_evidence`'s doc — but the issue itself dying takes its
+    // whole ledger with it.)
+    evidence::Entity::delete_many()
+        .filter(evidence::Column::ThreadId.eq(thread_id))
+        .exec(&txn)
+        .await?;
     repo_action_execution::Entity::delete_many()
         .filter(repo_action_execution::Column::ThreadId.eq(thread_id))
         .filter(repo_action_execution::Column::Status.ne(REPO_ACTION_CLEANUP_PENDING))
@@ -8141,8 +8151,13 @@ fn basic_auth_url_span(input: &str) -> Option<usize> {
 
 /// A `bearer <token>` scheme (case-insensitive) at the start of `input`, if
 /// present. Returns the byte length of the matched span including the token.
+/// `str::get` (not a direct slice) for the prefix probe: byte offset 7 can
+/// fall INSIDE a multibyte char (any CJK text reaches here — the caller scans
+/// every non-word position), and a direct `input[..7]` would panic on it.
+/// A prefix that isn't valid ASCII "bearer " is never a match anyway.
 fn bearer_token_span(input: &str) -> Option<usize> {
-    if input.len() < BEARER_PREFIX_LEN || !input[..BEARER_PREFIX_LEN].eq_ignore_ascii_case("bearer ") {
+    let prefix = input.get(..BEARER_PREFIX_LEN)?;
+    if !prefix.eq_ignore_ascii_case("bearer ") {
         return None;
     }
     let token_len = token_run_len(&input[BEARER_PREFIX_LEN..]);
@@ -8225,11 +8240,15 @@ pub struct EvidenceWrite<'a> {
 
 /// Append one evidence row, superseding the previous latest non-superseded
 /// row with the same (thread_id, direction_id, kind, source, source_ref)
-/// identity in the same transaction. A no-op — returns the existing latest
-/// row untouched, no new row inserted — when the new observation's
+/// identity in the same transaction. When the new observation's
 /// revision/policy_revision/summary/payload/collection_state are IDENTICAL to
-/// that latest row: issue #174 asks write sites to "dedupe to avoid spam...
-/// append only when content/result actually changed".
+/// that latest row, no new row is inserted — issue #174 asks write sites to
+/// "dedupe to avoid spam... append only when content/result actually
+/// changed" — but the existing row's `observed_at` IS refreshed to now:
+/// re-observing identical content is still a fresh observation, and without
+/// the bump a STABLE host fact re-confirmed every sweep would decay to
+/// `Stale` after 3 quiet sweeps (the TTL would measure "time since the
+/// content last CHANGED", the opposite of what "recently confirmed" means).
 pub async fn append_evidence(db: &Db, write: EvidenceWrite<'_>) -> Result<evidence::Model> {
     if write.thread_id <= 0 {
         anyhow::bail!("evidence requires a valid thread_id");
@@ -8267,8 +8286,11 @@ pub async fn append_evidence(db: &Db, write: EvidenceWrite<'_>) -> Result<eviden
             && existing.payload == write.payload
             && existing.collection_state == write.collection_state
         {
+            let mut refresh: evidence::ActiveModel = existing.clone().into();
+            refresh.observed_at = Set(now());
+            let row = refresh.update(&txn).await?;
             txn.commit().await?;
-            return Ok(existing.clone());
+            return Ok(row);
         }
     }
     let timestamp = now();
@@ -16645,7 +16667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_evidence_is_a_no_op_when_content_is_unchanged() {
+    async fn append_evidence_dedupes_identical_content_but_refreshes_observed_at() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         let thread_id = evidence_test_thread(&db).await;
         let write = || EvidenceWrite {
@@ -16661,11 +16683,75 @@ mod tests {
             collection_state: EVIDENCE_COLLECTION_OK,
         };
         let first = append_evidence(&db, write()).await.unwrap();
+        // Backdate the stored row so the refresh is observable at the clock's
+        // one-second string granularity.
+        let mut backdate: evidence::ActiveModel = first.clone().into();
+        backdate.observed_at = Set("1000".to_string());
+        backdate.update(&db.0).await.unwrap();
+
         let second = append_evidence(&db, write()).await.unwrap();
         assert_eq!(first.id, second.id, "identical content must not append a new row");
+        assert_ne!(
+            second.observed_at, "1000",
+            "an identical re-observation must refresh observed_at — a stable fact \
+             re-confirmed every sweep must not decay to Stale"
+        );
 
         let rows = list_evidence(&db, thread_id, Some(3), 10).await.unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    /// `redact_secrets` runs its scanners at every non-word position, so any
+    /// multibyte text (CJK summaries, error messages) exercises the prefix
+    /// probes at offsets that fall inside a character — those probes must
+    /// decline, not panic (the pre-fix `input[..7]` slice did).
+    #[test]
+    fn redact_secrets_handles_multibyte_text_without_panicking() {
+        assert_eq!(redact_secrets("验证通过"), "验证通过");
+        assert_eq!(redact_secrets("检查失败：退出码 1"), "检查失败：退出码 1");
+        assert_eq!(
+            redact_secrets("凭据 bearer abc123 已泄露"),
+            "凭据 bearer [redacted] 已泄露",
+            "a real bearer token after CJK text is still redacted"
+        );
+        assert_eq!(
+            redact_secrets("构建日志包含 ghp_ABCdef123 一枚"),
+            "构建日志包含 [redacted] 一枚",
+            "a GitHub token between CJK words is still redacted"
+        );
+    }
+
+    /// Deleting an ISSUE takes its whole evidence ledger with it — same
+    /// deleted-content contract as every other thread-owned table in the
+    /// cascade. (A deleted LANE keeping its evidence is separate, by design.)
+    #[tokio::test]
+    async fn delete_thread_cascade_removes_evidence_rows() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let thread_id = evidence_test_thread(&db).await;
+        append_evidence(
+            &db,
+            EvidenceWrite {
+                thread_id,
+                direction_id: 0,
+                kind: EVIDENCE_KIND_HOST,
+                source: "host_monitor",
+                source_ref: "https://example.com/pr/1",
+                revision: "sha1",
+                policy_revision: "",
+                summary: "ci green",
+                payload: "{}",
+                collection_state: EVIDENCE_COLLECTION_OK,
+            },
+        )
+        .await
+        .unwrap();
+
+        delete_thread_cascade(&db, thread_id).await.unwrap();
+
+        assert!(
+            evidence::Entity::find().all(&db.0).await.unwrap().is_empty(),
+            "no evidence row may outlive its issue"
+        );
     }
 
     #[tokio::test]

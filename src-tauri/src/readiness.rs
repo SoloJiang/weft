@@ -1844,6 +1844,20 @@ async fn record_execution_evidence(
         ExecutionReconciliation::Drifted => "drifted",
         ExecutionReconciliation::Unknown => "unknown",
     };
+    // The revision anchor is (repo name, head sha) of the FIRST readable worktree —
+    // `source_ref` must carry the repo NAME because that is the key
+    // `current_repo_head_shas` (and therefore `commands::evidence_row_dto`'s
+    // freshness lookup) compares revisions under; an empty `source_ref` can never
+    // match, which would leave every execution row permanently `Unknown`.
+    let (anchor_repo, anchor_sha) = worktrees
+        .iter()
+        .find_map(|worktree| {
+            worktree
+                .signature
+                .as_ref()
+                .map(|sig| (worktree.repo.as_str(), sig.head_sha.as_str()))
+        })
+        .unwrap_or(("", ""));
     let payload = serde_json::json!({
         "declared": {
             "branch": direction.branch,
@@ -1856,20 +1870,19 @@ async fn record_execution_evidence(
         "result": result,
     })
     .to_string();
-    let revision = worktrees
-        .iter()
-        .find_map(|worktree| worktree.signature.as_ref().map(|sig| sig.head_sha.as_str()))
-        .unwrap_or("");
     let summary = crate::store::repo::truncate_bounded(
-        &format!(
+        &crate::store::repo::redact_secrets(&format!(
             "execution reconciliation: {result} ({} worktree(s) vs branch {:?})",
             worktrees.len(),
             direction.branch,
-        ),
+        )),
         crate::store::repo::EVIDENCE_SUMMARY_MAX_BYTES,
     );
+    // Branch names and worktree paths are arbitrary user/CLI-supplied text —
+    // redact the payload too, honoring the entity doc's "applied at every
+    // write site" invariant (defense-in-depth, same as the summary).
     let payload = crate::store::repo::truncate_bounded(
-        &payload,
+        &crate::store::repo::redact_secrets(&payload),
         crate::store::repo::EVIDENCE_PAYLOAD_MAX_BYTES,
     );
     let collection_state = if reconciliation == ExecutionReconciliation::Unknown {
@@ -1884,8 +1897,8 @@ async fn record_execution_evidence(
             direction_id: direction.id,
             kind: crate::store::repo::EVIDENCE_KIND_EXECUTION,
             source: "reconciliation",
-            source_ref: "",
-            revision,
+            source_ref: anchor_repo,
+            revision: anchor_sha,
             policy_revision: "",
             summary: &summary,
             payload: &payload,
@@ -3502,7 +3515,11 @@ async fn resolve_pending_lanes(
 }
 
 /// Collect live storage/process facts, then run the pure aggregation. This
-/// function performs no writes and deliberately reuses the existing local
+/// function never mutates readiness-relevant state — verdicts stay derived,
+/// not stored — but the `RunAllowed` path DOES append best-effort evidence
+/// rows (issue #174: execution reconciliation in `collect_lane`, check
+/// reports at the check-flight publish point); an evidence write failure
+/// never fails the collection. It deliberately reuses the existing local
 /// check runner and host parsers rather than inventing parallel semantics.
 pub async fn collect(
     db: &Db,

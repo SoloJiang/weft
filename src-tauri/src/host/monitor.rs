@@ -160,13 +160,19 @@ async fn apply_probe_result(
             // announce state the DB never accepted — the same "claiming
             // something we could not confirm" this whole feature exists to
             // stop. Found in self-review, not by a reviewer.
-            if fail_count.is_some() && changed {
-                emit_pr_changed(app, pr);
-                // Evidence write site 3 (issue #174 R1-04): only on a
-                // PERSISTED, CHANGED snapshot — same gate as the emit above.
-                // An unchanged sweep would dedupe to a no-op at
-                // `repo::append_evidence` anyway; skipping the call here also
-                // avoids a write-transaction on every routine sweep.
+            if fail_count.is_some() {
+                if changed {
+                    emit_pr_changed(app, pr);
+                }
+                // Evidence write site 3 (issue #174 R1-04): on EVERY
+                // PERSISTED successful sweep, changed or not — an unchanged
+                // snapshot dedupes at `repo::append_evidence` to a bare
+                // `observed_at` refresh (no new row), which is what keeps a
+                // STABLE open PR's host evidence reading Fresh ("just
+                // re-confirmed") instead of decaying to Stale after 3 quiet
+                // sweeps. The frontend emit above still fires only on real
+                // change. The extra write per sweep is one tiny UPDATE, on a
+                // path that already rewrites the snapshot row every sweep.
                 record_host_success_evidence(db, pr, snapshot, &readiness).await;
             }
         }
@@ -252,8 +258,10 @@ async fn record_host_success_evidence(
         &crate::store::repo::redact_secrets(&summary),
         crate::store::repo::EVIDENCE_SUMMARY_MAX_BYTES,
     );
+    // Same redaction as the summary: axis strings and refs are host-supplied
+    // text, and the entity doc promises redaction at EVERY write site.
     let payload = crate::store::repo::truncate_bounded(
-        &payload,
+        &crate::store::repo::redact_secrets(&payload),
         crate::store::repo::EVIDENCE_PAYLOAD_MAX_BYTES,
     );
     if let Err(error) = repo::append_evidence(

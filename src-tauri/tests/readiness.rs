@@ -1732,6 +1732,30 @@ async fn branch_switch_produces_drifted_execution_evidence() {
     // overwritten by a LATER CLI-reported success — appending, not editing
     // in place, is what makes that possible.
     assert_eq!(row.superseded_by, 0, "the drift row is still the current fact");
+
+    // The freshness anchor: `source_ref` carries the worktree repo NAME whose
+    // head sha is the row's `revision`, and it must resolve against the same
+    // map the `list_evidence` command builds — an unanchored ("") execution
+    // row could never match and would read Unknown forever.
+    assert!(
+        !row.source_ref.is_empty(),
+        "execution evidence must anchor the probed repo's name"
+    );
+    let current = weft::readiness::current_repo_head_shas(&fixture.db, fixture.direction_id)
+        .await
+        .expect("current head shas");
+    let current_revision = current.get(&row.source_ref).map(String::as_str);
+    assert_eq!(
+        weft::store::repo::evidence_freshness(
+            row,
+            current_revision,
+            0, // `now` only matters for host-kind rows; execution is revision-anchored
+            weft::store::repo::evidence_host_max_age_secs(),
+        ),
+        weft::store::repo::EvidenceFreshness::Fresh,
+        "a just-recorded execution observation at the current HEAD is Fresh — the drift \
+         verdict is bad news, but the OBSERVATION itself is current"
+    );
 }
 
 #[tokio::test]
