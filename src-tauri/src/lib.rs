@@ -11,6 +11,10 @@ mod adapters;
 mod attention;
 pub mod ask;
 mod auth_persist;
+/// AuthorityPolicy (issue #172): the single Lane/CLI-permission judgment —
+/// `allowed_by_policy` | `needs_gate` | `denied` — versioned independently of
+/// the dynamic scope it judges. See the module doc for the full picture.
+pub mod authority;
 pub mod backup;
 mod brief;
 pub mod bus;
@@ -305,6 +309,13 @@ pub fn run() {
             commands::preview_brief,
             commands::verify_direction,
             commands::list_evidence,
+            commands::get_authority_policy,
+            commands::list_authority_policy_revisions,
+            commands::set_authority_policy,
+            commands::revoke_authority_policy,
+            commands::list_lane_gates,
+            commands::resolve_lane_gate,
+            commands::list_plan_revisions,
             commands::create_direction,
             commands::list_worktrees,
             commands::list_worktree_files,
