@@ -1,9 +1,9 @@
 //! All DB reads/writes go through here. Keeps SeaORM specifics out of commands.
 
 use super::entities::{
-    app_setting, code_checkpoint, direction, direction_dependency, human_card_terminal_outbox,
-    human_request, im_route, lead_hidden_delivery, lead_message, plan, pull_request,
-    repo_action_execution, repo_profile, repo_ref, session,
+    app_setting, code_checkpoint, direction, direction_dependency, evidence,
+    human_card_terminal_outbox, human_request, im_route, lead_hidden_delivery, lead_message, plan,
+    pull_request, repo_action_execution, repo_profile, repo_ref, session,
     skill_enable, skill_source, test_plan, thread, workspace, worktree,
 };
 use super::Db;
@@ -4718,6 +4718,16 @@ async fn delete_thread_cascade_with_action_cleanups(
         .filter(pull_request::Column::ThreadId.eq(thread_id))
         .exec(&txn)
         .await?;
+    // Evidence rows are keyed by thread and carry real (if redacted+bounded)
+    // issue content — check output tails, PR state, decision summaries. Same
+    // contract as every other table in this sweep: deleted-issue content must
+    // not linger in weft.db and backups. (Surviving a deleted LANE is by
+    // design — `list_evidence`'s doc — but the issue itself dying takes its
+    // whole ledger with it.)
+    evidence::Entity::delete_many()
+        .filter(evidence::Column::ThreadId.eq(thread_id))
+        .exec(&txn)
+        .await?;
     repo_action_execution::Entity::delete_many()
         .filter(repo_action_execution::Column::ThreadId.eq(thread_id))
         .filter(repo_action_execution::Column::Status.ne(REPO_ACTION_CLEANUP_PENDING))
@@ -8371,6 +8381,387 @@ pub async fn mark_pull_request_probe_error(db: &Db, id: i32, message: &str) -> R
     a.probe_fail_count = Set(next_fail_count);
     a.update(&db.0).await?;
     Ok(Some(next_fail_count))
+}
+
+// ---------------------------------------------------------------------------
+// Evidence ledger (issue #174 R1-04): minimal append-only account tying a
+// Lane's write basis, verification result, and revision together. See
+// `store::entities::evidence` for the column-by-column rationale.
+// ---------------------------------------------------------------------------
+
+pub const EVIDENCE_KIND_CODE: &str = "code";
+pub const EVIDENCE_KIND_VERIFICATION: &str = "verification";
+pub const EVIDENCE_KIND_INTERFACE: &str = "interface";
+pub const EVIDENCE_KIND_HOST: &str = "host";
+pub const EVIDENCE_KIND_EXECUTION: &str = "execution";
+pub const EVIDENCE_KIND_DECISION: &str = "decision";
+pub const EVIDENCE_KIND_HANDOFF: &str = "handoff";
+
+const EVIDENCE_KINDS: &[&str] = &[
+    EVIDENCE_KIND_CODE,
+    EVIDENCE_KIND_VERIFICATION,
+    EVIDENCE_KIND_INTERFACE,
+    EVIDENCE_KIND_HOST,
+    EVIDENCE_KIND_EXECUTION,
+    EVIDENCE_KIND_DECISION,
+    EVIDENCE_KIND_HANDOFF,
+];
+
+/// Kinds whose freshness is judged by comparing `revision` against the
+/// current git HEAD (or plan version) rather than a time-based TTL. `code`
+/// and `interface` have no producer yet (issue #174's minimal write-site set
+/// does not include them — see the PR description), but are included here so
+/// a future producer's rows are judged correctly without touching this
+/// function again.
+const EVIDENCE_REVISION_ANCHORED_KINDS: &[&str] = &[
+    EVIDENCE_KIND_CODE,
+    EVIDENCE_KIND_VERIFICATION,
+    EVIDENCE_KIND_EXECUTION,
+    EVIDENCE_KIND_INTERFACE,
+];
+
+pub const EVIDENCE_COLLECTION_OK: &str = "ok";
+pub const EVIDENCE_COLLECTION_UNKNOWN: &str = "unknown";
+
+pub const EVIDENCE_SUMMARY_MAX_BYTES: usize = 4 * 1024;
+pub const EVIDENCE_PAYLOAD_MAX_BYTES: usize = 8 * 1024;
+
+const TRUNCATION_MARKER: &str = "…truncated";
+
+/// Truncate `input` to at most `max_bytes` UTF-8 bytes, appending an explicit
+/// marker so a reader can never mistake a truncated summary/payload for a
+/// short-but-complete one (issue #174: "大日志截断...测试"). A no-op when
+/// `input` already fits.
+pub fn truncate_bounded(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    let budget = max_bytes.saturating_sub(TRUNCATION_MARKER.len());
+    let mut cut = budget.min(input.len());
+    while cut > 0 && !input.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{}", &input[..cut], TRUNCATION_MARKER)
+}
+
+const SECRET_TOKEN_PREFIXES: &[&str] = &["ghp_", "github_pat_", "sk-", "AKIA"];
+const REDACTED_SECRET: &str = "[redacted]";
+const REDACTED_CREDENTIALS: &str = "[redacted]";
+const BEARER_PREFIX_LEN: usize = "bearer ".len();
+
+fn is_secret_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
+}
+
+fn token_run_len(input: &str) -> usize {
+    input
+        .char_indices()
+        .take_while(|(_, c)| is_secret_token_char(*c))
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0)
+}
+
+/// A `scheme://user:pass@` prefix at the start of `input`, if present.
+/// Returns the byte length of the matched span (through the `@`, inclusive).
+fn basic_auth_url_span(input: &str) -> Option<usize> {
+    let scheme_end = input.find("://")?;
+    if scheme_end == 0
+        || !input[..scheme_end]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-')
+    {
+        return None;
+    }
+    let after_scheme = scheme_end + 3;
+    let rest = &input[after_scheme..];
+    let at = rest.find('@')?;
+    let credentials = &rest[..at];
+    if credentials.is_empty() || credentials.contains('/') || !credentials.contains(':') {
+        return None;
+    }
+    Some(after_scheme + at + 1)
+}
+
+/// A `bearer <token>` scheme (case-insensitive) at the start of `input`, if
+/// present. Returns the byte length of the matched span including the token.
+/// `str::get` (not a direct slice) for the prefix probe: byte offset 7 can
+/// fall INSIDE a multibyte char (any CJK text reaches here — the caller scans
+/// every non-word position), and a direct `input[..7]` would panic on it.
+/// A prefix that isn't valid ASCII "bearer " is never a match anyway.
+fn bearer_token_span(input: &str) -> Option<usize> {
+    let prefix = input.get(..BEARER_PREFIX_LEN)?;
+    if !prefix.eq_ignore_ascii_case("bearer ") {
+        return None;
+    }
+    let token_len = token_run_len(&input[BEARER_PREFIX_LEN..]);
+    if token_len == 0 {
+        return None;
+    }
+    Some(BEARER_PREFIX_LEN + token_len)
+}
+
+fn matching_secret_prefix(input: &str) -> Option<usize> {
+    SECRET_TOKEN_PREFIXES
+        .iter()
+        .find(|prefix| input.starts_with(**prefix))
+        .map(|prefix| prefix.len())
+}
+
+/// Mask common secret shapes before evidence text is persisted: bearer
+/// tokens, `ghp_`/`github_pat_` GitHub tokens, `sk-`-style API keys, `AKIA`
+/// AWS access key ids, and `scheme://user:pass@host` basic-auth URLs.
+/// Prefix-based matches (everything except the basic-auth URL) only fire at a
+/// word boundary, so ordinary prose like "risk-averse" or "desk-top" is left
+/// alone. Best-effort and intentionally simple (no regex dependency) — this
+/// is defense-in-depth over already-bounded text, not a security boundary on
+/// its own.
+pub fn redact_secrets(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    let mut prev_is_word = false;
+    while i < input.len() {
+        let rest = &input[i..];
+        if let Some(span) = basic_auth_url_span(rest) {
+            let scheme_end = rest.find("://").map(|v| v + 3).unwrap_or(0);
+            out.push_str(&rest[..scheme_end]);
+            out.push_str(REDACTED_CREDENTIALS);
+            out.push('@');
+            i += span;
+            prev_is_word = false;
+            continue;
+        }
+        if !prev_is_word {
+            if let Some(span) = bearer_token_span(rest) {
+                out.push_str(&rest[..BEARER_PREFIX_LEN]);
+                out.push_str(REDACTED_SECRET);
+                i += span;
+                prev_is_word = false;
+                continue;
+            }
+            if let Some(prefix_len) = matching_secret_prefix(rest) {
+                let token_len = token_run_len(&rest[prefix_len..]);
+                out.push_str(REDACTED_SECRET);
+                i += prefix_len + token_len;
+                prev_is_word = false;
+                continue;
+            }
+        }
+        let ch = rest.chars().next().unwrap_or('\u{0}');
+        out.push(ch);
+        prev_is_word = is_secret_token_char(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// One evidence write. The caller is responsible for bounding/redacting
+/// `summary`/`payload` first (`truncate_bounded` + `redact_secrets`) — this
+/// function does not re-apply either, so a call site that forgets cannot be
+/// silently "fixed" here and mask the bug.
+pub struct EvidenceWrite<'a> {
+    pub thread_id: i32,
+    pub direction_id: i32,
+    pub kind: &'a str,
+    pub source: &'a str,
+    pub source_ref: &'a str,
+    pub revision: &'a str,
+    pub policy_revision: &'a str,
+    pub summary: &'a str,
+    pub payload: &'a str,
+    pub collection_state: &'a str,
+}
+
+/// Append one evidence row, superseding the previous latest non-superseded
+/// row with the same (thread_id, direction_id, kind, source, source_ref)
+/// identity in the same transaction. When the new observation's
+/// revision/policy_revision/summary/payload/collection_state are IDENTICAL to
+/// that latest row, no new row is inserted — issue #174 asks write sites to
+/// "dedupe to avoid spam... append only when content/result actually
+/// changed" — but the existing row's `observed_at` IS refreshed to now:
+/// re-observing identical content is still a fresh observation, and without
+/// the bump a STABLE host fact re-confirmed every sweep would decay to
+/// `Stale` after 3 quiet sweeps (the TTL would measure "time since the
+/// content last CHANGED", the opposite of what "recently confirmed" means).
+pub async fn append_evidence(db: &Db, write: EvidenceWrite<'_>) -> Result<evidence::Model> {
+    if write.thread_id <= 0 {
+        anyhow::bail!("evidence requires a valid thread_id");
+    }
+    if !EVIDENCE_KINDS.contains(&write.kind) {
+        anyhow::bail!("unknown evidence kind {:?}", write.kind);
+    }
+    if write.source.trim().is_empty() {
+        anyhow::bail!("evidence requires a non-empty source");
+    }
+    if !matches!(
+        write.collection_state,
+        EVIDENCE_COLLECTION_OK | EVIDENCE_COLLECTION_UNKNOWN
+    ) {
+        anyhow::bail!(
+            "unknown evidence collection_state {:?}",
+            write.collection_state
+        );
+    }
+    let txn = db.0.begin().await?;
+    let latest = evidence::Entity::find()
+        .filter(evidence::Column::ThreadId.eq(write.thread_id))
+        .filter(evidence::Column::DirectionId.eq(write.direction_id))
+        .filter(evidence::Column::Kind.eq(write.kind))
+        .filter(evidence::Column::Source.eq(write.source))
+        .filter(evidence::Column::SourceRef.eq(write.source_ref))
+        .filter(evidence::Column::SupersededBy.eq(0))
+        .order_by_desc(evidence::Column::Id)
+        .one(&txn)
+        .await?;
+    if let Some(existing) = &latest {
+        if existing.revision == write.revision
+            && existing.policy_revision == write.policy_revision
+            && existing.summary == write.summary
+            && existing.payload == write.payload
+            && existing.collection_state == write.collection_state
+        {
+            let mut refresh: evidence::ActiveModel = existing.clone().into();
+            refresh.observed_at = Set(now());
+            let row = refresh.update(&txn).await?;
+            txn.commit().await?;
+            return Ok(row);
+        }
+    }
+    let timestamp = now();
+    let inserted = evidence::Entity::insert(evidence::ActiveModel {
+        id: NotSet,
+        thread_id: Set(write.thread_id),
+        direction_id: Set(write.direction_id),
+        kind: Set(write.kind.to_string()),
+        source: Set(write.source.to_string()),
+        source_ref: Set(write.source_ref.to_string()),
+        observed_at: Set(timestamp.clone()),
+        revision: Set(write.revision.to_string()),
+        policy_revision: Set(write.policy_revision.to_string()),
+        summary: Set(write.summary.to_string()),
+        payload: Set(write.payload.to_string()),
+        collection_state: Set(write.collection_state.to_string()),
+        superseded_by: Set(0),
+        created_at: Set(timestamp),
+    })
+    .exec(&txn)
+    .await?;
+    let new_id = inserted.last_insert_id;
+    if let Some(existing) = latest {
+        let mut a: evidence::ActiveModel = existing.into();
+        a.superseded_by = Set(new_id);
+        a.update(&txn).await?;
+    }
+    let row = evidence::Entity::find_by_id(new_id)
+        .one(&txn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("evidence row disappeared after insert"))?;
+    txn.commit().await?;
+    Ok(row)
+}
+
+/// Newest-first bounded page of evidence for a thread, optionally scoped to
+/// one Lane (`direction_id`; `None` = every row for the thread, issue-level
+/// and every Lane). Deliberately does NOT filter out superseded rows — the
+/// append-only history (including a drift row a later success superseded) is
+/// the point; `superseded_by` tells the reader which rows are stale.
+/// Tolerates a `direction_id` that no longer names a live Lane (deleted
+/// direction): evidence survives Lane removal by design, so this never joins
+/// against `direction` and can never fail on a dangling reference.
+pub async fn list_evidence(
+    db: &Db,
+    thread_id: i32,
+    direction_id: Option<i32>,
+    limit: u64,
+) -> Result<Vec<evidence::Model>> {
+    let mut query = evidence::Entity::find()
+        .filter(evidence::Column::ThreadId.eq(thread_id))
+        .order_by_desc(evidence::Column::Id)
+        .limit(limit.clamp(1, 500));
+    if let Some(direction_id) = direction_id {
+        query = query.filter(evidence::Column::DirectionId.eq(direction_id));
+    }
+    Ok(query.all(&db.0).await?)
+}
+
+/// `fresh | stale | unknown` for one evidence row, judged at read time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceFreshness {
+    Fresh,
+    Stale,
+    Unknown,
+}
+
+/// Mirrors `readiness`'s `3 * WEFT_PR_SWEEP_SECS` open-PR-snapshot TTL
+/// formula (its `PR_OPEN_SNAPSHOT_TTL_SWEEPS`), kept as an independent copy
+/// here rather than imported — `store` must not depend on `readiness` (the
+/// dependency already runs the other way). `None` means host polling is
+/// disabled entirely (`WEFT_PR_SWEEP_SECS=0`), so no host evidence row can
+/// ever be considered fresh.
+pub fn evidence_host_max_age_secs() -> Option<i64> {
+    let sweep_secs = crate::commands::env_secs("WEFT_PR_SWEEP_SECS", 60);
+    if sweep_secs == 0 {
+        return None;
+    }
+    Some(sweep_secs.saturating_mul(3).min(i64::MAX as u64) as i64)
+}
+
+/// The pure stale/supersede/unknown truth table (issue #174): unit-tested
+/// exhaustively in `tests` below.
+///
+/// - `collection_state == "unknown"` (a failed pull) always wins: `Unknown`.
+/// - a superseded row (`superseded_by != 0`) is always `Stale`.
+/// - a revision-anchored kind (`code`/`verification`/`execution`/`interface`)
+///   with an empty own `revision`, or no comparable `current_revision`
+///   supplied by the caller, is fail-closed `Unknown` rather than guessed as
+///   either `Fresh` or `Stale` — mirroring `readiness.rs`'s fail-closed
+///   pattern for evidence the collector could not actually sample.
+/// - a revision-anchored kind whose `revision` differs from `current_revision`
+///   is `Stale`.
+/// - a `host` kind row is judged by `observed_at` age against
+///   `host_max_age_secs` (`None` = polling disabled = always `Unknown`); an
+///   unparsable `observed_at` is `Unknown`.
+/// - anything else (decision/handoff, or a revision-anchored/host row that
+///   passed its check) is `Fresh`.
+pub fn evidence_freshness(
+    row: &evidence::Model,
+    current_revision: Option<&str>,
+    now_secs: i64,
+    host_max_age_secs: Option<i64>,
+) -> EvidenceFreshness {
+    if row.collection_state == EVIDENCE_COLLECTION_UNKNOWN {
+        return EvidenceFreshness::Unknown;
+    }
+    if row.superseded_by != 0 {
+        return EvidenceFreshness::Stale;
+    }
+    if EVIDENCE_REVISION_ANCHORED_KINDS.contains(&row.kind.as_str()) {
+        let row_revision = row.revision.trim();
+        if row_revision.is_empty() {
+            return EvidenceFreshness::Unknown;
+        }
+        match current_revision.map(str::trim) {
+            None => return EvidenceFreshness::Unknown,
+            Some("") => return EvidenceFreshness::Unknown,
+            Some(current) if current != row_revision => return EvidenceFreshness::Stale,
+            Some(_) => {}
+        }
+    }
+    if row.kind == EVIDENCE_KIND_HOST {
+        let Some(max_age) = host_max_age_secs else {
+            return EvidenceFreshness::Unknown;
+        };
+        match row.observed_at.trim().parse::<i64>() {
+            Ok(observed) => {
+                if now_secs.saturating_sub(observed) > max_age {
+                    return EvidenceFreshness::Stale;
+                }
+            }
+            Err(_) => return EvidenceFreshness::Unknown,
+        }
+    }
+    EvidenceFreshness::Fresh
 }
 
 #[cfg(test)]
@@ -16713,5 +17104,510 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Evidence ledger (issue #174 R1-04)
+    // -----------------------------------------------------------------
+
+    fn base_evidence_row(kind: &str) -> evidence::Model {
+        evidence::Model {
+            id: 1,
+            thread_id: 1,
+            direction_id: 1,
+            kind: kind.to_string(),
+            source: "test".to_string(),
+            source_ref: String::new(),
+            observed_at: "1000".to_string(),
+            revision: "sha1".to_string(),
+            policy_revision: String::new(),
+            summary: String::new(),
+            payload: String::new(),
+            collection_state: EVIDENCE_COLLECTION_OK.to_string(),
+            superseded_by: 0,
+            created_at: "1000".to_string(),
+        }
+    }
+
+    #[test]
+    fn truncate_bounded_leaves_short_text_untouched() {
+        assert_eq!(truncate_bounded("hello", 100), "hello");
+    }
+
+    #[test]
+    fn truncate_bounded_appends_marker_and_respects_the_byte_budget() {
+        let long = "a".repeat(5000);
+        let out = truncate_bounded(&long, 100);
+        assert!(out.len() <= 100, "output must respect the byte budget: {}", out.len());
+        assert!(out.ends_with(TRUNCATION_MARKER), "must carry the explicit truncation marker");
+        assert_ne!(out, long);
+    }
+
+    #[test]
+    fn truncate_bounded_never_splits_a_multibyte_char() {
+        let text = "证".repeat(2000); // 3 bytes per char
+        let out = truncate_bounded(&text, 50);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        assert!(out.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn redact_secrets_masks_bearer_tokens_case_insensitively_and_keeps_the_scheme_word() {
+        let out = redact_secrets("Authorization: Bearer abcDEF123.token-x");
+        assert!(out.contains("[redacted]"), "{out}");
+        assert!(!out.contains("abcDEF123"), "{out}");
+        assert!(out.contains("Bearer "), "keeps the original-case scheme word: {out}");
+
+        let out2 = redact_secrets("authorization: bearer abcDEF123");
+        assert!(!out2.contains("abcDEF123"), "{out2}");
+    }
+
+    #[test]
+    fn redact_secrets_masks_github_tokens() {
+        let ghp = redact_secrets("token=ghp_1234567890abcdefghijklmnopqrstuvwxyz");
+        assert!(ghp.contains("[redacted]"), "{ghp}");
+        assert!(!ghp.contains("1234567890"), "{ghp}");
+
+        let pat = redact_secrets("using github_pat_11ABCDEFG_xyz for auth");
+        assert!(pat.contains("[redacted]"), "{pat}");
+        assert!(!pat.contains("11ABCDEFG"), "{pat}");
+    }
+
+    #[test]
+    fn redact_secrets_masks_sk_style_keys_and_aws_access_key_ids() {
+        let sk = redact_secrets("key sk-proj-abcXYZ123");
+        assert!(!sk.contains("abcXYZ123"), "{sk}");
+
+        let akia = redact_secrets("id AKIAABCDEFGHIJKLMNOP in the log");
+        assert!(!akia.contains("AKIAABCDEFGHIJKLMNOP"), "{akia}");
+        assert!(akia.contains("[redacted]"), "{akia}");
+    }
+
+    #[test]
+    fn redact_secrets_masks_basic_auth_urls_but_keeps_scheme_and_host() {
+        let out = redact_secrets("clone via https://user:s3cr3t@github.com/acme/widgets.git");
+        assert!(out.contains("https://[redacted]@github.com"), "{out}");
+        assert!(!out.contains("s3cr3t"), "{out}");
+        assert!(!out.contains("user:"), "{out}");
+    }
+
+    #[test]
+    fn redact_secrets_does_not_misfire_on_ordinary_prose_word_boundaries() {
+        let text = "desk-top and risk-averse plans, ask-first policy";
+        assert_eq!(redact_secrets(text), text);
+    }
+
+    #[test]
+    fn evidence_freshness_collection_unknown_wins_over_every_other_signal() {
+        let mut row = base_evidence_row(EVIDENCE_KIND_VERIFICATION);
+        row.collection_state = EVIDENCE_COLLECTION_UNKNOWN.to_string();
+        row.superseded_by = 7; // even a superseded+unknown row reports unknown first
+        assert_eq!(
+            evidence_freshness(&row, Some("sha1"), 1000, Some(180)),
+            EvidenceFreshness::Unknown
+        );
+    }
+
+    #[test]
+    fn evidence_freshness_superseded_row_is_always_stale() {
+        let mut row = base_evidence_row(EVIDENCE_KIND_DECISION);
+        row.superseded_by = 9;
+        assert_eq!(evidence_freshness(&row, None, 1000, None), EvidenceFreshness::Stale);
+    }
+
+    #[test]
+    fn evidence_freshness_revision_anchored_kind_with_empty_own_revision_is_unknown() {
+        let mut row = base_evidence_row(EVIDENCE_KIND_EXECUTION);
+        row.revision = String::new();
+        assert_eq!(
+            evidence_freshness(&row, Some("sha1"), 1000, None),
+            EvidenceFreshness::Unknown
+        );
+    }
+
+    #[test]
+    fn evidence_freshness_revision_anchored_kind_with_no_comparable_current_revision_is_unknown() {
+        let row = base_evidence_row(EVIDENCE_KIND_VERIFICATION);
+        assert_eq!(evidence_freshness(&row, None, 1000, None), EvidenceFreshness::Unknown);
+        assert_eq!(evidence_freshness(&row, Some(""), 1000, None), EvidenceFreshness::Unknown);
+    }
+
+    #[test]
+    fn evidence_freshness_revision_anchored_kind_is_stale_on_mismatch_fresh_on_match() {
+        let row = base_evidence_row(EVIDENCE_KIND_CODE);
+        assert_eq!(
+            evidence_freshness(&row, Some("sha2"), 1000, None),
+            EvidenceFreshness::Stale,
+            "commit changed under this evidence — the acceptance criterion"
+        );
+        assert_eq!(evidence_freshness(&row, Some("sha1"), 1000, None), EvidenceFreshness::Fresh);
+    }
+
+    #[test]
+    fn evidence_freshness_interface_kind_is_also_revision_anchored() {
+        let row = base_evidence_row(EVIDENCE_KIND_INTERFACE);
+        assert_eq!(
+            evidence_freshness(&row, Some("sha2"), 1000, None),
+            EvidenceFreshness::Stale
+        );
+    }
+
+    #[test]
+    fn evidence_freshness_host_kind_ignores_revision_and_uses_the_ttl() {
+        let mut row = base_evidence_row(EVIDENCE_KIND_HOST);
+        row.revision = "irrelevant-to-host-freshness".to_string();
+        row.observed_at = "1000".to_string();
+        assert_eq!(
+            evidence_freshness(&row, Some("does-not-matter"), 1100, Some(180)),
+            EvidenceFreshness::Fresh,
+            "within the TTL window"
+        );
+        assert_eq!(
+            evidence_freshness(&row, None, 1400, Some(180)),
+            EvidenceFreshness::Stale,
+            "older than 3x the sweep TTL"
+        );
+    }
+
+    #[test]
+    fn evidence_freshness_host_kind_is_unknown_when_polling_disabled_or_unparsable() {
+        let mut row = base_evidence_row(EVIDENCE_KIND_HOST);
+        assert_eq!(
+            evidence_freshness(&row, None, 1000, None),
+            EvidenceFreshness::Unknown,
+            "WEFT_PR_SWEEP_SECS=0 disables host polling entirely"
+        );
+        row.observed_at = "not-a-number".to_string();
+        assert_eq!(
+            evidence_freshness(&row, None, 1000, Some(180)),
+            EvidenceFreshness::Unknown
+        );
+    }
+
+    #[test]
+    fn evidence_freshness_decision_and_handoff_kinds_ignore_revision_entirely() {
+        let mut decision = base_evidence_row(EVIDENCE_KIND_DECISION);
+        decision.revision = String::new();
+        assert_eq!(evidence_freshness(&decision, None, 1000, None), EvidenceFreshness::Fresh);
+
+        let mut handoff = base_evidence_row(EVIDENCE_KIND_HANDOFF);
+        handoff.revision = "whatever".to_string();
+        assert_eq!(
+            evidence_freshness(&handoff, Some("something-else"), 1000, None),
+            EvidenceFreshness::Fresh
+        );
+    }
+
+    async fn evidence_test_thread(db: &Db) -> i32 {
+        let ws = create_workspace(db, "evidence-ws").await.unwrap();
+        let thread = create_thread(db, ws.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        thread.id
+    }
+
+    #[tokio::test]
+    async fn append_evidence_rejects_an_unknown_kind_or_collection_state() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let thread_id = evidence_test_thread(&db).await;
+        let bad_kind = append_evidence(
+            &db,
+            EvidenceWrite {
+                thread_id,
+                direction_id: 0,
+                kind: "not-a-real-kind",
+                source: "test",
+                source_ref: "",
+                revision: "",
+                policy_revision: "",
+                summary: "",
+                payload: "",
+                collection_state: EVIDENCE_COLLECTION_OK,
+            },
+        )
+        .await;
+        assert!(bad_kind.is_err());
+
+        let bad_state = append_evidence(
+            &db,
+            EvidenceWrite {
+                thread_id,
+                direction_id: 0,
+                kind: EVIDENCE_KIND_HOST,
+                source: "test",
+                source_ref: "",
+                revision: "",
+                policy_revision: "",
+                summary: "",
+                payload: "",
+                collection_state: "not-ok-and-not-unknown",
+            },
+        )
+        .await;
+        assert!(bad_state.is_err());
+    }
+
+    #[tokio::test]
+    async fn append_evidence_supersedes_the_previous_latest_row_for_the_same_identity() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let thread_id = evidence_test_thread(&db).await;
+        let first = append_evidence(
+            &db,
+            EvidenceWrite {
+                thread_id,
+                direction_id: 5,
+                kind: EVIDENCE_KIND_EXECUTION,
+                source: "reconciliation",
+                source_ref: "",
+                revision: "sha1",
+                policy_revision: "",
+                summary: "matched",
+                payload: r#"{"result":"matched"}"#,
+                collection_state: EVIDENCE_COLLECTION_OK,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.superseded_by, 0);
+
+        let second = append_evidence(
+            &db,
+            EvidenceWrite {
+                thread_id,
+                direction_id: 5,
+                kind: EVIDENCE_KIND_EXECUTION,
+                source: "reconciliation",
+                source_ref: "",
+                revision: "sha2",
+                policy_revision: "",
+                summary: "drifted",
+                payload: r#"{"result":"drifted"}"#,
+                collection_state: EVIDENCE_COLLECTION_OK,
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(second.id, first.id);
+        assert_eq!(second.superseded_by, 0);
+
+        // The FIRST (now-superseded) row must survive, unchanged in content,
+        // with its supersede pointer set — this is the acceptance criterion:
+        // a drift row is never overwritten by a later success, only
+        // superseded and kept in the history.
+        let reloaded_first = evidence::Entity::find_by_id(first.id)
+            .one(&db.0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded_first.superseded_by, second.id);
+        assert_eq!(reloaded_first.summary, "matched");
+    }
+
+    #[tokio::test]
+    async fn append_evidence_dedupes_identical_content_but_refreshes_observed_at() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let thread_id = evidence_test_thread(&db).await;
+        let write = || EvidenceWrite {
+            thread_id,
+            direction_id: 3,
+            kind: EVIDENCE_KIND_VERIFICATION,
+            source: "check_flight",
+            source_ref: "widgets",
+            revision: "sha1",
+            policy_revision: "",
+            summary: "2/2 checks passed",
+            payload: "{}",
+            collection_state: EVIDENCE_COLLECTION_OK,
+        };
+        let first = append_evidence(&db, write()).await.unwrap();
+        // Backdate the stored row so the refresh is observable at the clock's
+        // one-second string granularity.
+        let mut backdate: evidence::ActiveModel = first.clone().into();
+        backdate.observed_at = Set("1000".to_string());
+        backdate.update(&db.0).await.unwrap();
+
+        let second = append_evidence(&db, write()).await.unwrap();
+        assert_eq!(first.id, second.id, "identical content must not append a new row");
+        assert_ne!(
+            second.observed_at, "1000",
+            "an identical re-observation must refresh observed_at — a stable fact \
+             re-confirmed every sweep must not decay to Stale"
+        );
+
+        let rows = list_evidence(&db, thread_id, Some(3), 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// `redact_secrets` runs its scanners at every non-word position, so any
+    /// multibyte text (CJK summaries, error messages) exercises the prefix
+    /// probes at offsets that fall inside a character — those probes must
+    /// decline, not panic (the pre-fix `input[..7]` slice did).
+    #[test]
+    fn redact_secrets_handles_multibyte_text_without_panicking() {
+        assert_eq!(redact_secrets("验证通过"), "验证通过");
+        assert_eq!(redact_secrets("检查失败：退出码 1"), "检查失败：退出码 1");
+        assert_eq!(
+            redact_secrets("凭据 bearer abc123 已泄露"),
+            "凭据 bearer [redacted] 已泄露",
+            "a real bearer token after CJK text is still redacted"
+        );
+        assert_eq!(
+            redact_secrets("构建日志包含 ghp_ABCdef123 一枚"),
+            "构建日志包含 [redacted] 一枚",
+            "a GitHub token between CJK words is still redacted"
+        );
+    }
+
+    /// Deleting an ISSUE takes its whole evidence ledger with it — same
+    /// deleted-content contract as every other thread-owned table in the
+    /// cascade. (A deleted LANE keeping its evidence is separate, by design.)
+    #[tokio::test]
+    async fn delete_thread_cascade_removes_evidence_rows() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let thread_id = evidence_test_thread(&db).await;
+        append_evidence(
+            &db,
+            EvidenceWrite {
+                thread_id,
+                direction_id: 0,
+                kind: EVIDENCE_KIND_HOST,
+                source: "host_monitor",
+                source_ref: "https://example.com/pr/1",
+                revision: "sha1",
+                policy_revision: "",
+                summary: "ci green",
+                payload: "{}",
+                collection_state: EVIDENCE_COLLECTION_OK,
+            },
+        )
+        .await
+        .unwrap();
+
+        delete_thread_cascade(&db, thread_id).await.unwrap();
+
+        assert!(
+            evidence::Entity::find().all(&db.0).await.unwrap().is_empty(),
+            "no evidence row may outlive its issue"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_evidence_identity_includes_source_ref_so_sibling_repos_do_not_cross_supersede()
+    {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let thread_id = evidence_test_thread(&db).await;
+        let api_row = append_evidence(
+            &db,
+            EvidenceWrite {
+                thread_id,
+                direction_id: 4,
+                kind: EVIDENCE_KIND_VERIFICATION,
+                source: "check_flight",
+                source_ref: "api",
+                revision: "sha1",
+                policy_revision: "",
+                summary: "api checks",
+                payload: "{}",
+                collection_state: EVIDENCE_COLLECTION_OK,
+            },
+        )
+        .await
+        .unwrap();
+        let web_row = append_evidence(
+            &db,
+            EvidenceWrite {
+                thread_id,
+                direction_id: 4,
+                kind: EVIDENCE_KIND_VERIFICATION,
+                source: "check_flight",
+                source_ref: "web",
+                revision: "sha1",
+                policy_revision: "",
+                summary: "web checks",
+                payload: "{}",
+                collection_state: EVIDENCE_COLLECTION_OK,
+            },
+        )
+        .await
+        .unwrap();
+        let reloaded_api = evidence::Entity::find_by_id(api_row.id)
+            .one(&db.0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reloaded_api.superseded_by, 0,
+            "a different repo's verification row must not supersede this one"
+        );
+        assert_ne!(api_row.id, web_row.id);
+    }
+
+    #[tokio::test]
+    async fn list_evidence_is_newest_first_bounded_and_scopable_by_direction() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let thread_id = evidence_test_thread(&db).await;
+        for (direction_id, source_ref) in [(1, "a"), (2, "b"), (1, "c")] {
+            append_evidence(
+                &db,
+                EvidenceWrite {
+                    thread_id,
+                    direction_id,
+                    kind: EVIDENCE_KIND_HOST,
+                    source: "host_monitor",
+                    source_ref,
+                    revision: "",
+                    policy_revision: "",
+                    summary: "",
+                    payload: "",
+                    collection_state: EVIDENCE_COLLECTION_OK,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let all = list_evidence(&db, thread_id, None, 10).await.unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(
+            all.windows(2).all(|w| w[0].id > w[1].id),
+            "newest first: {all:?}"
+        );
+
+        let lane_one = list_evidence(&db, thread_id, Some(1), 10).await.unwrap();
+        assert_eq!(lane_one.len(), 2);
+        assert!(lane_one.iter().all(|row| row.direction_id == 1));
+
+        let bounded = list_evidence(&db, thread_id, None, 1).await.unwrap();
+        assert_eq!(bounded.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_evidence_tolerates_a_direction_id_with_no_matching_lane() {
+        // Deletion policy: evidence survives Lane removal. `list_evidence`
+        // never joins against `direction`, so a `direction_id` naming a Lane
+        // that was deleted (or never existed) is not an error — the caller
+        // gets its historical rows back, not a crash or an empty-because-
+        // dangling-reference silent drop.
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let thread_id = evidence_test_thread(&db).await;
+        append_evidence(
+            &db,
+            EvidenceWrite {
+                thread_id,
+                direction_id: 12345,
+                kind: EVIDENCE_KIND_EXECUTION,
+                source: "reconciliation",
+                source_ref: "",
+                revision: "sha1",
+                policy_revision: "",
+                summary: "matched",
+                payload: "{}",
+                collection_state: EVIDENCE_COLLECTION_OK,
+            },
+        )
+        .await
+        .unwrap();
+        let rows = list_evidence(&db, thread_id, Some(12345), 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].direction_id, 12345);
     }
 }

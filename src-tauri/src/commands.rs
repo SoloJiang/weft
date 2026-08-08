@@ -2833,7 +2833,50 @@ async fn confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sess
     )
     .await?;
     asks.grant_read_only_issue(thread_id);
+    // Evidence write site 4 (issue #174 R1-04): this is the ONLY production
+    // path that materializes a Lane decision today — `planner::
+    // approve_direction`/`deny_direction` also record decision evidence
+    // (for future per-lane UI/bus wiring) but neither is currently called
+    // from a tauri command or bus tool. `confirm` only ever dispatches
+    // AllowedByPolicy lanes (see `readiness::proposal_lane_policy`'s
+    // Confirmed-phase rule), so every id here gets that verdict.
+    record_confirm_decision_evidence(db, thread_id, &ids).await;
     Ok(ids)
+}
+
+async fn record_confirm_decision_evidence(db: &Db, thread_id: i32, direction_ids: &[i32]) {
+    if direction_ids.is_empty() {
+        return;
+    }
+    let policy_revision = crate::store::repo::get_plan(db, thread_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|plan| plan.created_at)
+        .unwrap_or_default();
+    for &direction_id in direction_ids {
+        let summary = "lane decision: allowed_by_policy".to_string();
+        let payload = serde_json::json!({ "policy": "allowed_by_policy" }).to_string();
+        if let Err(error) = crate::store::repo::append_evidence(
+            db,
+            crate::store::repo::EvidenceWrite {
+                thread_id,
+                direction_id,
+                kind: crate::store::repo::EVIDENCE_KIND_DECISION,
+                source: "planner",
+                source_ref: &format!("confirm_proposal:{thread_id}"),
+                revision: "",
+                policy_revision: &policy_revision,
+                summary: &summary,
+                payload: &payload,
+                collection_state: crate::store::repo::EVIDENCE_COLLECTION_OK,
+            },
+        )
+        .await
+        {
+            eprintln!("[weft][evidence] decision evidence for direction {direction_id}: {error}");
+        }
+    }
 }
 
 /// Confirm the stored proposal: create its directions + materialize worktrees.
@@ -2879,6 +2922,100 @@ pub async fn verify_direction(db: State<'_, Db>, direction_id: i32) -> R<Vec<Rep
     crate::readiness::verify_direction(&db, direction_id)
         .await
         .map_err(e)
+}
+
+/// One evidence row plus its read-time freshness (issue #174 R1-04). Mirrors
+/// `store::entities::evidence::Model` field-for-field, with `freshness`
+/// appended.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct EvidenceRowDto {
+    pub id: i32,
+    pub thread_id: i32,
+    pub direction_id: i32,
+    pub kind: String,
+    pub source: String,
+    pub source_ref: String,
+    pub observed_at: String,
+    pub revision: String,
+    pub policy_revision: String,
+    pub summary: String,
+    pub payload: String,
+    pub collection_state: String,
+    pub superseded_by: i32,
+    pub freshness: crate::store::repo::EvidenceFreshness,
+}
+
+fn evidence_row_dto(
+    row: crate::store::entities::evidence::Model,
+    current_revisions: &std::collections::HashMap<String, String>,
+    now_secs: i64,
+    host_max_age_secs: Option<i64>,
+) -> EvidenceRowDto {
+    let current_revision = current_revisions.get(&row.source_ref).map(String::as_str);
+    let freshness = crate::store::repo::evidence_freshness(
+        &row,
+        current_revision,
+        now_secs,
+        host_max_age_secs,
+    );
+    EvidenceRowDto {
+        id: row.id,
+        thread_id: row.thread_id,
+        direction_id: row.direction_id,
+        kind: row.kind,
+        source: row.source,
+        source_ref: row.source_ref,
+        observed_at: row.observed_at,
+        revision: row.revision,
+        policy_revision: row.policy_revision,
+        summary: row.summary,
+        payload: row.payload,
+        collection_state: row.collection_state,
+        superseded_by: row.superseded_by,
+        freshness,
+    }
+}
+
+/// Newest-first bounded page of a thread's evidence ledger (issue #174
+/// R1-04), optionally scoped to one Lane. `direction_id = Some(0)` is
+/// issue-level evidence (unbound PR rows, issue-wide asks); `None` returns
+/// every row for the thread. When `direction_id` names a live Lane (non-zero,
+/// still resolvable), this does ONE bounded live Git-signature probe of its
+/// registered worktrees to judge revision-anchored freshness — the same
+/// explicit, user-triggered trust tier as `verify_direction`, never run from
+/// a passive poller. A deleted Lane (dangling `direction_id`) or issue-level
+/// scope simply skips the probe: revision-anchored rows then read `unknown`
+/// rather than erroring.
+#[tauri::command]
+pub async fn list_evidence(
+    db: State<'_, Db>,
+    thread_id: i32,
+    direction_id: Option<i32>,
+    limit: Option<u32>,
+) -> R<Vec<EvidenceRowDto>> {
+    let rows = crate::store::repo::list_evidence(
+        &db,
+        thread_id,
+        direction_id,
+        u64::from(limit.unwrap_or(50)),
+    )
+    .await
+    .map_err(e)?;
+    let current_revisions = match direction_id {
+        Some(id) if id != 0 => crate::readiness::current_repo_head_shas(&db, id)
+            .await
+            .unwrap_or_default(),
+        _ => std::collections::HashMap::new(),
+    };
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let host_max_age_secs = crate::store::repo::evidence_host_max_age_secs();
+    Ok(rows
+        .into_iter()
+        .map(|row| evidence_row_dto(row, &current_revisions, now_secs, host_max_age_secs))
+        .collect())
 }
 
 // The built-in review-agent rung is gone: review now runs as the user's global

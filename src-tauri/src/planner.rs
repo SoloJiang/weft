@@ -2187,8 +2187,11 @@ pub async fn approve_direction_with_pin(
     index: usize,
     manual_tool: Option<&str>,
 ) -> Result<i32> {
-    approve_direction_with_pin_with_session_liveness(db, thread_id, index, manual_tool, None)
-        .await
+    let direction_id =
+        approve_direction_with_pin_with_session_liveness(db, thread_id, index, manual_tool, None)
+            .await?;
+    record_decision_evidence_for_approval(db, thread_id, index, direction_id).await;
+    Ok(direction_id)
 }
 
 /// Runtime-aware counterpart of [`approve_direction_with_pin`]. A live worker
@@ -2201,14 +2204,86 @@ pub async fn approve_direction_with_pin_and_live_sessions(
     manual_tool: Option<&str>,
     is_session_live: &(dyn Fn(i32) -> bool + Send + Sync),
 ) -> Result<i32> {
-    approve_direction_with_pin_with_session_liveness(
+    let direction_id = approve_direction_with_pin_with_session_liveness(
         db,
         thread_id,
         index,
         manual_tool,
         Some(is_session_live),
     )
+    .await?;
+    record_decision_evidence_for_approval(db, thread_id, index, direction_id).await;
+    Ok(direction_id)
+}
+
+/// Evidence write site 4 (issue #174 R1-04), approval half. Best-effort and
+/// deliberately outside `_with_session_liveness`'s own `thread_gate` hold —
+/// touching that function's many return paths (idempotent re-approve, R44-3
+/// ownership reclaim, etc.) to thread a policy_revision out was judged too
+/// risky for what is a best-effort ledger write; the tiny window where a
+/// concurrent re-propose lands between materialize and this read means the
+/// recorded `policy_revision` is "the plan version as of just after
+/// approval" rather than a byte-exact "as of the approval itself" — adequate
+/// for a first Evidence ledger, not a correctness-critical value.
+async fn record_decision_evidence_for_approval(
+    db: &Db,
+    thread_id: i32,
+    index: usize,
+    direction_id: i32,
+) {
+    let policy_revision = repo::get_plan(db, thread_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|plan| plan.created_at)
+        .unwrap_or_default();
+    record_decision_evidence(
+        db,
+        thread_id,
+        direction_id,
+        &format!("approve_direction:{thread_id}:{index}"),
+        "allowed_by_policy",
+        &policy_revision,
+    )
+    .await;
+}
+
+/// Append `decision` evidence (issue #174 R1-04): the settled Lane policy
+/// decision plus the plan's OCC version (`plan.created_at`) as
+/// `policy_revision`. Issue #172 will replace this with a real
+/// `AuthorityPolicy` revision; the column's shape (an opaque revision string)
+/// is deliberately left compatible with that migration rather than inventing
+/// a richer structure now. Best-effort: a failed evidence write must never
+/// fail the decision itself.
+async fn record_decision_evidence(
+    db: &Db,
+    thread_id: i32,
+    direction_id: i32,
+    source_ref: &str,
+    policy: &str,
+    policy_revision: &str,
+) {
+    let summary = format!("lane decision: {policy}");
+    let payload = serde_json::json!({ "policy": policy }).to_string();
+    if let Err(error) = crate::store::repo::append_evidence(
+        db,
+        crate::store::repo::EvidenceWrite {
+            thread_id,
+            direction_id,
+            kind: crate::store::repo::EVIDENCE_KIND_DECISION,
+            source: "planner",
+            source_ref,
+            revision: "",
+            policy_revision,
+            summary: &summary,
+            payload: &payload,
+            collection_state: crate::store::repo::EVIDENCE_COLLECTION_OK,
+        },
+    )
     .await
+    {
+        eprintln!("[weft][evidence] decision evidence for direction {direction_id}: {error}");
+    }
 }
 
 async fn approve_direction_with_pin_with_session_liveness(
@@ -2601,12 +2676,29 @@ pub async fn deny_direction(db: &Db, thread_id: i32, index: usize) -> Result<(St
         .ok_or_else(|| anyhow::anyhow!("write trigger {index} out of range"))?;
     pd.decision = "denied".to_string();
     let info = (pd.name.clone(), pd.repo.clone());
+    // `direction_id == 0` when this lane was never materialized (a pending
+    // proposal denied outright) — evidence's own "0 = issue-level" convention
+    // already covers that case, same as an unbound PR row.
+    let direction_id = pd.direction_id;
     persist_decision(db, thread_id, &proposal, &plan).await?;
     // A deny can be the event that makes ANOTHER lane's depends_on resolve to the
     // deny-sentinel (Codex review, PR #159 planner.rs:1534) — must run regardless of
     // whether this is the proposal's last undecided lane.
     resolve_and_record_upstream_edges(db, thread_id, &proposal, &plan.proposal).await;
     auto_settle_if_fully_decided(db, thread_id, &proposal, &plan.proposal).await;
+    // Evidence write site 4 (issue #174 R1-04), denial half. `plan.created_at`
+    // here is the version this decision was actually evaluated against (read
+    // before this function's own mutation), unlike the approval half's
+    // necessarily-post-hoc read — see `record_decision_evidence_for_approval`.
+    record_decision_evidence(
+        db,
+        thread_id,
+        direction_id,
+        &format!("deny_direction:{thread_id}:{index}"),
+        "denied",
+        &plan.created_at,
+    )
+    .await;
     Ok(info)
 }
 

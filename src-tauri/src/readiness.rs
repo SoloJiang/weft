@@ -1753,6 +1753,27 @@ async fn probe_worktrees_for_direction(
     futures::future::join_all(probes).await.into_iter().collect()
 }
 
+/// Best-effort current HEAD sha per repo name for a direction's registered
+/// worktrees, keyed the same way evidence rows key their `source_ref` for
+/// revision-anchored kinds (`record_verification_evidence`'s repo name). Used
+/// ONLY by the explicit `list_evidence` read command (issue #174 R1-04) to
+/// judge freshness — an explicit, bounded, user-triggered read, the same
+/// trust tier as `verify_direction`. Never called from a passive/background
+/// poller. A repo whose probe failed is simply absent from the map, which
+/// `store::repo::evidence_freshness` already treats as `Unknown` (fail-closed)
+/// for any revision-anchored row it can't compare.
+pub async fn current_repo_head_shas(
+    db: &Db,
+    direction_id: i32,
+) -> Result<HashMap<String, String>> {
+    let git_probe = GitSignatureProbe::readiness();
+    let worktrees = probe_worktrees_for_direction(db, direction_id, &git_probe).await?;
+    Ok(worktrees
+        .into_iter()
+        .filter_map(|worktree| worktree.signature.map(|sig| (worktree.repo, sig.head_sha)))
+        .collect())
+}
+
 fn reconciliation_for(
     direction: &direction::Model,
     worktrees: &[ProbedWorktree],
@@ -1782,6 +1803,110 @@ fn reconciliation_for(
         return ExecutionReconciliation::Unknown;
     }
     ExecutionReconciliation::Matched
+}
+
+/// Append `execution` evidence (issue #174 R1-04): the Lane's declared branch
+/// plus its registered worktree paths against the actually-probed
+/// branch/head/dirty facts, and the resulting `matched | drifted | unknown`
+/// verdict. Append-only + supersede means a drift row recorded here is never
+/// overwritten by a LATER CLI-reported success — a fresh `matched`
+/// observation appends a NEW row and supersedes the old one, but the drift
+/// row itself stays in the history (the issue's acceptance criterion).
+/// `collection_state` is `unknown` whenever reconciliation itself resolved to
+/// `Unknown` (an unreadable worktree, or an ambiguous zero-worktree state at
+/// this call site — the caller already skips the true zero-worktree case).
+async fn record_execution_evidence(
+    db: &Db,
+    direction: &direction::Model,
+    worktrees: &[ProbedWorktree],
+    reconciliation: ExecutionReconciliation,
+) -> Result<()> {
+    let observed: Vec<serde_json::Value> = worktrees
+        .iter()
+        .map(|worktree| match &worktree.signature {
+            Some(signature) => serde_json::json!({
+                "repo": worktree.repo,
+                "path": worktree.stored_path,
+                "branch": signature.branch,
+                "head_sha": signature.head_sha,
+                "dirty": signature.dirty,
+                "readable": true,
+            }),
+            None => serde_json::json!({
+                "repo": worktree.repo,
+                "path": worktree.stored_path,
+                "readable": false,
+            }),
+        })
+        .collect();
+    let result = match reconciliation {
+        ExecutionReconciliation::Matched => "matched",
+        ExecutionReconciliation::Drifted => "drifted",
+        ExecutionReconciliation::Unknown => "unknown",
+    };
+    // The revision anchor is (repo name, head sha) of the FIRST readable worktree —
+    // `source_ref` must carry the repo NAME because that is the key
+    // `current_repo_head_shas` (and therefore `commands::evidence_row_dto`'s
+    // freshness lookup) compares revisions under; an empty `source_ref` can never
+    // match, which would leave every execution row permanently `Unknown`.
+    let (anchor_repo, anchor_sha) = worktrees
+        .iter()
+        .find_map(|worktree| {
+            worktree
+                .signature
+                .as_ref()
+                .map(|sig| (worktree.repo.as_str(), sig.head_sha.as_str()))
+        })
+        .unwrap_or(("", ""));
+    let payload = serde_json::json!({
+        "declared": {
+            "branch": direction.branch,
+            "worktrees": worktrees.iter().map(|worktree| serde_json::json!({
+                "repo": worktree.repo,
+                "path": worktree.stored_path,
+            })).collect::<Vec<_>>(),
+        },
+        "observed": observed,
+        "result": result,
+    })
+    .to_string();
+    let summary = crate::store::repo::truncate_bounded(
+        &crate::store::repo::redact_secrets(&format!(
+            "execution reconciliation: {result} ({} worktree(s) vs branch {:?})",
+            worktrees.len(),
+            direction.branch,
+        )),
+        crate::store::repo::EVIDENCE_SUMMARY_MAX_BYTES,
+    );
+    // Branch names and worktree paths are arbitrary user/CLI-supplied text —
+    // redact the payload too, honoring the entity doc's "applied at every
+    // write site" invariant (defense-in-depth, same as the summary).
+    let payload = crate::store::repo::truncate_bounded(
+        &crate::store::repo::redact_secrets(&payload),
+        crate::store::repo::EVIDENCE_PAYLOAD_MAX_BYTES,
+    );
+    let collection_state = if reconciliation == ExecutionReconciliation::Unknown {
+        crate::store::repo::EVIDENCE_COLLECTION_UNKNOWN
+    } else {
+        crate::store::repo::EVIDENCE_COLLECTION_OK
+    };
+    repo::append_evidence(
+        db,
+        crate::store::repo::EvidenceWrite {
+            thread_id: direction.thread_id,
+            direction_id: direction.id,
+            kind: crate::store::repo::EVIDENCE_KIND_EXECUTION,
+            source: "reconciliation",
+            source_ref: anchor_repo,
+            revision: anchor_sha,
+            policy_revision: "",
+            summary: &summary,
+            payload: &payload,
+            collection_state,
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 fn check_targets_for_worktrees(worktrees: &[ProbedWorktree]) -> Option<Vec<CheckTarget>> {
@@ -2945,7 +3070,27 @@ async fn run_shared_verification(
             direction_id,
             targets,
             |targets| async move {
-                run_verification_checks(targets, READINESS_CHECK_TIMEOUT).await
+                // Evidence write site 1 (issue #174 R1-04): this closure is the
+                // check flight's actual RUNNER — `get_or_run_report_with_
+                // admission_and_post_targets` only calls it on the leader path
+                // after a cache miss, i.e. exactly once per freshly-produced
+                // report (`CheckFlightLeader::finish`'s single publish point
+                // for fresh evidence). A cache hit or a follower join returns
+                // an already-recorded report and writes nothing new here —
+                // dedup at the storage layer (`repo::append_evidence`) would
+                // make a redundant write harmless anyway, but skipping it also
+                // avoids a write-transaction on every readiness poll.
+                let evidence_targets = targets.clone();
+                let report = run_verification_checks(targets, READINESS_CHECK_TIMEOUT).await?;
+                if let Err(error) =
+                    record_verification_evidence(db, direction_id, &evidence_targets, &report)
+                        .await
+                {
+                    eprintln!(
+                        "[weft][evidence] verification evidence for direction {direction_id}: {error}"
+                    );
+                }
+                Ok(report)
             },
             move |_| async move {
                 verification_targets_for_direction(db, direction_id, &admission_probe, purpose)
@@ -2956,6 +3101,82 @@ async fn run_shared_verification(
             },
         )
         .await
+}
+
+/// Append `verification` evidence for each repo's fresh check report. Best
+/// effort: called only from the check flight's fresh-runner path (see
+/// `run_shared_verification`), and a failure here must never fail
+/// verification itself — the caller logs and continues.
+async fn record_verification_evidence(
+    db: &Db,
+    direction_id: i32,
+    targets: &[CheckTarget],
+    report: &VerificationReport,
+) -> Result<()> {
+    if report.repo_checks.is_empty() {
+        return Ok(());
+    }
+    let Some(direction) = repo::get_direction(db, direction_id).await? else {
+        // The Lane was deleted between admission and publish — evidence
+        // survives Lane removal by design, but there is nothing new to
+        // attribute to a direction_id that no longer exists.
+        return Ok(());
+    };
+    let revision_by_repo: HashMap<&str, &str> = targets
+        .iter()
+        .map(|target| (target.repo.as_str(), target.head_sha.as_str()))
+        .collect();
+    for rc in &report.repo_checks {
+        let revision = revision_by_repo
+            .get(rc.repo.as_str())
+            .copied()
+            .unwrap_or("");
+        let summary = if rc.checks.is_empty() {
+            "no checks were produced".to_string()
+        } else {
+            let passed = rc.checks.iter().filter(|c| c.status == "pass").count();
+            let names: Vec<&str> = rc.checks.iter().map(|c| c.name.as_str()).collect();
+            format!(
+                "{passed}/{} checks passed: {}",
+                rc.checks.len(),
+                names.join(", ")
+            )
+        };
+        let payload = serde_json::json!({
+            "checks": rc.checks.iter().map(|c| serde_json::json!({
+                "name": c.name,
+                "status": c.status,
+                "code": c.code,
+                "output_tail": crate::store::repo::redact_secrets(&c.output_tail),
+            })).collect::<Vec<_>>(),
+        })
+        .to_string();
+        let summary = crate::store::repo::truncate_bounded(
+            &crate::store::repo::redact_secrets(&summary),
+            crate::store::repo::EVIDENCE_SUMMARY_MAX_BYTES,
+        );
+        let payload = crate::store::repo::truncate_bounded(
+            &payload,
+            crate::store::repo::EVIDENCE_PAYLOAD_MAX_BYTES,
+        );
+        repo::append_evidence(
+            db,
+            crate::store::repo::EvidenceWrite {
+                thread_id: direction.thread_id,
+                direction_id,
+                kind: crate::store::repo::EVIDENCE_KIND_VERIFICATION,
+                source: "check_flight",
+                source_ref: &rc.repo,
+                revision,
+                policy_revision: "",
+                summary: &summary,
+                payload: &payload,
+                collection_state: crate::store::repo::EVIDENCE_COLLECTION_OK,
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn checks_for(
@@ -3191,6 +3412,21 @@ async fn collect_lane(
 
     let worktrees = probe_worktrees_for_direction(db, direction.id, git_probe).await?;
     facts.reconciliation = reconciliation_for(direction, &worktrees);
+    // Evidence write site 2 (issue #174 R1-04). Only reached on the
+    // `RunAllowed` path (`CachedOnly` already returned above without
+    // probing) — the CachedOnly global/tool status reader stays read-only in
+    // the stronger sense this module's doc describes, same as it never
+    // starts a Git signature probe. Best-effort: never fails collection.
+    if !worktrees.is_empty() {
+        if let Err(error) =
+            record_execution_evidence(db, direction, &worktrees, facts.reconciliation).await
+        {
+            eprintln!(
+                "[weft][evidence] execution evidence for direction {}: {error}",
+                direction.id
+            );
+        }
+    }
     // Keep collection's cost aligned with `lane_readiness` first-match order.
     // Once a human-action, active-worker, all-clear terminal merge, or drift
     // gate decides the outcome, starting a build/test process cannot add useful
@@ -3279,7 +3515,11 @@ async fn resolve_pending_lanes(
 }
 
 /// Collect live storage/process facts, then run the pure aggregation. This
-/// function performs no writes and deliberately reuses the existing local
+/// function never mutates readiness-relevant state — verdicts stay derived,
+/// not stored — but the `RunAllowed` path DOES append best-effort evidence
+/// rows (issue #174: execution reconciliation in `collect_lane`, check
+/// reports at the check-flight publish point); an evidence write failure
+/// never fails the collection. It deliberately reuses the existing local
 /// check runner and host parsers rather than inventing parallel semantics.
 pub async fn collect(
     db: &Db,

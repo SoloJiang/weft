@@ -3,6 +3,7 @@ pub mod backup_config;
 pub mod code_checkpoint;
 pub mod direction;
 pub mod direction_dependency;
+pub mod evidence;
 pub mod human_card_terminal_outbox;
 pub mod human_request;
 pub mod im_route;

@@ -304,6 +304,7 @@ pub fn run() {
             commands::confirm_proposal,
             commands::preview_brief,
             commands::verify_direction,
+            commands::list_evidence,
             commands::create_direction,
             commands::list_worktrees,
             commands::list_worktree_files,

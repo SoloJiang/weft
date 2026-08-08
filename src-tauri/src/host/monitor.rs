@@ -160,8 +160,20 @@ async fn apply_probe_result(
             // announce state the DB never accepted — the same "claiming
             // something we could not confirm" this whole feature exists to
             // stop. Found in self-review, not by a reviewer.
-            if fail_count.is_some() && changed {
-                emit_pr_changed(app, pr);
+            if fail_count.is_some() {
+                if changed {
+                    emit_pr_changed(app, pr);
+                }
+                // Evidence write site 3 (issue #174 R1-04): on EVERY
+                // PERSISTED successful sweep, changed or not — an unchanged
+                // snapshot dedupes at `repo::append_evidence` to a bare
+                // `observed_at` refresh (no new row), which is what keeps a
+                // STABLE open PR's host evidence reading Fresh ("just
+                // re-confirmed") instead of decaying to Stale after 3 quiet
+                // sweeps. The frontend emit above still fires only on real
+                // change. The extra write per sweep is one tiny UPDATE, on a
+                // path that already rewrites the snapshot row every sweep.
+                record_host_success_evidence(db, pr, snapshot, &readiness).await;
             }
         }
         Err(e) => {
@@ -172,6 +184,10 @@ async fn apply_probe_result(
                     None
                 }
             };
+            // A failed pull must never be read back as success: record it as
+            // `collection_state = "unknown"` evidence rather than silently
+            // reusing the last-known snapshot's axes.
+            record_host_failure_evidence(db, pr, &e.message()).await;
             emit_pr_changed(app, pr);
             if repo::get_pull_request(db, pr.id)
                 .await
@@ -194,6 +210,114 @@ fn emit_pr_changed(app: &AppHandle, pr: &pull_request::Model) {
             "direction_id": pr.direction_id,
         }),
     );
+}
+
+/// A bounded pointer to this tracked PR/MR for evidence's `source_ref`: the
+/// PR URL when known, else an owner/repo#number fallback so a row is never
+/// left unreferenced.
+fn host_evidence_source_ref(pr: &pull_request::Model) -> String {
+    if pr.url.trim().is_empty() {
+        format!("{}/{}#{}", pr.host_owner, pr.host_repo, pr.number)
+    } else {
+        pr.url.clone()
+    }
+}
+
+/// Append `host` evidence (issue #174 R1-04) for a freshly fetched, changed
+/// snapshot: the PR URL as `source_ref`, a compact axis summary, and the
+/// fresh `head_sha` as `revision`. Best-effort — an evidence write failure
+/// must never fail the sweep itself.
+async fn record_host_success_evidence(
+    db: &Db,
+    pr: &pull_request::Model,
+    snapshot: &PrSnapshot,
+    readiness: &MergeReadiness,
+) {
+    let source_ref = host_evidence_source_ref(pr);
+    let summary = format!(
+        "lifecycle={:?} ci={:?} review={:?} threads={:?} conflict={:?} merge_readiness={:?}",
+        snapshot.lifecycle,
+        snapshot.ci,
+        snapshot.review,
+        snapshot.threads,
+        snapshot.conflict,
+        readiness,
+    );
+    let payload = serde_json::json!({
+        "head_sha": snapshot.head_sha,
+        "base_ref": snapshot.base_ref,
+        "lifecycle": serde_json::to_value(&snapshot.lifecycle).unwrap_or(serde_json::Value::Null),
+        "ci": serde_json::to_value(&snapshot.ci).unwrap_or(serde_json::Value::Null),
+        "review": serde_json::to_value(&snapshot.review).unwrap_or(serde_json::Value::Null),
+        "threads": serde_json::to_value(&snapshot.threads).unwrap_or(serde_json::Value::Null),
+        "conflict": serde_json::to_value(&snapshot.conflict).unwrap_or(serde_json::Value::Null),
+        "merge_readiness": serde_json::to_value(readiness).unwrap_or(serde_json::Value::Null),
+    })
+    .to_string();
+    let summary = crate::store::repo::truncate_bounded(
+        &crate::store::repo::redact_secrets(&summary),
+        crate::store::repo::EVIDENCE_SUMMARY_MAX_BYTES,
+    );
+    // Same redaction as the summary: axis strings and refs are host-supplied
+    // text, and the entity doc promises redaction at EVERY write site.
+    let payload = crate::store::repo::truncate_bounded(
+        &crate::store::repo::redact_secrets(&payload),
+        crate::store::repo::EVIDENCE_PAYLOAD_MAX_BYTES,
+    );
+    if let Err(error) = repo::append_evidence(
+        db,
+        crate::store::repo::EvidenceWrite {
+            thread_id: pr.thread_id,
+            direction_id: pr.direction_id,
+            kind: crate::store::repo::EVIDENCE_KIND_HOST,
+            source: "host_monitor",
+            source_ref: &source_ref,
+            revision: &snapshot.head_sha,
+            policy_revision: "",
+            summary: &summary,
+            payload: &payload,
+            collection_state: crate::store::repo::EVIDENCE_COLLECTION_OK,
+        },
+    )
+    .await
+    {
+        eprintln!("[weft][evidence] host evidence for pr #{}: {error}", pr.id);
+    }
+}
+
+/// Append `host` evidence for a FAILED probe: `collection_state = "unknown"`
+/// rather than silently reusing the last-known snapshot's axes as if they
+/// were fresh (issue #174's acceptance criterion — "host 拉取失败显示
+/// unknown,不沿用为成功"). Repeated identical failures dedupe to a no-op at
+/// `repo::append_evidence`'s content-equality check.
+async fn record_host_failure_evidence(db: &Db, pr: &pull_request::Model, message: &str) {
+    let source_ref = host_evidence_source_ref(pr);
+    let summary = crate::store::repo::truncate_bounded(
+        &crate::store::repo::redact_secrets(message),
+        crate::store::repo::EVIDENCE_SUMMARY_MAX_BYTES,
+    );
+    if let Err(error) = repo::append_evidence(
+        db,
+        crate::store::repo::EvidenceWrite {
+            thread_id: pr.thread_id,
+            direction_id: pr.direction_id,
+            kind: crate::store::repo::EVIDENCE_KIND_HOST,
+            source: "host_monitor",
+            source_ref: &source_ref,
+            revision: &pr.head_sha,
+            policy_revision: "",
+            summary: &summary,
+            payload: "",
+            collection_state: crate::store::repo::EVIDENCE_COLLECTION_UNKNOWN,
+        },
+    )
+    .await
+    {
+        eprintln!(
+            "[weft][evidence] host failure evidence for pr #{}: {error}",
+            pr.id
+        );
+    }
 }
 
 /// Whether a freshly fetched snapshot differs from the last stored row in any
@@ -375,4 +499,120 @@ mod tests {
         assert!(snapshot_changed(&old, &snap, &readiness, false));
     }
 
+    // -----------------------------------------------------------------
+    // Evidence write site 3 (issue #174 R1-04)
+    // -----------------------------------------------------------------
+
+    async fn evidence_test_thread(db: &Db) -> i32 {
+        let workspace = repo::create_workspace(db, "host-evidence-ws").await.unwrap();
+        let thread = repo::create_thread(db, workspace.id, "issue", "feature", "codex")
+            .await
+            .unwrap();
+        thread.id
+    }
+
+    #[tokio::test]
+    async fn record_host_success_evidence_writes_a_traceable_row_even_for_a_base_ref_that_differs_from_the_lane(
+    ) {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let thread_id = evidence_test_thread(&db).await;
+        let mut pr = base_row();
+        pr.thread_id = thread_id;
+        pr.url = "https://github.com/acme/widgets/pull/9".to_string();
+        let mut snapshot = base_snapshot();
+        snapshot.head_sha = "freshsha".to_string();
+        // The lane declared "main"; the actually-fetched PR targets a
+        // different branch — host evidence must still faithfully record what
+        // was fetched (issue #174: "错误 PR base...represented via host
+        // evidence"), not silently agree with what the lane expected.
+        snapshot.base_ref = "release/1.0".to_string();
+        let readiness = MergeReadiness::Ready;
+
+        record_host_success_evidence(&db, &pr, &snapshot, &readiness).await;
+
+        let rows = repo::list_evidence(&db, thread_id, None, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.kind, repo::EVIDENCE_KIND_HOST);
+        assert_eq!(row.source, "host_monitor");
+        assert_eq!(row.source_ref, pr.url);
+        assert_eq!(row.revision, "freshsha");
+        assert_eq!(row.collection_state, repo::EVIDENCE_COLLECTION_OK);
+        assert!(
+            row.payload.contains("release/1.0"),
+            "the actually-fetched base_ref must be traceable in evidence: {}",
+            row.payload
+        );
+    }
+
+    #[tokio::test]
+    async fn record_host_success_evidence_is_a_no_op_when_the_snapshot_is_unchanged() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let thread_id = evidence_test_thread(&db).await;
+        let mut pr = base_row();
+        pr.thread_id = thread_id;
+        let snapshot = base_snapshot();
+        let readiness = MergeReadiness::Ready;
+
+        record_host_success_evidence(&db, &pr, &snapshot, &readiness).await;
+        record_host_success_evidence(&db, &pr, &snapshot, &readiness).await;
+
+        let rows = repo::list_evidence(&db, thread_id, None, 10).await.unwrap();
+        assert_eq!(rows.len(), 1, "an identical fresh snapshot must not spam a new row");
+    }
+
+    #[tokio::test]
+    async fn record_host_failure_evidence_marks_collection_unknown_and_dedupes_identical_failures()
+    {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let thread_id = evidence_test_thread(&db).await;
+        let mut pr = base_row();
+        pr.thread_id = thread_id;
+
+        record_host_failure_evidence(&db, &pr, "gh api rate limited").await;
+        record_host_failure_evidence(&db, &pr, "gh api rate limited").await;
+        let rows = repo::list_evidence(&db, thread_id, None, 10).await.unwrap();
+        assert_eq!(rows.len(), 1, "an identical repeated failure must dedupe, not spam");
+        assert_eq!(
+            rows[0].collection_state,
+            repo::EVIDENCE_COLLECTION_UNKNOWN,
+            "a failed pull must never be recorded as a successful read (issue #174 acceptance criterion)"
+        );
+        assert!(rows[0].summary.contains("rate limited"));
+
+        // A DIFFERENT failure reason is new information — it appends a
+        // (superseding) row rather than being folded into the old one.
+        record_host_failure_evidence(&db, &pr, "auth revoked").await;
+        let rows_after_new_failure = repo::list_evidence(&db, thread_id, None, 10).await.unwrap();
+        assert_eq!(rows_after_new_failure.len(), 2);
+        assert_eq!(
+            rows_after_new_failure
+                .iter()
+                .filter(|row| row.collection_state == repo::EVIDENCE_COLLECTION_UNKNOWN)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_probe_never_overwrites_a_prior_success_as_success() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let thread_id = evidence_test_thread(&db).await;
+        let mut pr = base_row();
+        pr.thread_id = thread_id;
+        let snapshot = base_snapshot();
+
+        record_host_success_evidence(&db, &pr, &snapshot, &MergeReadiness::Ready).await;
+        record_host_failure_evidence(&db, &pr, "network unreachable").await;
+
+        let rows = repo::list_evidence(&db, thread_id, None, 10).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest-first: the failure is the latest, non-superseded row: the
+        // reader must see "unknown" as the CURRENT state, not the stale
+        // success it followed.
+        assert_eq!(rows[0].collection_state, repo::EVIDENCE_COLLECTION_UNKNOWN);
+        assert_eq!(rows[0].superseded_by, 0);
+        assert_eq!(rows[1].collection_state, repo::EVIDENCE_COLLECTION_OK);
+        assert_eq!(rows[1].superseded_by, rows[0].id);
+    }
 }
