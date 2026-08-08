@@ -27,9 +27,9 @@ mod commands_backup;
 pub mod computer;
 pub mod config;
 mod coordinator;
-mod curator;
+pub mod curator;
 mod deps_bootstrap;
-mod detect;
+pub mod detect;
 /// issue #97 额度感知:claude `rate_limit_event` / codex app-server
 /// `account/rateLimits/*` 的结构化解析结果落在这里(tool-keyed 全局快照),供
 /// Resources 面板展示与达限 fail-over 判断消费。
@@ -69,14 +69,16 @@ pub mod profile;
 /// session_gate 已有的采样,不新增采样、不碰任何安全网写路径。
 mod resource_dashboard;
 pub mod readiness;
+pub mod runtime;
 mod session_gate;
 mod session_meta;
 mod sidecar;
 pub mod skills;
 mod trail;
+pub mod ui_events;
 pub mod slug;
 pub mod store;
-mod tool_command;
+pub mod tool_command;
 mod tools;
 
 /// The bus server's base URL, e.g. "http://127.0.0.1:54321".
@@ -105,6 +107,9 @@ fn mcp_bridge_enabled() -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Mark the process before anything can consult runtime::agents_allowed().
+    runtime::set_mode(runtime::Mode::App);
+
     // Prewarm the augmented tool PATH (login-shell probe + disk cache) so the first
     // agent spawn doesn't pay the probe. This no longer mutates the global env —
     // each agent spawn passes `detect::tool_path()` per-`Command` (see detect.rs) —

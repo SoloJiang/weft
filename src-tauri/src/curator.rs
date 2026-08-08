@@ -311,10 +311,11 @@ pub async fn graph(db: &Db, workspace_id: i32) -> Result<Graph> {
 /// Schedule the one-shot legacy backfill for an upgraded workspace whose rows
 /// lack a canonical tier. Called from `graph()` so EVERY read path (the Tauri repo
 /// map AND the planner's MCP `get_repo_map`) covers it, not just the UI. No-op
-/// outside a running app (so unit tests never spawn an agent) and at most once per
+/// unless a runtime mode is installed (app or daemon — so unit tests never
+/// spawn an agent) and at most once per
 /// workspace per process (so a failed/slow analyzer can't storm).
 fn maybe_schedule_backfill(db: &Db, workspace_id: i32, nodes: &[ProfileView]) {
-    if crate::APP_HANDLE.get().is_none() {
+    if !crate::runtime::agents_allowed() {
         return;
     }
     // A node needs the agent if its tier isn't canonical — a non-empty legacy
@@ -328,7 +329,7 @@ fn maybe_schedule_backfill(db: &Db, workspace_id: i32, nodes: &[ProfileView]) {
         .any(|n| profile::normalize_tier(&n.tier).is_none());
     if needs_backfill && try_claim_backfill(workspace_id) {
         let db = db.clone();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             // Auto pass (fires on graph reads) → not forced, not cancellable.
             analyze_workspace_coalesced(&db, workspace_id, false).await;
         });
@@ -1278,10 +1279,7 @@ fn try_claim_backfill(workspace_id: i32) -> bool {
 /// Nudge any open repo map to reload so background-inferred classifications and
 /// edges appear without a manual refresh.
 fn emit_graph_updated(workspace_id: i32) {
-    if let Some(app) = crate::APP_HANDLE.get() {
-        use tauri::Emitter;
-        let _ = app.emit("repo-graph-updated", workspace_id);
-    }
+    crate::ui_events::emit("repo-graph-updated", workspace_id);
 }
 
 // ─────────────────────── per-repo analysis run state ───────────────────────
@@ -1647,7 +1645,8 @@ fn test_pass_gate_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// Emit one analysis lifecycle/stream event for a repo so an open detail panel
-/// can render the live transcript + status. No-op outside a running app.
+/// can render the live transcript + status. No-op when no event sink is
+/// installed (tests).
 fn emit_repo_analysis(
     workspace_id: i32,
     repo_id: i32,
@@ -1655,19 +1654,16 @@ fn emit_repo_analysis(
     text: Option<&str>,
     error: Option<&str>,
 ) {
-    if let Some(app) = crate::APP_HANDLE.get() {
-        use tauri::Emitter;
-        let _ = app.emit(
-            "repo-analysis",
-            serde_json::json!({
-                "workspaceId": workspace_id,
-                "repoId": repo_id,
-                "phase": phase,
-                "text": text,
-                "error": error,
-            }),
-        );
-    }
+    crate::ui_events::emit(
+        "repo-analysis",
+        serde_json::json!({
+            "workspaceId": workspace_id,
+            "repoId": repo_id,
+            "phase": phase,
+            "text": text,
+            "error": error,
+        }),
+    );
 }
 
 /// Persist one repo's deep-pass classification: tier + stack + summary +

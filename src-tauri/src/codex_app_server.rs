@@ -849,7 +849,7 @@ impl Client {
         let (write_tx, mut write_rx) =
             mpsc::unbounded_channel::<(Vec<u8>, Option<oneshot::Sender<()>>)>();
         let client_for_writer = self.clone();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             let mut stdin = stdin;
             let fail = || async {
                 client_for_writer
@@ -887,7 +887,7 @@ impl Client {
 
         let me = self.clone();
         let read_quota_command = program.to_string();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             me.read_loop(stdout, read_quota_command).await;
         });
 
@@ -917,7 +917,7 @@ impl Client {
         // slow/unsupported endpoint can never delay the connection itself.
         let quota_probe = self.clone();
         let probe_quota_command = program.to_string();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             quota_probe
                 .refresh_quota_snapshot(&probe_quota_command)
                 .await;

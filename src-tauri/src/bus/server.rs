@@ -1407,10 +1407,7 @@ async fn calibrate_edges_tool(db: &Db, thread: i32, args: &Value) -> Value {
     match crate::store::repo::calibrate_repo_relation(db, from, to, kind, via, action).await {
         Ok(()) => {
             // Live-refresh the repo map for this curator thread's workspace.
-            if let Some(app) = crate::APP_HANDLE.get() {
-                use tauri::Emitter;
-                let _ = app.emit("repo-graph-updated", t.workspace_id);
-            }
+            crate::ui_events::emit("repo-graph-updated", t.workspace_id);
             text_result(format!(
                 "{action} {kind} edge {from}->{to} (pinned to your calibration)"
             ))
@@ -1466,10 +1463,7 @@ async fn set_classification_tool(db: &Db, thread: i32, args: &Value) -> Value {
     }
     match crate::curator::edit_profile(db, repo, None, Some(tier.as_str()), category).await {
         Ok(_) => {
-            if let Some(app) = crate::APP_HANDLE.get() {
-                use tauri::Emitter;
-                let _ = app.emit("repo-graph-updated", t.workspace_id);
-            }
+            crate::ui_events::emit("repo-graph-updated", t.workspace_id);
             let role = category.map(|c| format!("/{c}")).unwrap_or_default();
             text_result(format!(
                 "repo {repo} classified as {tier}{role} (pinned — survives re-analysis)"
@@ -1565,16 +1559,13 @@ async fn emit_proposal_row(db: &Db, thread: i32, rationale: &str, count: usize) 
     )
     .await
     {
-        if let Some(app) = crate::APP_HANDLE.get() {
-            use tauri::Emitter;
-            let _ = app.emit(
-                crate::lead_chat::engine::EVENT,
-                crate::lead_chat::engine::Push::Message {
-                    thread_id: thread,
-                    message: m,
-                },
-            );
-        }
+        crate::ui_events::emit(
+            crate::lead_chat::engine::EVENT,
+            crate::lead_chat::engine::Push::Message {
+                thread_id: thread,
+                message: m,
+            },
+        );
     }
 }
 
@@ -1728,10 +1719,22 @@ pub async fn serve(
     db: Db,
     asks: AskRegistry,
 ) -> std::io::Result<(String, tokio::task::JoinHandle<()>)> {
+    serve_on(bus, db, asks, "127.0.0.1:0").await
+}
+
+/// `serve` with an explicit bind address. The desktop app keeps the ephemeral
+/// port (`127.0.0.1:0`); weftd pins a stable one so the Codex MCP config and
+/// the Stage 3 web app can point at it across restarts.
+pub async fn serve_on(
+    bus: BusRegistry,
+    db: Db,
+    asks: AskRegistry,
+    addr: &str,
+) -> std::io::Result<(String, tokio::task::JoinHandle<()>)> {
     restore_durable_human_requests(&db, &bus)
         .await
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     let addr = listener.local_addr()?;
     let base = format!("http://127.0.0.1:{}", addr.port());
     let app = router(bus, db, asks);

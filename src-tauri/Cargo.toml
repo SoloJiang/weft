@@ -9,6 +9,10 @@ edition = "2021"
 name = "weft"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bin]]
+name = "weftd"
+path = "src/bin/weftd.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
