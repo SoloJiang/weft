@@ -3,6 +3,8 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type {
   BackupStatusDto,
   AttentionSnapshot,
+  AuthorityPolicyRevision,
+  AuthorityPolicyRules,
   BusMsg,
   ConfigItem,
   DefaultToolInfo,
@@ -14,11 +16,13 @@ import type {
   ImageAttachment,
   ImRoute,
   IssueReadinessDto,
+  LaneGate,
   LeadMessage,
   LeadStateInfo,
   LiveWorkerSlot,
   ObserveRef,
   ParsedSkill,
+  PlanRevision,
   ProcessQuotaStatus,
   Proposal,
   ReadOnlyGrants,
@@ -287,6 +291,37 @@ export const api = {
       directionId: directionId ?? null,
       limit: limit ?? null,
     }),
+
+  // AuthorityPolicy (issue #172): the workspace's active policy (or null =
+  // the hard-coded conservative default is in effect), its full revision
+  // history, and the commands that tighten/loosen/revoke it.
+  getAuthorityPolicy: (workspaceId: number) =>
+    invoke<AuthorityPolicyRevision | null>("get_authority_policy", { workspaceId }),
+  listAuthorityPolicyRevisions: (workspaceId: number) =>
+    invoke<AuthorityPolicyRevision[]>("list_authority_policy_revisions", { workspaceId }),
+  setAuthorityPolicy: (workspaceId: number, rules: AuthorityPolicyRules) =>
+    invoke<AuthorityPolicyRevision>("set_authority_policy", { workspaceId, rules }),
+  revokeAuthorityPolicy: (workspaceId: number) =>
+    invoke<void>("revoke_authority_policy", { workspaceId }),
+  // Every Lane in a thread currently blocked on a Gate, and the command that
+  // resolves one (records the decision, then re-runs materialize so an
+  // approval takes effect immediately).
+  listLaneGates: (threadId: number) => invoke<LaneGate[]>("list_lane_gates", { threadId }),
+  resolveLaneGate: (
+    directionId: number,
+    policyRevision: string,
+    decision: "approved" | "denied",
+    reason?: string,
+  ) =>
+    invoke<Worktree[]>("resolve_lane_gate", {
+      directionId,
+      policyRevision,
+      decision,
+      reason: reason ?? null,
+    }),
+  // Versioned dynamic scope (issue #172): newest-first history for a thread.
+  listPlanRevisions: (threadId: number, limit?: number) =>
+    invoke<PlanRevision[]>("list_plan_revisions", { threadId, limit: limit ?? null }),
 
   threadMessages: (threadId: number) =>
     invoke<BusMsg[]>("thread_messages", { threadId }),

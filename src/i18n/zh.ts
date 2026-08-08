@@ -299,6 +299,23 @@ export const zh = {
     engineRouteBlockedHint: "请选择手动引擎，或让一个可用的自动候选恢复后再重试。",
     planSummary: "方案摘要",
     readOnlyPropagationNote: "批准后，这些 worker 的只读检查（如 git status）也会自动放行，无需再问——随时可在看板上撤销。",
+    gate: {
+      title_other: "{{count}} 个任务待你决定",
+      hint: "策略允许的任务会自动开始，不会出现在这里——出现在这里的是命中了某条规则、需要单独决定的任务。",
+      reasonLabel: "等待原因",
+      hitRuleLabel: "命中规则：{{rule}}",
+      approve: "批准",
+      deny: "拒绝",
+      resolving: "处理中…",
+      approveFailed: "批准失败，请重试。",
+      denyFailed: "拒绝失败，请重试。",
+      reason: {
+        protected_branch: "目标是受保护分支",
+        awaiting_gate_decision: "尚无策略覆盖此任务",
+        gate_approved_override: "已针对当前策略版本批准",
+        gate_denied_override: "已针对当前策略版本拒绝",
+      },
+    },
   },
   notify: {
     needsTitle: "待你处理",

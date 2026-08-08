@@ -373,6 +373,52 @@ export interface EvidenceRow {
   freshness: EvidenceFreshness;
 }
 
+/** AuthorityPolicy rules (issue #172) — mirrors Rust `authority::PolicyRules`
+ *  field-for-field. Every field defaults to the most conservative reading. */
+export interface AuthorityPolicyRules {
+  allowed_repos: string[];
+  denied_repos: string[];
+  protected_branches: string[];
+  auto_materialize: boolean;
+  allow_actions: string[];
+  deny_actions: string[];
+}
+
+/** One AuthorityPolicy revision — mirrors Rust `commands::AuthorityPolicyDto`. */
+export interface AuthorityPolicyRevision {
+  id: number;
+  scope: string;
+  scope_id: number;
+  revision: string;
+  rules: AuthorityPolicyRules;
+  source: string;
+  created_at: string;
+  revoked_at: string;
+}
+
+/** A Lane currently blocked on a Gate — mirrors Rust `commands::LaneGateDto`. */
+export interface LaneGate {
+  direction_id: number;
+  thread_id: number;
+  name: string;
+  reason: string;
+  base_branch: string;
+  policy_revision: string;
+  verdict_reason: string;
+  hit_rule: string | null;
+  observed_at: string;
+}
+
+/** One scope revision snapshot — mirrors Rust `store::entities::plan_revision::Model`. */
+export interface PlanRevision {
+  id: number;
+  thread_id: number;
+  version: string;
+  proposal: string;
+  source: string;
+  created_at: string;
+}
+
 /** One row in a chat timeline (lead console / chat-mode workers). */
 export interface LeadMessage {
   id: number;

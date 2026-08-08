@@ -307,6 +307,24 @@ export const en = {
     planSummary: "Plan summary",
     readOnlyPropagationNote:
       "Approving also lets these workers run read-only checks (like git status) without asking — revocable anytime from the board.",
+    gate: {
+      title_one: "{{count}} task needs your decision",
+      title_other: "{{count}} tasks need your decision",
+      hint: "A policy-allowed task starts automatically with no card here — these need a specific decision because a rule flagged them.",
+      reasonLabel: "Why it's waiting",
+      hitRuleLabel: "Matched rule: {{rule}}",
+      approve: "Approve",
+      deny: "Deny",
+      resolving: "Applying…",
+      approveFailed: "Couldn't approve — try again.",
+      denyFailed: "Couldn't deny — try again.",
+      reason: {
+        protected_branch: "targets a protected branch",
+        awaiting_gate_decision: "no policy covers this yet",
+        gate_approved_override: "approved for this policy revision",
+        gate_denied_override: "denied for this policy revision",
+      },
+    },
   },
   notify: {
     needsTitle: "Needs you",

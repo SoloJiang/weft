@@ -13,6 +13,7 @@ import { PlanSummary } from "../session/blocks/PlanSummary";
 import { latestPlanCard, type ParsedPlanCard } from "../session/planCard";
 import { SCOPE_CONFIRM_DISABLED, scopeConfirmStateOf } from "./scopeConfirmState";
 import { dependsOnLabel } from "./dependsOnView";
+import { LaneGatePanel } from "./LaneGatePanel";
 
 // One sub-task lane: exactly one write repo per direction (scope rework). The
 // old read/write/none taxonomy is gone from this gate — every lane here is a
@@ -231,6 +232,11 @@ export function ScopeReview({ onClose }: { onClose: () => void }) {
               ))}
             </div>
           </div>
+
+          {/* Issue #172: Lanes a policy sent to Gate instead of auto-materializing —
+              e.g. a protected-branch target. A policy-allowed lane never appears
+              here at all; this panel renders nothing when there is nothing pending. */}
+          <LaneGatePanel threadId={activeThreadId} />
         </div>
       </div>
 
