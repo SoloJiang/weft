@@ -1,8 +1,8 @@
 use crate::store::entities::{
-    app_setting, backup_config, code_checkpoint, direction, human_card_terminal_outbox,
-    human_request, im_route, lead_hidden_delivery, lead_message, plan, pull_request,
-    repo_action_execution, repo_profile, repo_ref, session, skill_enable, skill_source, test_plan,
-    thread, workspace, worktree,
+    app_setting, backup_config, code_checkpoint, direction, direction_dependency,
+    human_card_terminal_outbox, human_request, im_route, lead_hidden_delivery, lead_message, plan,
+    pull_request, repo_action_execution, repo_profile, repo_ref, session, skill_enable,
+    skill_source, test_plan, thread, workspace, worktree,
 };
 use sea_orm::{EntityTrait, Schema};
 use sea_orm_migration::prelude::*;
@@ -66,6 +66,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0051HumanCardTerminalOutbox),
             Box::new(M0052RepoActionExecution),
             Box::new(M0053LeadHiddenDelivery),
+            Box::new(M0054DirectionDependency),
         ]
     }
 }
@@ -2466,6 +2467,141 @@ impl MigrationTrait for M0053LeadHiddenDelivery {
             .await
     }
 }
+
+/// Issue #173 (R1-03): lifts `direction.depends_on_direction_id` — a single
+/// producer→consumer slot — into a real many-to-many DAG. Each consumer
+/// Lane can now own zero to many rows here instead of exactly one implicit
+/// edge; see `direction_dependency::Model`'s doc for the row shape and
+/// `repo::set_direction_upstreams` for the sole writer.
+///
+/// `depends_on_direction_id` is NOT dropped: the ADR (issue #173 comment)
+/// keeps it as a maintained, fail-closed MIRROR column so every OLD reader
+/// (and a rollback of this feature) keeps working off the exact same
+/// semantics it always has — `0` = no upstream, a positive id = one
+/// resolved edge, `-1`/`-2` = the existing denied/unresolved sentinels.
+/// `set_direction_upstreams` is the only writer of both the new table and
+/// the mirror going forward, so the two can never drift once this migration
+/// completes.
+///
+/// The one-time data lift below runs only when `direction_dependency` is
+/// still empty (a fresh upgrade); a rerun of `up()` — this migration's own
+/// "duplicate column"-style tolerance, matching `M0046DirectionUpstream` —
+/// finds the table non-empty and skips the lift, so it can never double the
+/// same rows. Lift mapping, straight from the legacy sentinel convention:
+/// `0` → no row; a positive id → one `resolved` edge; `-1`
+/// (`DENIED_UPSTREAM_SENTINEL`) → one `denied` edge; `-2`
+/// (`UNRESOLVED_UPSTREAM_SENTINEL`) → one `unresolved` edge. A `denied`/
+/// `unresolved` row's `upstream_direction_id` is `0` ("not applicable") —
+/// the legacy column never recorded WHICH name produced the sentinel
+/// either, so there is nothing more to lift.
+///
+/// Uniqueness on `(direction_id, upstream_direction_id)` for `resolved`
+/// edges is enforced at the application layer (`set_direction_upstreams`),
+/// not by a DB index: sea-query's cross-backend `Index` builder has no
+/// portable way to scope a unique index to `state = 'resolved'` only (a
+/// SQLite partial index would work but is not expressible through the
+/// shared migration API this codebase's other tables use), so this follows
+/// the same precedent as `register_pull_request`'s app-level
+/// find-then-upsert rather than adding a raw-SQL one-off here.
+pub struct M0054DirectionDependency;
+impl MigrationName for M0054DirectionDependency {
+    fn name(&self) -> &str {
+        "m0054_direction_dependency"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0054DirectionDependency {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let schema = Schema::new(manager.get_database_backend());
+        let mut statement = schema.create_table_from_entity(direction_dependency::Entity);
+        statement.if_not_exists();
+        manager.create_table(statement).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_direction_dependency_direction")
+                    .table(Alias::new("direction_dependency"))
+                    .col(Alias::new("direction_id"))
+                    .to_owned(),
+            )
+            .await?;
+
+        let db = manager.get_connection();
+        let backend = db.get_database_backend();
+
+        // Rerun guard: a fresh table lifts once; a rerun (this migration's own
+        // "duplicate column"-style tolerance) sees existing rows and skips —
+        // never double-inserts the same legacy edge.
+        let already_lifted = db
+            .query_one(Statement::from_string(
+                backend,
+                "SELECT id FROM direction_dependency LIMIT 1".to_owned(),
+            ))
+            .await?
+            .is_some();
+        if already_lifted {
+            return Ok(());
+        }
+
+        let rows = db
+            .query_all(Statement::from_string(
+                backend,
+                "SELECT id, depends_on_direction_id FROM direction".to_owned(),
+            ))
+            .await?;
+        for row in rows {
+            let direction_id: i32 = match row.try_get("", "id") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let legacy: i32 = match row.try_get("", "depends_on_direction_id") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let (upstream_direction_id, state): (i32, &str) = match legacy {
+                0 => continue, // no upstream declared — no row to lift.
+                // DENIED_UPSTREAM_SENTINEL (repo.rs) — kept as a literal here since
+                // migrations intentionally do not depend on `store::repo`.
+                -1 => (0, "denied"),
+                // UNRESOLVED_UPSTREAM_SENTINEL (repo.rs).
+                -2 => (0, "unresolved"),
+                positive => (positive, "resolved"),
+            };
+            db.execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO direction_dependency (direction_id, upstream_direction_id, state, created_at) VALUES (?, ?, ?, ?)",
+                [
+                    direction_id.into(),
+                    upstream_direction_id.into(),
+                    state.into(),
+                    crate::store::repo::now_unix().into(),
+                ],
+            ))
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Drops the table only. `depends_on_direction_id` is untouched — it is a
+    /// maintained mirror, never solely populated by this migration, so a
+    /// rollback of the new table leaves every existing reader (which only
+    /// ever looked at the legacy column) working exactly as it did before
+    /// this feature shipped.
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("direction_dependency"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2473,6 +2609,7 @@ mod tests {
         M0046DirectionUpstream, M0047PullRequestThreadStatus, M0048HumanRequest,
         M0049HumanRequestSourceMessage, M0050HumanRequestImRoutes,
         M0051HumanCardTerminalOutbox, M0052RepoActionExecution, M0053LeadHiddenDelivery,
+        M0054DirectionDependency,
     };
 
     #[test]
@@ -3425,6 +3562,109 @@ mod tests {
         assert!(
             components.contains("\"backend\""),
             "backend tier must appear: {components}"
+        );
+    }
+
+    /// M0054 (issue #173): the DAG upgrade's own upgrade-path test — mirrors
+    /// `m0046_direction_upstream_column_defaults_existing_rows_to_zero_and_reruns_safely`'s
+    /// shape. Starts from a pre-M0054 `direction` table (the legacy single-slot
+    /// column already present, no `direction_dependency` table at all — exactly
+    /// what a real user's database looks like right before upgrading, including
+    /// rows already sitting on the `-1`/`-2` sentinels) and verifies: every legacy
+    /// value lifts to the right edge row, `0` lifts to nothing, and a RERUN does
+    /// not double the lifted rows.
+    #[tokio::test]
+    async fn m0054_direction_dependency_lifts_legacy_column_values_and_reruns_safely() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let backend = db.get_database_backend();
+        // Pre-M0054 shape: `direction` already carries the legacy single-slot
+        // column (M0046 shipped long before this migration) but no
+        // `direction_dependency` table exists yet.
+        db.execute(Statement::from_string(
+            backend,
+            "CREATE TABLE direction (id INTEGER PRIMARY KEY, name TEXT NOT NULL, \
+             depends_on_direction_id INTEGER NOT NULL DEFAULT 0)"
+                .to_owned(),
+        ))
+        .await
+        .unwrap();
+        db.execute(Statement::from_string(
+            backend,
+            "INSERT INTO direction (id, name, depends_on_direction_id) VALUES \
+             (1, 'no-upstream', 0), \
+             (2, 'producer', 0), \
+             (3, 'resolved-consumer', 2), \
+             (4, 'denied-consumer', -1), \
+             (5, 'unresolved-consumer', -2)"
+                .to_owned(),
+        ))
+        .await
+        .unwrap();
+
+        M0054DirectionDependency
+            .up(&SchemaManager::new(&db))
+            .await
+            .unwrap();
+
+        async fn edges_for(db: &sea_orm::DatabaseConnection, direction_id: i32) -> Vec<(i32, String)> {
+            let backend = db.get_database_backend();
+            db.query_all(Statement::from_string(
+                backend,
+                format!(
+                    "SELECT upstream_direction_id, state FROM direction_dependency \
+                     WHERE direction_id = {direction_id} ORDER BY id"
+                ),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                let upstream: i32 = row.try_get("", "upstream_direction_id").unwrap();
+                let state: String = row.try_get("", "state").unwrap();
+                (upstream, state)
+            })
+            .collect()
+        }
+
+        assert_eq!(
+            edges_for(&db, 1).await,
+            Vec::<(i32, String)>::new(),
+            "0 lifts to no rows — never invent a dependency"
+        );
+        assert_eq!(
+            edges_for(&db, 3).await,
+            vec![(2, "resolved".to_string())],
+            "a positive legacy value lifts to one resolved edge naming that upstream"
+        );
+        assert_eq!(
+            edges_for(&db, 4).await,
+            vec![(0, "denied".to_string())],
+            "-1 (DENIED_UPSTREAM_SENTINEL) lifts to one denied edge, upstream 0 (not applicable)"
+        );
+        assert_eq!(
+            edges_for(&db, 5).await,
+            vec![(0, "unresolved".to_string())],
+            "-2 (UNRESOLVED_UPSTREAM_SENTINEL) lifts to one unresolved edge"
+        );
+
+        // Rerun must not double the lifted rows (this migration's own
+        // "duplicate column"-style tolerance, matching M0046's rerun test).
+        M0054DirectionDependency
+            .up(&SchemaManager::new(&db))
+            .await
+            .unwrap();
+        assert_eq!(
+            edges_for(&db, 3).await,
+            vec![(2, "resolved".to_string())],
+            "a rerun must not duplicate the already-lifted edge"
+        );
+        assert_eq!(
+            edges_for(&db, 4).await.len(),
+            1,
+            "a rerun must not duplicate the already-lifted denied edge"
         );
     }
 }

@@ -22,9 +22,18 @@ pub struct Model {
     /// in Needs-you and kept for audit.
     #[sea_orm(default_value = "")]
     pub reason: String,
-    /// Another task that must be MERGED before this one is considered
-    /// mergeable — the cross-repo ordering edge (producer → consumer).
-    /// `0` = no upstream, same convention as `repo_id`.
+    /// LEGACY single-slot cross-repo ordering edge (producer → consumer). `0` = no upstream,
+    /// same convention as `repo_id`; `-1`/`-2` are the denied/unresolved sentinels (see
+    /// `store::repo::DENIED_UPSTREAM_SENTINEL` / `UNRESOLVED_UPSTREAM_SENTINEL`).
+    ///
+    /// Issue #173 (R1-03) upgraded this to a real many-to-many DAG (see
+    /// `store::entities::direction_dependency`): a Lane's real dependency set is the
+    /// `direction_dependency` rows keyed by this direction's id, not this column. This column
+    /// SURVIVES as a maintained, fail-closed MIRROR — the sole writer is
+    /// `store::repo::set_direction_upstreams` — so any old reader of this column, and a
+    /// rollback of the DAG feature, keep working off the exact same sentinel convention they
+    /// always have. Never write it directly; go through `set_direction_upstreams` (or its
+    /// single-edge compat wrapper `set_direction_upstream`).
     #[sea_orm(default_value = 0)]
     pub depends_on_direction_id: i32,
     /// Explicit engine selections are pins. Legacy rows stay pinned; a new
