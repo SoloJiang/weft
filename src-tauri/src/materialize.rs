@@ -2,6 +2,7 @@
 //! repo's local `.worktrees/weft/` directory, and record it. Reads are unmanaged
 //! (agents read real repos directly). Weft injection files stay untracked.
 
+use crate::authority;
 use crate::git;
 use crate::store::{entities, repo, Db};
 use anyhow::{Context, Result};
@@ -92,6 +93,98 @@ async fn bootstrap_worktree_deps(path: &str) {
     }
 }
 
+/// Issue #172: the ONE place `materialize_direction` decides whether it may
+/// actually WRITE a worktree — resolves the current `AuthorityPolicy` for the
+/// direction's workspace (or the hard-coded conservative default when none is
+/// configured), the current scope revision, and any recorded Gate override
+/// for this exact lane at this exact policy revision, then calls
+/// `authority::adjudicate_lane` fresh. Never caches or reuses a prior
+/// verdict — every call re-reads the CURRENT policy/scope, which is what
+/// makes a stale decision structurally impossible to act on (a materialize
+/// call made after a policy tightens always sees the tightened policy; there
+/// is no older verdict anywhere to fall back to). Every direction reaching
+/// this function already exists only because a human called confirm/approve
+/// on it (the only two writers of `direction` rows), so `human_authorized` is
+/// unconditionally `true` here — under the hard-coded default policy this
+/// makes adjudication a complete no-op (`AllowedByPolicy` every time),
+/// preserving today's confirm-gated single-repo flow exactly. Always records
+/// a `decision` Evidence row, win or lose, for the audit trail.
+async fn authorize_materialize(
+    db: &Db,
+    dir: &entities::direction::Model,
+    repo_ref: &entities::repo_ref::Model,
+    thread_workspace_id: i32,
+) -> Result<bool> {
+    let policy = match repo::get_active_authority_policy(db, "workspace", thread_workspace_id).await? {
+        Some(row) => authority::PolicySnapshot {
+            id: row.id,
+            scope: authority::PolicyScope::Workspace(thread_workspace_id),
+            revision: row.revision,
+            rules: serde_json::from_str(&row.rules).unwrap_or_default(),
+            source: row.source,
+            created_at: row.created_at,
+            revoked_at: row.revoked_at,
+        },
+        None => authority::default_policy(authority::PolicyScope::Workspace(thread_workspace_id)),
+    };
+    let scope_revision = repo::latest_plan_revision(db, dir.thread_id)
+        .await?
+        .map(|r| r.version)
+        .unwrap_or_default();
+    let gate_override = repo::get_gate_decision(db, dir.id, &policy.revision)
+        .await?
+        .map(|g| {
+            if g.decision == "approved" {
+                authority::GateOverride::Approved
+            } else {
+                authority::GateOverride::Denied
+            }
+        });
+    let lane = authority::LaneCandidate {
+        lane_id: &dir.slug,
+        repo_known: true,
+        repo_name: &repo_ref.name,
+        reason: &dir.reason,
+        base_branch: &dir.base_branch,
+        human_authorized: true,
+        human_denied: false,
+        duplicate_lane_id: false,
+        gate_override,
+    };
+    let verdict = authority::adjudicate_lane(&policy, &scope_revision, &lane);
+    let allowed = verdict.decision == authority::LaneDecision::AllowedByPolicy;
+    let summary = format!("lane decision: {:?} ({:?})", verdict.decision, verdict.reason);
+    let payload = serde_json::json!({
+        "decision": verdict.decision,
+        "reason": verdict.reason,
+        "hit_rule": verdict.hit_rule,
+    })
+    .to_string();
+    if let Err(error) = repo::append_evidence(
+        db,
+        repo::EvidenceWrite {
+            thread_id: dir.thread_id,
+            direction_id: dir.id,
+            kind: repo::EVIDENCE_KIND_DECISION,
+            source: "authority",
+            source_ref: &format!("materialize_direction:{}", dir.id),
+            revision: &scope_revision,
+            policy_revision: &verdict.policy_revision,
+            summary: &summary,
+            payload: &payload,
+            collection_state: repo::EVIDENCE_COLLECTION_OK,
+        },
+    )
+    .await
+    {
+        eprintln!(
+            "[weft][evidence] materialize decision evidence for direction {}: {error}",
+            dir.id
+        );
+    }
+    Ok(allowed)
+}
+
 pub async fn materialize_direction(
     db: &Db,
     direction_id: i32,
@@ -101,7 +194,7 @@ pub async fn materialize_direction(
         .one(&db.0)
         .await?
         .context("task not found")?;
-    let _thread = entities::thread::Entity::find_by_id(dir.thread_id)
+    let thread = entities::thread::Entity::find_by_id(dir.thread_id)
         .one(&db.0)
         .await?
         .context("thread not found")?;
@@ -143,6 +236,16 @@ pub async fn materialize_direction(
             // reclaim left the checkout without node_modules. No-op when ready.
             bootstrap_worktree_deps(&existing.path).await;
             return Ok(vec![existing]);
+        }
+        // Issue #172: about to RECREATE a worktree on disk (the reclaimed/replaced
+        // case) — a real write, so it is gated exactly like the first-time create
+        // path below. The idempotent fast return above is deliberately NOT gated:
+        // it only reads already-materialized state, and re-denying an already
+        // valid, already-registered worktree here would strand a dispatched
+        // worker mid-flight on a later policy tighten (the issue's own "已
+        // materialize 后策略被收紧时,停止新的写入" — new writes, not existing ones).
+        if !authorize_materialize(db, &dir, &repo_ref, thread.workspace_id).await? {
+            return Ok(Vec::new());
         }
         // The dir was reclaimed (remove_direction_worktree) or replaced, but the row (and
         // usually the branch) survives. Recreate the on-disk worktree for the
@@ -275,6 +378,12 @@ pub async fn materialize_direction(
         }
         bootstrap_worktree_deps(&existing.path).await;
         return Ok(vec![existing]);
+    }
+    // Issue #172: no worktree row exists at all yet — a first-time create, gated
+    // the SAME way as the recreate path above, and BEFORE any git/filesystem
+    // work happens (issue's "越界在创建 worktree 之前拦截" acceptance bar).
+    if !authorize_materialize(db, &dir, &repo_ref, thread.workspace_id).await? {
+        return Ok(Vec::new());
     }
     let repo_path = std::path::Path::new(&repo_ref.local_git_path);
     let path = worktree_path(repo_path, &dir.branch);
@@ -3192,5 +3301,178 @@ mod tests {
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// Shared fixture for the issue #172 AuthorityPolicy tests below: a bare
+    /// origin + clone on disk, and a workspace/repo/thread row set. Returns
+    /// `(root, weft_home, db, workspace, repo_ref, thread)`; the caller creates
+    /// its own direction(s) and is responsible for cleanup (mirrors every other
+    /// test in this file — no shared teardown helper exists here).
+    async fn authority_test_fixture(
+        tag: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        crate::store::Db,
+        crate::store::entities::workspace::Model,
+        crate::store::entities::repo_ref::Model,
+        crate::store::entities::thread::Model,
+        String,
+    ) {
+        use crate::store::repo;
+        use std::process::Command as Cmd;
+        let tag = format!("weft-mat-authority-{tag}-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        let g = |a: &[&str]| {
+            Cmd::new("git").args(a).current_dir(&origin).status().unwrap();
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t.t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(origin.join("README.md"), "# x\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-q", "-m", "init"]);
+        // The default branch name depends on this environment's `init.defaultBranch`
+        // (not always "main") — every caller uses THIS value, never a hard-coded
+        // literal, so the fixture works regardless of the ambient git config.
+        let default_branch = crate::git::current_branch(&origin).unwrap();
+        let clone = root.join("clone");
+        Cmd::new("git")
+            .args(["clone", "-q", &origin.to_string_lossy(), &clone.to_string_lossy()])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r = repo::add_repo_ref(&db, ws.id, "api", clone.to_str().unwrap(), &default_branch, "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude").await.unwrap();
+        (root, weft_home, db, ws, r, t, default_branch)
+    }
+
+    fn authority_test_teardown(root: &std::path::Path, weft_home: &std::path::Path) {
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(weft_home);
+    }
+
+    /// Issue #172 fail-closed boundary: a repo an AuthorityPolicy explicitly
+    /// denies must NEVER get a worktree, and the interception happens BEFORE
+    /// any git/filesystem work — no `.worktrees/` dir is ever created for it.
+    #[tokio::test]
+    async fn authority_denied_repo_never_creates_a_worktree() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (root, weft_home, db, ws, r, t, _default_branch) = authority_test_fixture("denied-repo").await;
+
+        let rules = serde_json::json!({ "denied_repos": ["api"] }).to_string();
+        repo::create_authority_policy(&db, "workspace", ws.id, &rules, "user")
+            .await
+            .unwrap();
+
+        let dir = repo::create_direction(&db, t.id, "x", "claude", r.id, "because", "plan+impl", "")
+            .await
+            .unwrap();
+        let worktrees = materialize_direction(&db, dir.id).await.unwrap();
+        assert!(worktrees.is_empty(), "a denied lane must never receive a worktree");
+        assert!(
+            repo::worktree_for(&db, dir.id, r.id).await.unwrap().is_none(),
+            "a denied lane must never register a worktree row"
+        );
+        let wt_path = worktree_path(std::path::Path::new(r.local_git_path.as_str()), &dir.branch);
+        assert!(
+            !wt_path.exists(),
+            "a denied lane must never create the worktree directory on disk"
+        );
+
+        // The decision is still on the audit trail (issue's "保留完整 audit").
+        let evidence = repo::list_evidence(&db, t.id, Some(dir.id), 10).await.unwrap();
+        assert!(
+            evidence.iter().any(|e| e.kind == repo::EVIDENCE_KIND_DECISION
+                && e.payload.contains("\"denied\"")),
+            "a denied verdict must be recorded as decision evidence"
+        );
+
+        authority_test_teardown(&root, &weft_home);
+    }
+
+    /// Issue #172: a protected base branch needs a human Gate even though the
+    /// lane already went through the ordinary confirm/approve flow (`human_
+    /// authorized` is always true at this layer) — no worktree until a Gate
+    /// override is recorded, then a re-materialize call succeeds.
+    #[tokio::test]
+    async fn authority_protected_branch_needs_gate_then_override_unblocks() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (root, weft_home, db, ws, r, t, default_branch) = authority_test_fixture("protected-branch").await;
+
+        let rules = serde_json::json!({ "protected_branches": [default_branch.clone()] }).to_string();
+        let policy = repo::create_authority_policy(&db, "workspace", ws.id, &rules, "user")
+            .await
+            .unwrap();
+
+        let dir = repo::create_direction(&db, t.id, "x", "claude", r.id, "because", "plan+impl", &default_branch)
+            .await
+            .unwrap();
+        let worktrees = materialize_direction(&db, dir.id).await.unwrap();
+        assert!(worktrees.is_empty(), "a protected-branch lane must Gate, not auto-materialize");
+        assert!(repo::worktree_for(&db, dir.id, r.id).await.unwrap().is_none());
+
+        // Resolve the Gate: a human approves this exact lane at this exact policy revision.
+        repo::record_gate_decision(&db, dir.id, &policy.revision, "approved", "reviewed the diff")
+            .await
+            .unwrap();
+        let worktrees = materialize_direction(&db, dir.id).await.unwrap();
+        assert_eq!(worktrees.len(), 1, "an approved Gate override must let materialize proceed");
+        assert!(
+            repo::worktree_for(&db, dir.id, r.id).await.unwrap().is_some(),
+            "the worktree must now be registered"
+        );
+
+        authority_test_teardown(&root, &weft_home);
+    }
+
+    /// Issue #172 "stale policy decision fail closed": a lane that WOULD have
+    /// been allowed under an earlier (permissive/default) policy state must be
+    /// denied once the policy tightens — `materialize_direction` always
+    /// re-adjudicates against the CURRENT policy, never a cached verdict.
+    #[tokio::test]
+    async fn authority_tightened_policy_denies_a_lane_the_default_policy_would_have_allowed() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (root, weft_home, db, ws, r, t, _default_branch) = authority_test_fixture("stale").await;
+
+        // Before any AuthorityPolicy row exists, the hard-coded default lets an
+        // ordinary confirmed lane through (zero-regression baseline).
+        let baseline = repo::create_direction(&db, t.id, "baseline", "claude", r.id, "because", "plan+impl", "")
+            .await
+            .unwrap();
+        let worktrees = materialize_direction(&db, baseline.id).await.unwrap();
+        assert_eq!(worktrees.len(), 1, "the default policy must allow an ordinary confirmed lane");
+
+        // Tighten: deny this repo from now on.
+        let rules = serde_json::json!({ "denied_repos": ["api"] }).to_string();
+        repo::create_authority_policy(&db, "workspace", ws.id, &rules, "user")
+            .await
+            .unwrap();
+
+        // A NEW lane, created after the tighten, must be denied — never
+        // materialized off the old (now-stale) permissive state.
+        let later = repo::create_direction(&db, t.id, "later", "claude", r.id, "because", "plan+impl", "")
+            .await
+            .unwrap();
+        let worktrees = materialize_direction(&db, later.id).await.unwrap();
+        assert!(worktrees.is_empty(), "a tightened policy must deny a lane the old state would have allowed");
+        assert!(repo::worktree_for(&db, later.id, r.id).await.unwrap().is_none());
+
+        authority_test_teardown(&root, &weft_home);
     }
 }

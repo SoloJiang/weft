@@ -382,6 +382,16 @@ pub async fn save_proposal_value(db: &Db, thread_id: i32, input: &Value) -> Resu
     let version = proposal_version();
     repo::upsert_plan(db, thread_id, &json, "proposed", &version).await?;
     repo::set_plan_created_at(db, thread_id, &version).await?;
+    // Issue #172: append the immutable scope-history snapshot BEHIND the
+    // working `plan` head this call just wrote — same version, same JSON.
+    // Source is "lead": this is the ONE function every fresh
+    // `propose_directions`/re-propose call goes through. Best-effort: the
+    // working plan write above already succeeded and is the source of truth
+    // for materialize/confirm; a failure here only loses history, never
+    // correctness, so it is logged rather than propagated.
+    if let Err(error) = repo::insert_plan_revision(db, thread_id, &version, &json, "lead").await {
+        eprintln!("[weft][plan_revision] snapshot for thread {thread_id}: {error}");
+    }
     Ok(())
 }
 
@@ -1709,6 +1719,17 @@ async fn confirm_with_manual_tool_with_session_liveness(
     if !applied {
         rollback_attempt(db, &created_now, &recreated_reused).await;
         anyhow::bail!("plan changed during confirm (re-proposed); please retry");
+    }
+    // Issue #172: record WHICH scope revision this confirm decided against —
+    // same version as the plan that was just confirmed (confirm never mints a
+    // fresh version, only a re-propose does), but its own "user" row and its
+    // own snapshot (now carrying each lane's recorded `direction_id`). See
+    // `insert_plan_revision`'s own doc on why a failure here is logged, not
+    // propagated: the confirm itself already committed above.
+    if let Err(error) =
+        repo::insert_plan_revision(db, thread_id, &start_plan.created_at, &new_json, "user").await
+    {
+        eprintln!("[weft][plan_revision] confirm snapshot for thread {thread_id}: {error}");
     }
     for (direction_id, route) in committed_route_markers {
         crate::engine_routing::record_decision(
