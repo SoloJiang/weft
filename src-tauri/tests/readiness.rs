@@ -1689,3 +1689,296 @@ async fn branch_mismatch_is_execution_drift() {
         "a drifted checkout must not start the readiness check process"
     );
 }
+
+// ---------------------------------------------------------------------
+// Evidence ledger collection (issue #174 R1-04)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn branch_switch_produces_drifted_execution_evidence() {
+    let fixture = fixture(None).await;
+    let direction = repo::get_direction(&fixture.db, fixture.direction_id)
+        .await
+        .expect("direction query")
+        .expect("direction exists");
+    let mut active: direction::ActiveModel = direction.into();
+    active.branch = Set("different-branch".to_string());
+    active
+        .update(&fixture.db.0)
+        .await
+        .expect("direction branch update");
+
+    weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
+        .await
+        .expect("readiness");
+
+    let rows = repo::list_evidence(&fixture.db, fixture.thread_id, Some(fixture.direction_id), 10)
+        .await
+        .expect("evidence after branch switch");
+    let execution_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row.kind == weft::store::repo::EVIDENCE_KIND_EXECUTION)
+        .collect();
+    assert_eq!(execution_rows.len(), 1, "one execution evidence row: {rows:?}");
+    let row = execution_rows[0];
+    assert_eq!(row.collection_state, weft::store::repo::EVIDENCE_COLLECTION_OK);
+    assert!(row.payload.contains("\"result\":\"drifted\""), "{}", row.payload);
+    assert!(
+        row.payload.contains("different-branch"),
+        "declared branch must be traceable: {}",
+        row.payload
+    );
+    // Drift evidence is the acceptance criterion: it must not be silently
+    // overwritten by a LATER CLI-reported success — appending, not editing
+    // in place, is what makes that possible.
+    assert_eq!(row.superseded_by, 0, "the drift row is still the current fact");
+}
+
+#[tokio::test]
+async fn a_later_reported_success_supersedes_but_never_erases_a_drift_row() {
+    let fixture = fixture(None).await;
+    let direction = repo::get_direction(&fixture.db, fixture.direction_id)
+        .await
+        .expect("direction query")
+        .expect("direction exists");
+    let mut active: direction::ActiveModel = direction.into();
+    active.branch = Set("different-branch".to_string());
+    active
+        .update(&fixture.db.0)
+        .await
+        .expect("direction branch update");
+    weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
+        .await
+        .expect("readiness while drifted");
+    let drifted_rows =
+        repo::list_evidence(&fixture.db, fixture.thread_id, Some(fixture.direction_id), 10)
+            .await
+            .expect("evidence while drifted");
+    let drift_row = drifted_rows
+        .iter()
+        .find(|row| row.kind == weft::store::repo::EVIDENCE_KIND_EXECUTION)
+        .expect("drift evidence row")
+        .clone();
+
+    // The CLI "reports success" by the branch matching again (the only
+    // channel readiness has for a worker's self-report of completion).
+    let mut active: direction::ActiveModel = repo::get_direction(&fixture.db, fixture.direction_id)
+        .await
+        .expect("direction query")
+        .expect("direction exists")
+        .into();
+    active.branch = Set(format!("feature/readiness-{}", fixture.direction_id));
+    active
+        .update(&fixture.db.0)
+        .await
+        .expect("direction branch restored");
+    weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
+        .await
+        .expect("readiness after branch restored");
+
+    let rows_after =
+        repo::list_evidence(&fixture.db, fixture.thread_id, Some(fixture.direction_id), 10)
+            .await
+            .expect("evidence after restore");
+    let execution_rows: Vec<_> = rows_after
+        .iter()
+        .filter(|row| row.kind == weft::store::repo::EVIDENCE_KIND_EXECUTION)
+        .collect();
+    assert_eq!(execution_rows.len(), 2, "the drift row must still exist: {rows_after:?}");
+    let still_present_drift_row = execution_rows
+        .iter()
+        .find(|row| row.id == drift_row.id)
+        .expect("the original drift row was not deleted");
+    assert!(
+        still_present_drift_row.payload.contains("\"result\":\"drifted\""),
+        "the drift row's content is never rewritten: {}",
+        still_present_drift_row.payload
+    );
+    assert_ne!(
+        still_present_drift_row.superseded_by, 0,
+        "the drift row is now superseded, but still present"
+    );
+    let matched_row = execution_rows
+        .iter()
+        .find(|row| row.id != drift_row.id)
+        .expect("a new matched row was appended");
+    assert!(matched_row.payload.contains("\"result\":\"matched\""), "{}", matched_row.payload);
+    assert_eq!(matched_row.superseded_by, 0);
+}
+
+#[tokio::test]
+async fn an_unreadable_extra_worktree_produces_unknown_collection_state_not_success() {
+    let fixture = fixture(None).await;
+    remove_registered_worktree_directories(&fixture).await;
+
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
+        .await
+        .expect("readiness with an unreadable worktree");
+    assert_eq!(result.readiness, IssueReadiness::Unknown);
+    assert_eq!(result.reasons[0].code, ReasonCode::RemoteUnknown);
+
+    let rows = repo::list_evidence(&fixture.db, fixture.thread_id, Some(fixture.direction_id), 10)
+        .await
+        .expect("evidence with an unreadable worktree");
+    let execution_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row.kind == weft::store::repo::EVIDENCE_KIND_EXECUTION)
+        .collect();
+    assert_eq!(execution_rows.len(), 1, "{rows:?}");
+    let row = execution_rows[0];
+    assert_eq!(
+        row.collection_state,
+        weft::store::repo::EVIDENCE_COLLECTION_UNKNOWN,
+        "a failed/unreadable collection attempt must never look like success"
+    );
+    assert!(row.payload.contains("\"result\":\"unknown\""), "{}", row.payload);
+    assert!(row.payload.contains("\"readable\":false"), "{}", row.payload);
+}
+
+#[tokio::test]
+async fn a_dirty_worktree_is_recorded_in_the_observed_set_without_changing_the_matched_verdict() {
+    let fixture = fixture(None).await;
+    let registered = repo::list_worktrees(&fixture.db, Some(fixture.direction_id))
+        .await
+        .expect("registered worktrees");
+    assert_eq!(registered.len(), 1);
+    // An UNCOMMITTED, out-of-scope change: the branch still matches the
+    // Lane's declared branch (Matched, per readiness's own reconciliation
+    // semantics — untouched by this issue), but the dirty file must still be
+    // traceable in the execution evidence's observed set.
+    std::fs::write(
+        Path::new(&registered[0].path).join("scratch.md"),
+        "uncommitted out-of-scope note\n",
+    )
+    .expect("uncommitted scratch file");
+
+    let result = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
+        .await
+        .expect("readiness with a dirty worktree");
+    assert_eq!(
+        result.readiness,
+        IssueReadiness::Unknown,
+        "a dirty worktree cannot produce fresh check evidence, but is still Matched, not Drifted"
+    );
+
+    let rows = repo::list_evidence(&fixture.db, fixture.thread_id, Some(fixture.direction_id), 10)
+        .await
+        .expect("evidence with a dirty worktree");
+    let execution_row = rows
+        .iter()
+        .find(|row| row.kind == weft::store::repo::EVIDENCE_KIND_EXECUTION)
+        .expect("execution evidence row");
+    assert!(execution_row.payload.contains("\"result\":\"matched\""), "{}", execution_row.payload);
+    assert!(
+        execution_row.payload.contains("\"dirty\":true"),
+        "the out-of-scope uncommitted change must be in the observed set: {}",
+        execution_row.payload
+    );
+}
+
+#[tokio::test]
+async fn verification_evidence_is_recorded_and_the_old_row_goes_stale_after_a_new_commit() {
+    let fixture = fixture(None).await;
+    add_passing_build_script(&fixture).await;
+
+    let first = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
+        .await
+        .expect("readiness after first check run");
+    assert_eq!(first.readiness, IssueReadiness::ReviewReady);
+
+    let rows_after_first =
+        repo::list_evidence(&fixture.db, fixture.thread_id, Some(fixture.direction_id), 10)
+            .await
+            .expect("evidence after first run");
+    let verification_rows_first: Vec<_> = rows_after_first
+        .iter()
+        .filter(|row| row.kind == weft::store::repo::EVIDENCE_KIND_VERIFICATION)
+        .collect();
+    assert_eq!(verification_rows_first.len(), 1, "one fresh verification row: {rows_after_first:?}");
+    let first_row = verification_rows_first[0].clone();
+    assert!(!first_row.revision.is_empty());
+
+    // A new commit changes HEAD — the check flight's signature cache must not
+    // reuse the old evidence.
+    let registered = repo::list_worktrees(&fixture.db, Some(fixture.direction_id))
+        .await
+        .expect("registered worktrees");
+    let worktree_path = Path::new(&registered[0].path);
+    std::fs::write(worktree_path.join("NOTES.md"), "follow-up notes\n").expect("notes file");
+    git(worktree_path, &["add", "NOTES.md"]);
+    git(worktree_path, &["commit", "-q", "-m", "second commit"]);
+
+    let second = weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
+        .await
+        .expect("readiness after second commit");
+    assert_eq!(second.readiness, IssueReadiness::ReviewReady);
+
+    let rows_after_second =
+        repo::list_evidence(&fixture.db, fixture.thread_id, Some(fixture.direction_id), 10)
+            .await
+            .expect("evidence after second run");
+    let verification_rows_after: Vec<_> = rows_after_second
+        .iter()
+        .filter(|row| row.kind == weft::store::repo::EVIDENCE_KIND_VERIFICATION)
+        .collect();
+    assert_eq!(
+        verification_rows_after.len(),
+        2,
+        "the second commit appends a NEW row rather than mutating the old one: {rows_after_second:?}"
+    );
+    let newest = verification_rows_after
+        .iter()
+        .find(|row| row.superseded_by == 0)
+        .expect("current row");
+    let superseded = verification_rows_after
+        .iter()
+        .find(|row| row.id != newest.id)
+        .expect("superseded row");
+    assert_eq!(superseded.id, first_row.id);
+    assert_ne!(newest.revision, first_row.revision);
+    assert_eq!(superseded.superseded_by, newest.id);
+
+    // The stale/supersede truth table, exercised end-to-end (issue #174's
+    // "commit 变化后旧检查证据会变 stale" acceptance criterion): the OLD row
+    // reads stale against the NEW head even judged independent of clock time.
+    assert_eq!(
+        weft::store::repo::evidence_freshness(superseded, Some(newest.revision.as_str()), 0, None),
+        weft::store::repo::EvidenceFreshness::Stale,
+    );
+    assert_eq!(
+        weft::store::repo::evidence_freshness(newest, Some(newest.revision.as_str()), 0, None),
+        weft::store::repo::EvidenceFreshness::Fresh,
+    );
+}
+
+#[tokio::test]
+async fn evidence_survives_direction_deletion_and_is_still_listable() {
+    let fixture = fixture(None).await;
+    let direction = repo::get_direction(&fixture.db, fixture.direction_id)
+        .await
+        .expect("direction query")
+        .expect("direction exists");
+    let mut active: direction::ActiveModel = direction.into();
+    active.branch = Set("different-branch".to_string());
+    active
+        .update(&fixture.db.0)
+        .await
+        .expect("direction branch update");
+    weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
+        .await
+        .expect("readiness while drifted");
+    let before = repo::list_evidence(&fixture.db, fixture.thread_id, Some(fixture.direction_id), 10)
+        .await
+        .expect("evidence before deletion");
+    assert!(!before.is_empty());
+
+    direction::Entity::delete_by_id(fixture.direction_id)
+        .exec(&fixture.db.0)
+        .await
+        .expect("delete direction (evidence retention is independent of the FK-less direction_id)");
+
+    let after = repo::list_evidence(&fixture.db, fixture.thread_id, Some(fixture.direction_id), 10)
+        .await
+        .expect("evidence after deletion must not error on a dangling direction_id");
+    assert_eq!(after.len(), before.len(), "evidence is retained after Lane removal");
+}

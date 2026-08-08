@@ -34,6 +34,7 @@ import { Button } from "../components/ui/Button";
 import { Dialog, DialogPanel } from "../components/ui/Dialog";
 import { StatusDot } from "../components/ui/StatusChip";
 import { Tooltip } from "../components/ui/Tooltip";
+import { EvidencePanel } from "../components/EvidencePanel";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { ReadinessChip } from "../components/ReadinessChip";
 import { ScopeReview } from "./ScopeReview";
@@ -563,8 +564,11 @@ function ProvenanceMenu({
     setCopied(key);
     window.setTimeout(() => setCopied((k) => (k === key ? null : k)), 1800);
   };
+  // Evidence (issue #174) fetches lazily — only while this menu is open —
+  // so a closed dropdown never polls the backend.
+  const [open, setOpen] = useState(false);
   return (
-    <DM.Root>
+    <DM.Root open={open} onOpenChange={setOpen}>
       <Tooltip label={t("thread.provenanceTip")}>
         <DM.Trigger
           aria-label={t("thread.provenance")}
@@ -699,6 +703,8 @@ function ProvenanceMenu({
               </div>
             </>
           )}
+          <DM.Separator className="my-1 h-px bg-border" />
+          <EvidencePanel threadId={direction.thread_id} directionId={direction.id} active={open} />
         </DM.Content>
       </DM.Portal>
     </DM.Root>

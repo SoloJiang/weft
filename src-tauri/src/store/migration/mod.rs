@@ -1,5 +1,5 @@
 use crate::store::entities::{
-    app_setting, backup_config, code_checkpoint, direction, human_card_terminal_outbox,
+    app_setting, backup_config, code_checkpoint, direction, evidence, human_card_terminal_outbox,
     human_request, im_route, lead_hidden_delivery, lead_message, plan, pull_request,
     repo_action_execution, repo_profile, repo_ref, session, skill_enable, skill_source, test_plan,
     thread, workspace, worktree,
@@ -66,6 +66,13 @@ impl MigratorTrait for Migrator {
             Box::new(M0051HumanCardTerminalOutbox),
             Box::new(M0052RepoActionExecution),
             Box::new(M0053LeadHiddenDelivery),
+            // NOTE: M0054 is intentionally skipped here — a sibling PR (issue
+            // #173, branch claude/issue-173-dag) also appends to this vec for
+            // a dependency-edge table and claims M0054. Whichever of the two
+            // PRs merges second must rebase this vec (trivial conflict); the
+            // numbering gap itself is harmless — `Migrator` runs migrations by
+            // registration order, not by the numeral in the struct name.
+            Box::new(M0055Evidence),
         ]
     }
 }
@@ -2466,6 +2473,55 @@ impl MigrationTrait for M0053LeadHiddenDelivery {
             .await
     }
 }
+
+/// The minimal Evidence ledger (issue #174 R1-04): append-only rows tying a
+/// write's basis, verification, and revision together per Lane. See
+/// `store::entities::evidence` for the column-by-column rationale and
+/// `store::repo::append_evidence` for the append/supersede write path.
+pub struct M0055Evidence;
+impl MigrationName for M0055Evidence {
+    fn name(&self) -> &str {
+        "m0055_evidence"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0055Evidence {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        let mut statement = schema.create_table_from_entity(evidence::Entity);
+        statement.if_not_exists();
+        manager.create_table(statement).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_evidence_thread")
+                    .table(Alias::new("evidence"))
+                    .col(Alias::new("thread_id"))
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_evidence_direction_kind")
+                    .table(Alias::new("evidence"))
+                    .col(Alias::new("direction_id"))
+                    .col(Alias::new("kind"))
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Alias::new("evidence")).to_owned())
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2473,6 +2529,7 @@ mod tests {
         M0046DirectionUpstream, M0047PullRequestThreadStatus, M0048HumanRequest,
         M0049HumanRequestSourceMessage, M0050HumanRequestImRoutes,
         M0051HumanCardTerminalOutbox, M0052RepoActionExecution, M0053LeadHiddenDelivery,
+        M0055Evidence,
     };
 
     #[test]
@@ -3170,6 +3227,61 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert!(columns.contains("dedupe_key"));
         assert!(columns.contains("state"));
+    }
+
+    #[tokio::test]
+    async fn m0055_evidence_is_rerunnable_with_expected_columns_and_indexes() {
+        use crate::store::Db;
+        use sea_orm::{ConnectionTrait, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let manager = SchemaManager::new(&db.0);
+        M0055Evidence.up(&manager).await.unwrap();
+        M0055Evidence.up(&manager).await.unwrap();
+
+        let columns = db
+            .0
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "PRAGMA table_info(evidence)".to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "name").ok())
+            .collect::<std::collections::HashSet<_>>();
+        for column in [
+            "thread_id",
+            "direction_id",
+            "kind",
+            "source",
+            "source_ref",
+            "observed_at",
+            "revision",
+            "policy_revision",
+            "summary",
+            "payload",
+            "collection_state",
+            "superseded_by",
+        ] {
+            assert!(columns.contains(column), "missing {column}");
+        }
+        let indexes = db
+            .0
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND \
+                 tbl_name = 'evidence'"
+                    .to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "name").ok())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(indexes.contains("idx_evidence_thread"));
+        assert!(indexes.contains("idx_evidence_direction_kind"));
     }
 
     /// M0047 (issue #110): the same upgrade-path coverage M0046 gets, for the

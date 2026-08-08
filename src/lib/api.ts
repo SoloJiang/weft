@@ -8,6 +8,7 @@ import type {
   DefaultToolInfo,
   Direction,
   EnabledSkill,
+  EvidenceRow,
   FileTree,
   GrantSnapshot,
   ImageAttachment,
@@ -278,6 +279,14 @@ export const api = {
   // Quality loop: run inferred checks across a direction's write worktrees.
   verifyDirection: (directionId: number) =>
     invoke<RepoChecks[]>("verify_direction", { directionId }),
+  // Evidence ledger (issue #174): newest-first bounded page for one thread,
+  // optionally scoped to a Lane. directionId=0 is issue-level evidence.
+  listEvidence: (threadId: number, directionId?: number | null, limit?: number) =>
+    invoke<EvidenceRow[]>("list_evidence", {
+      threadId,
+      directionId: directionId ?? null,
+      limit: limit ?? null,
+    }),
 
   threadMessages: (threadId: number) =>
     invoke<BusMsg[]>("thread_messages", { threadId }),

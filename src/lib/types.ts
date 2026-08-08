@@ -338,6 +338,41 @@ export interface IssueReadinessDto {
   lanes: LaneReadinessDto[];
 }
 
+/** Minimal Evidence ledger (issue #174 R1-04) — mirrors Rust
+ *  `commands::EvidenceRowDto` field-for-field. `direction_id === 0` is
+ *  issue-level evidence (not owned by any single Lane). */
+export type EvidenceKind =
+  | "code"
+  | "verification"
+  | "interface"
+  | "host"
+  | "execution"
+  | "decision"
+  | "handoff";
+
+export type EvidenceCollectionState = "ok" | "unknown";
+
+/** `fresh | stale | unknown`, judged at read time — see
+ *  `store::repo::evidence_freshness` for the truth table. */
+export type EvidenceFreshness = "fresh" | "stale" | "unknown";
+
+export interface EvidenceRow {
+  id: number;
+  thread_id: number;
+  direction_id: number;
+  kind: EvidenceKind;
+  source: string;
+  source_ref: string;
+  observed_at: string;
+  revision: string;
+  policy_revision: string;
+  summary: string;
+  payload: string;
+  collection_state: EvidenceCollectionState;
+  superseded_by: number;
+  freshness: EvidenceFreshness;
+}
+
 /** One row in a chat timeline (lead console / chat-mode workers). */
 export interface LeadMessage {
   id: number;

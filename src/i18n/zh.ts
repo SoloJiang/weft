@@ -1078,6 +1078,27 @@ export const zh = {
       pr_closed_unmerged: "PR 已关闭但未合并",
     },
   },
+  evidence: {
+    title: "证据",
+    empty: "暂无证据记录。",
+    loading: "证据加载中…",
+    loadFailed: "证据加载失败。",
+    supersededBadge: "已被取代",
+    freshness: {
+      fresh: "最新",
+      stale: "已过期",
+      unknown: "未知",
+    },
+    kind: {
+      code: "代码",
+      verification: "验证",
+      interface: "接口",
+      host: "Host",
+      execution: "执行对账",
+      decision: "决策",
+      handoff: "交接",
+    },
+  },
   grants: {
     inherited: "已继承授权",
     inheritedTitleFull: "这个 issue 的完全访问授权从上次运行保留了下来——点击撤销",

@@ -1119,6 +1119,27 @@ export const en = {
       pr_closed_unmerged: "PR was closed without merging",
     },
   },
+  evidence: {
+    title: "Evidence",
+    empty: "No evidence recorded yet.",
+    loading: "Loading evidence…",
+    loadFailed: "Couldn't load evidence.",
+    supersededBadge: "Superseded",
+    freshness: {
+      fresh: "Fresh",
+      stale: "Stale",
+      unknown: "Unknown",
+    },
+    kind: {
+      code: "Code",
+      verification: "Verification",
+      interface: "Interface",
+      host: "Host",
+      execution: "Execution",
+      decision: "Decision",
+      handoff: "Handoff",
+    },
+  },
   grants: {
     inherited: "Inherited access",
     inheritedTitleFull:
