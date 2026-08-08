@@ -298,6 +298,7 @@ function ScopeLaneRow({ lane, index, confirming }: { lane: ScopeLane; index: num
   // re-propose with the same name/repo/base still resets a dirty (unblurred) base edit.
   const proposalVersion = proposal?.created_at ?? "";
   const dependsOn = dependsOnLabel(lane.direction.depends_on);
+  const dependsOnCount = lane.direction.depends_on?.length ?? 0;
   return (
     <motion.div
       initial={{ opacity: 0, y: 6 }}
@@ -325,10 +326,10 @@ function ScopeLaneRow({ lane, index, confirming }: { lane: ScopeLane; index: num
         {dependsOn && (
           <div
             className="mt-0.5 flex min-w-0 items-center gap-1 text-[10.5px] text-ink-faint"
-            title={t("scope.dependsOnHint", { name: dependsOn })}
+            title={t("scope.dependsOnHint", { name: dependsOn, count: dependsOnCount })}
           >
             <GitMerge size={10} className="shrink-0" />
-            <span className="truncate">{t("scope.dependsOn", { name: dependsOn })}</span>
+            <span className="truncate">{t("scope.dependsOn", { name: dependsOn, count: dependsOnCount })}</span>
           </div>
         )}
       </div>

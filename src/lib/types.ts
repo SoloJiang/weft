@@ -710,9 +710,9 @@ export interface ResolvedDirection {
   decision: string;
   hint: "normal" | "deep";
   route?: EngineRouteDecision | null;
-  /** the `name` of ANOTHER direction in this SAME proposal that must merge before this one can
-   *  (issue #110 T4); "" = no upstream. */
-  depends_on: string;
+  /** the `name`s of OTHER directions in this SAME proposal that must all merge before this one
+   *  can (issue #110 T4; a join of zero to many as of issue #173); [] = no upstream. */
+  depends_on: string[];
 }
 export interface ResolvedProposal {
   thread_id: number;

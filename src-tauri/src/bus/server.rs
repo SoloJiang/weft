@@ -1637,8 +1637,11 @@ fn planner_specs() -> Value {
                         "description": "Optional routing hint only: normal prefers Codex for cheap batches; deep prefers Claude for deeper reasoning. This is not a tool choice." },
                     "base_branch": { "type": "string",
                         "description": "Branch in the target repo to branch the new work OFF. Leave empty to use the repo's default branch (main/master). Set it only when the repo merges into a non-default branch (develop/staging/a release branch)." },
-                    "depends_on": { "type": "string",
-                        "description": "Optional: the exact `name` of ANOTHER task in THIS SAME call's `directions` list that must be merged before this one is allowed to merge — use this for a cross-repo change set where this task consumes something the other task produces (e.g. a submodule SHA bump, a version bump). Leave empty when this task has no upstream. The name MUST resolve to exactly one task proposed in this SAME call: a typo, an ambiguous duplicate name, a name from another proposal, or a task that gets denied all BLOCK this task's merge (it is never released on a bad reference) until a later propose_directions call supplies a name that resolves cleanly." }
+                    "depends_on": { "anyOf": [
+                            { "type": "string" },
+                            { "type": "array", "items": { "type": "string" } }
+                        ],
+                        "description": "Optional: the exact `name`(s) of OTHER task(s) in THIS SAME call's `directions` list that must ALL be merged before this one is allowed to merge — use this for a cross-repo change set where this task consumes something the other task(s) produce (e.g. a submodule SHA bump, a version bump). A single task may depend on more than one upstream (a join: e.g. an interface repo AND an SDK repo both landing first) — pass an array of names for that, or a single string when there is exactly one. Leave empty/omit when this task has no upstream. Every name MUST resolve to exactly one OTHER task proposed in this SAME call: a typo, an ambiguous duplicate name, a name from another proposal, or a task that gets denied all BLOCK this task's merge (it is never released on a bad reference) until a later propose_directions call supplies a name that resolves cleanly." }
                 }, "required": ["name", "repo", "reason"] } }
             }, "required": ["directions"] }
         },
