@@ -3166,6 +3166,15 @@ pub async fn delete_direction(db: &Db, direction_id: i32) -> Result<()> {
         .filter(direction_dependency::Column::DirectionId.eq(direction_id))
         .exec(&db.0)
         .await?;
+    // Same reasoning for the Lane's Gate decision (issue #172): this function is
+    // also the materialize-failure rollback, so a Lane that a human approved and
+    // then failed to materialize would otherwise leave its approval — reason text
+    // included — behind on an id no query can reach, while the retry mints a new
+    // direction with a new id.
+    lane_gate_decision::Entity::delete_many()
+        .filter(lane_gate_decision::Column::DirectionId.eq(direction_id))
+        .exec(&db.0)
+        .await?;
     direction::Entity::delete_by_id(direction_id)
         .exec(&db.0)
         .await?;
@@ -4390,6 +4399,13 @@ pub async fn delete_repo_cascade_with_human_cancellations(
             .filter(human_request::Column::DirectionId.is_in(direction_ids.clone()))
             .exec(&txn)
             .await?;
+        // Gate decisions (issue #172) are reachable only by direction id, so a
+        // direction dying without its decision row leaks a human's reason text
+        // onto an id nothing can query. Same sweep the per-issue cascade owes.
+        lane_gate_decision::Entity::delete_many()
+            .filter(lane_gate_decision::Column::DirectionId.is_in(direction_ids.clone()))
+            .exec(&txn)
+            .await?;
         direction::Entity::delete_many()
             .filter(direction::Column::Id.is_in(direction_ids.clone()))
             .exec(&txn)
@@ -4691,6 +4707,13 @@ async fn delete_workspace_cascade_with_action_cleanups(
             .filter(human_request::Column::DirectionId.is_in(direction_ids.clone()))
             .exec(&txn)
             .await?;
+        // Gate decisions (issue #172) are reachable only by direction id, so a
+        // direction dying without its decision row leaks a human's reason text
+        // onto an id nothing can query. Same sweep the per-issue cascade owes.
+        lane_gate_decision::Entity::delete_many()
+            .filter(lane_gate_decision::Column::DirectionId.is_in(direction_ids.clone()))
+            .exec(&txn)
+            .await?;
         direction::Entity::delete_many()
             .filter(direction::Column::Id.is_in(direction_ids.clone()))
             .exec(&txn)
@@ -4711,6 +4734,13 @@ async fn delete_workspace_cascade_with_action_cleanups(
             .await?;
         plan::Entity::delete_many()
             .filter(plan::Column::ThreadId.is_in(removed_threads.clone()))
+            .exec(&txn)
+            .await?;
+        // The scope history behind each working head (issue #172) — full JSON
+        // proposal snapshots — dies with its issue here too, for the reason
+        // spelled out in `delete_thread_cascade_with_action_cleanups`.
+        plan_revision::Entity::delete_many()
+            .filter(plan_revision::Column::ThreadId.is_in(removed_threads.clone()))
             .exec(&txn)
             .await?;
         test_plan::Entity::delete_many()
@@ -4766,6 +4796,17 @@ async fn delete_workspace_cascade_with_action_cleanups(
     }
     skill_enable::Entity::delete_many()
         .filter(skill_enable::Column::Scope.eq(format!("ws:{workspace_id}")))
+        .exec(&txn)
+        .await?;
+    // Every AuthorityPolicy revision written for this workspace (issue #172),
+    // revoked ones included. The table is append-only per scope — revoking
+    // stamps `revoked_at` rather than deleting — so this cascade is the only
+    // thing that can ever clear rows whose `scope_id` names a workspace that
+    // no longer exists, and their `rules` JSON carries real configuration
+    // (repo paths, branch patterns) from the deleted workspace.
+    authority_policy::Entity::delete_many()
+        .filter(authority_policy::Column::Scope.eq("workspace"))
+        .filter(authority_policy::Column::ScopeId.eq(workspace_id))
         .exec(&txn)
         .await?;
     if !deleted_repo_action_ids.is_empty() {
@@ -4899,6 +4940,14 @@ async fn delete_thread_cascade_with_action_cleanups(
             .filter(direction_dependency::Column::DirectionId.eq(d.id))
             .exec(&txn)
             .await?;
+        // A Gate decision (issue #172) is only ever reachable through its
+        // direction id, so leaving it behind is a pure leak: the row carries a
+        // human's free-text reason naming a Lane of the issue being deleted,
+        // and nothing can ever read or clear it once the direction is gone.
+        lane_gate_decision::Entity::delete_many()
+            .filter(lane_gate_decision::Column::DirectionId.eq(d.id))
+            .exec(&txn)
+            .await?;
         direction::Entity::delete_by_id(d.id).exec(&txn).await?;
     }
     // The thread row anchors the thread write fence
@@ -4920,6 +4969,16 @@ async fn delete_thread_cascade_with_action_cleanups(
         .await?;
     plan::Entity::delete_many()
         .filter(plan::Column::ThreadId.eq(thread_id))
+        .exec(&txn)
+        .await?;
+    // The append-only scope history (issue #172) holds a full JSON snapshot of
+    // every proposal this issue ever had — rationale, Lane names, per-Lane
+    // reasons. "Never updated or deleted after insert" is an in-life contract,
+    // not an exemption from the sweep: the working head dying without its
+    // history would leave the richest copy of the deleted issue's content in
+    // weft.db and backups.
+    plan_revision::Entity::delete_many()
+        .filter(plan_revision::Column::ThreadId.eq(thread_id))
         .exec(&txn)
         .await?;
     test_plan::Entity::delete_many()
@@ -16113,6 +16172,117 @@ mod tests {
         assert!(
             direction_dependency::Entity::find().all(&db.0).await.unwrap().is_empty(),
             "no dependency edge may outlive its issue"
+        );
+    }
+
+    /// Issue #172's two issue-owned tables join the same sweep: `plan_revision`
+    /// holds full JSON snapshots of every proposal the issue ever had, and
+    /// `lane_gate_decision` holds a human's free-text reason for approving or
+    /// denying a Lane. Both are reachable only by thread/direction id, so
+    /// surviving the cascade means leaking deleted-issue content onto rows
+    /// nothing can ever query or clear.
+    #[tokio::test]
+    async fn delete_thread_cascade_removes_scope_history_and_gate_decisions() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws_gate_cascade").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "api", "/tmp/gate-cascade-api", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let lane = create_direction(&db, t.id, "lane", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+        insert_plan_revision(&db, t.id, "1-1", "{\"rationale\":\"secret scope\"}", "lead")
+            .await
+            .unwrap();
+        record_gate_decision(&db, lane.id, "1", "approved", "ok by me").await.unwrap();
+
+        delete_thread_cascade(&db, t.id).await.unwrap();
+
+        assert!(
+            plan_revision::Entity::find().all(&db.0).await.unwrap().is_empty(),
+            "no scope revision may outlive its issue"
+        );
+        assert!(
+            lane_gate_decision::Entity::find().all(&db.0).await.unwrap().is_empty(),
+            "no Gate decision may outlive its issue"
+        );
+    }
+
+    /// Deleting a workspace never routes through `delete_thread_cascade`, so it
+    /// owes the same #172 sweep independently — plus the workspace-scoped
+    /// AuthorityPolicy rows, which are append-only (a revoke stamps
+    /// `revoked_at` instead of deleting) and therefore have no other reaper.
+    /// Another workspace's policy must survive: the sweep is scoped, not global.
+    #[tokio::test]
+    async fn delete_workspace_cascade_removes_scope_history_gates_and_policies() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws_authority_cascade").await.unwrap();
+        let keeper = create_workspace(&db, "ws_authority_keeper").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "api", "/tmp/authority-cascade-api", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let lane = create_direction(&db, t.id, "lane", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+        insert_plan_revision(&db, t.id, "1-1", "{\"rationale\":\"secret scope\"}", "lead")
+            .await
+            .unwrap();
+        record_gate_decision(&db, lane.id, "1", "approved", "ok by me").await.unwrap();
+        create_authority_policy(&db, "workspace", ws.id, "{}", "user").await.unwrap();
+        create_authority_policy(&db, "workspace", ws.id, "{}", "user").await.unwrap();
+        // Revoking stamps the active revision instead of deleting it, so this
+        // workspace now owns both an older row and a revoked one.
+        revoke_authority_policy(&db, "workspace", ws.id).await.unwrap();
+        create_authority_policy(&db, "workspace", keeper.id, "{}", "user").await.unwrap();
+
+        delete_workspace_cascade(&db, ws.id).await.unwrap();
+
+        assert!(
+            plan_revision::Entity::find().all(&db.0).await.unwrap().is_empty(),
+            "no scope revision may outlive its workspace"
+        );
+        assert!(
+            lane_gate_decision::Entity::find().all(&db.0).await.unwrap().is_empty(),
+            "no Gate decision may outlive its workspace"
+        );
+        let policies = authority_policy::Entity::find().all(&db.0).await.unwrap();
+        assert_eq!(
+            policies.iter().map(|p| p.scope_id).collect::<Vec<_>>(),
+            vec![keeper.id],
+            "the deleted workspace's policy revisions (revoked ones included) are gone, \
+             and only the untouched workspace's policy remains"
+        );
+    }
+
+    /// `delete_direction` is also the materialize-failure rollback: a Lane a
+    /// human approved and that then failed to materialize must not leave its
+    /// approval behind on an id the retry will never reuse.
+    #[tokio::test]
+    async fn delete_direction_removes_its_gate_decision() {
+        let db = mem().await;
+        let ws = create_workspace(&db, "ws_gate_rollback").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "api", "/tmp/gate-rollback-api", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let lane = create_direction(&db, t.id, "lane", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+        let survivor = create_direction(&db, t.id, "other", "claude", r.id, "r", "impl-only", "")
+            .await
+            .unwrap();
+        record_gate_decision(&db, lane.id, "1", "approved", "ok by me").await.unwrap();
+        record_gate_decision(&db, survivor.id, "1", "denied", "not yet").await.unwrap();
+
+        delete_direction(&db, lane.id).await.unwrap();
+
+        let rows = lane_gate_decision::Entity::find().all(&db.0).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|g| g.direction_id).collect::<Vec<_>>(),
+            vec![survivor.id],
+            "only the deleted Lane's decision is swept"
         );
     }
 
