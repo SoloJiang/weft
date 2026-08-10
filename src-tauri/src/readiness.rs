@@ -2938,13 +2938,29 @@ async fn run_bounded_check(
         crate::proc_registry::configure(&mut command, crate::proc_registry::Owner::probe());
     let mut child = match command.spawn() {
         Ok(child) => child,
+        // A check that never STARTED said nothing about the user's code, so it
+        // cannot be recorded as that code failing. Reporting `Completed{fail}`
+        // here made weft assert someone's tests were red when the truth was
+        // that its own exec failed — a missing binary, a permission, or, most
+        // often, `fork`/`posix_spawn` returning EAGAIN because the machine was
+        // out of process slots.
+        //
+        // That last one is not hypothetical: it is what named a different
+        // readiness test on macOS CI run after run. Under parallel test load a
+        // trivially-passing `exit 0` check would intermittently spawn-fail and
+        // land here, and the suite read `Failing` where it expected `Passed`.
+        // Non-deterministic, macOS-only, and never the same test twice —
+        // because which check loses the spawn is whichever one runs when the
+        // runner is tightest.
+        //
+        // `NotProduced` is the arm that already means "no verdict was
+        // obtained", the same answer a timeout gets. It does not fail open:
+        // readiness reads it as not-ready. Every neighbouring early return in
+        // this function already goes there; this one was the exception.
         Err(error) => {
-            return Ok(BoundedCheckOutcome::Completed(crate::check::CheckResult {
-                name: check.name.clone(),
-                status: "fail".to_string(),
-                code: -1,
+            return Ok(BoundedCheckOutcome::NotProduced {
                 output_tail: format!("could not run {}: {error}", check.program),
-            }));
+            });
         }
     };
     let mut registration = Some(configured.register(&child));
@@ -7228,6 +7244,41 @@ mod tests {
         .expect("no-rung readiness check");
 
         assert_eq!(evidence, CheckEvidence::NotProduced);
+    }
+
+    /// A check weft could not START is not a failing check.
+    ///
+    /// The distinction against the crash case above is the whole point: there,
+    /// a child ran and died, which IS a verdict about the user's code. Here no
+    /// child exists at all, so calling it `fail` invents one. In production
+    /// that misreports a missing binary or a permission error as red tests; on
+    /// a loaded macOS CI runner it is `posix_spawn` returning EAGAIN, which is
+    /// what named a different readiness test almost every run.
+    #[tokio::test]
+    async fn a_check_that_could_not_be_started_is_not_produced_rather_than_failing() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let outcome = run_bounded_check(
+            root.path(),
+            &crate::check::Check {
+                name: "missing".to_string(),
+                program: "weft-no-such-program-exists".to_string(),
+                args: Vec::new(),
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the runner itself does not error");
+
+        match outcome {
+            BoundedCheckOutcome::NotProduced { output_tail } => assert!(
+                output_tail.contains("could not run"),
+                "the reason must say the check never started: {output_tail}"
+            ),
+            BoundedCheckOutcome::Completed(result) => panic!(
+                "a check that never ran must not become a verdict about the user's code: \
+                 {result:?}"
+            ),
+        }
     }
 
     #[tokio::test]
