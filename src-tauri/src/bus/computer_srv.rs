@@ -994,6 +994,30 @@ async fn run_action(
     // `verify_approved_target`, right before it activates/injects — see that
     // function's own doc for the "approve one window, dispatch to a
     // different one" gap this closes.
+    // Register this thread's workspace BEFORE the GUI approval consults the
+    // Permission Bridge.
+    //
+    // Every other route does this on its own ask path, but a `weft_computer`
+    // action reaches `auto_decision_gui` through here — and the PreToolUse hook
+    // returns early for weft-internal tools, before its own registration. So a
+    // fresh thread whose FIRST permission request is a GUI action arrived with
+    // no mapping at all: the bridge returned `None`, and a never-attempted
+    // lookup is deliberately NOT indeterminate (an unmapped thread is the
+    // ordinary state, and treating it as unknown would defer every ask in an
+    // installation with no policy). A standing Full/Always grant then
+    // auto-allowed a GUI action the workspace's `deny_actions` covers.
+    //
+    // A FAILED read is recorded rather than ignored, the same contract the ACP
+    // and Codex routes use: absence means "nobody asked yet", so it cannot also
+    // mean "we asked and could not tell".
+    match crate::store::repo::get_thread(db, thread).await {
+        Ok(Some(row)) => asks.note_thread_workspace(thread, row.workspace_id),
+        // Only a FAILED read is an unknown. `Ok(None)` is a determinate
+        // answer — there is no such thread, so there is no workspace policy to
+        // bypass — and marking it unknown would defer every ask on it forever.
+        Ok(None) => {}
+        Err(_) => asks.note_thread_workspace_unresolved(thread),
+    }
     let approved = approve(asks, thread, dir, wt, action, args).await?;
     // re-check the kill switch AFTER the approval
     // await returns — NOT just once, up top, before that (potentially very

@@ -6747,7 +6747,10 @@ async fn acp_consumer(
                     // workspace's `deny_actions` covers.
                     match repo::get_thread(&db, thread_id).await {
                         Ok(Some(row)) => asks.note_thread_workspace(thread_id, row.workspace_id),
-                        Ok(None) | Err(_) => asks.note_thread_workspace_unresolved(thread_id),
+                        // Only a FAILED read is an unknown; a thread that
+                        // does not exist has no policy to bypass.
+                        Ok(None) => {}
+                        Err(_) => asks.note_thread_workspace_unresolved(thread_id),
                     }
                     match asks.auto_decision(thread_id, &dir, risk, &action_key) {
                         Some(crate::ask::Decision::Allow) => crate::acp::Want::AllowOnce,
@@ -7498,7 +7501,8 @@ async fn codex_consumer(
                 // A failed read is RECORDED, not ignored — see the ACP route.
                 match repo::get_thread(&db, thread_id).await {
                     Ok(Some(row)) => registry.note_thread_workspace(thread_id, row.workspace_id),
-                    Ok(None) | Err(_) => registry.note_thread_workspace_unresolved(thread_id),
+                    Ok(None) => {}
+                    Err(_) => registry.note_thread_workspace_unresolved(thread_id),
                 }
                 // `risk` gates issue #103's read-only batch/issue grants inside
                 // auto_decision; it never widens Full/Always, which ignore it.
