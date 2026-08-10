@@ -328,7 +328,28 @@ fn now_unix_string() -> String {
     secs.to_string()
 }
 
-fn matches_name(list: &[String], name: &str) -> bool {
+/// Does this rule list NAME this repo — the test used where a match GRANTS.
+///
+/// Exact, because that is precisely how `planner::resolve` binds a lane to a
+/// workspace repo (`*n == dir.repo`), and the two have to agree on what "this
+/// repository" means. Repos are deduplicated by local path or remote URL and
+/// never by name (`store::repo::add_repo_ref`), so one workspace can hold
+/// genuinely distinct repositories called `api` and `API`. Folding case here
+/// made `allowed_repos: ["api"]` authorize a lane targeting `API` — an
+/// allowlist permitting a repository it had never named, and a scope rule
+/// silently covering work in the wrong checkout.
+fn allowlist_names_repo(list: &[String], name: &str) -> bool {
+    list.iter().any(|entry| entry == name)
+}
+
+/// Does this rule list CATCH this repo — the test used where a match REFUSES.
+///
+/// Deliberately looser than the allow side, and the asymmetry is the whole
+/// point: each list matches in whichever direction fails CLOSED. A denial that
+/// misses because someone wrote `API` for a repo named `api` is a hole; an
+/// allowance that hits for the same reason authorizes a different repository.
+/// So the denylist is generous and the allowlist is exact.
+fn denylist_catches_repo(list: &[String], name: &str) -> bool {
     list.iter().any(|entry| entry.eq_ignore_ascii_case(name))
 }
 
@@ -548,14 +569,16 @@ pub fn adjudicate_lane(
         };
     }
 
-    if matches_name(&policy.rules.denied_repos, lane.repo_name) {
+    if denylist_catches_repo(&policy.rules.denied_repos, lane.repo_name) {
         return build(
             LaneDecision::Denied,
             VerdictReason::RepoDeniedByPolicy,
             Some(lane.repo_name.to_string()),
         );
     }
-    if !policy.rules.allowed_repos.is_empty() && !matches_name(&policy.rules.allowed_repos, lane.repo_name) {
+    if !policy.rules.allowed_repos.is_empty()
+        && !allowlist_names_repo(&policy.rules.allowed_repos, lane.repo_name)
+    {
         return build(
             LaneDecision::Denied,
             VerdictReason::RepoOutsideProjectScope,
@@ -885,6 +908,56 @@ mod tests {
         let after = adjudicate_lane(&tightened, "rev-1", &base_lane());
         assert_eq!(after.decision, LaneDecision::Denied);
         assert_eq!(after.policy_revision, "2");
+    }
+
+    /// An allowlist may only authorize the repository it NAMED, and a denylist
+    /// may not be dodged by spelling.
+    ///
+    /// Repos are deduplicated by local path or remote URL and never by name, so
+    /// one workspace can hold genuinely distinct repositories called `api` and
+    /// `API` — and `planner::resolve` binds a lane to one of them by exact
+    /// name. A case-folding allowlist therefore authorized the OTHER repo.
+    ///
+    /// The two lists match differently on purpose, each in the direction that
+    /// fails closed: exact where a hit grants, generous where a hit refuses.
+    #[test]
+    fn repo_scope_matches_exactly_to_allow_and_generously_to_deny() {
+        let mut lane = base_lane();
+        lane.repo_name = "API";
+
+        // ALLOW: naming `api` must not authorize the distinct repo `API`.
+        let mut scoped = default_policy(PolicyScope::Workspace(1));
+        scoped.rules.allowed_repos = vec!["api".to_string()];
+        let verdict = adjudicate_lane(&scoped, "rev-1", &lane);
+        assert_eq!(
+            verdict.decision,
+            LaneDecision::Denied,
+            "an allowlist must not authorize a repository it did not name"
+        );
+        assert_eq!(verdict.reason, VerdictReason::RepoOutsideProjectScope);
+
+        // …and the repository it DID name is still allowed.
+        let mut named = base_lane();
+        named.repo_name = "api";
+        assert_eq!(
+            adjudicate_lane(&scoped, "rev-1", &named).decision,
+            LaneDecision::AllowedByPolicy
+        );
+
+        // DENY: a spelling difference must not slip past a refusal.
+        let mut refused = default_policy(PolicyScope::Workspace(1));
+        refused.rules.denied_repos = vec!["api".to_string()];
+        for spelling in ["api", "API", "Api"] {
+            let mut lane = base_lane();
+            lane.repo_name = spelling;
+            let verdict = adjudicate_lane(&refused, "rev-1", &lane);
+            assert_eq!(
+                verdict.decision,
+                LaneDecision::Denied,
+                "{spelling} must not dodge a denial"
+            );
+            assert_eq!(verdict.reason, VerdictReason::RepoDeniedByPolicy);
+        }
     }
 
     #[test]
