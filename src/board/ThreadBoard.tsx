@@ -332,7 +332,12 @@ export function ThreadBoard() {
           there could never be seen by the person who has to act on it. A
           policy-allowed lane never appears here; the panel renders nothing
           when there is nothing pending. */}
-      <div className="shrink-0 px-5 empty:hidden">
+      {/* Bounded. A policy can gate every lane of a proposal (up to 64), and the
+          board is `overflow-hidden` — an unbounded `shrink-0` panel would push
+          the chat, and the later Gate rows themselves, outside the WebView with
+          no way to scroll to them. Capped at a third of the viewport, scrolling
+          inside itself past that. */}
+      <div className="max-h-[33vh] shrink-0 overflow-y-auto px-5 empty:hidden">
         <LaneGatePanel threadId={activeThreadId} />
       </div>
       <div className="flex min-h-0 flex-1 flex-col">{renderTabBody()}</div>

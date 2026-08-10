@@ -3488,11 +3488,27 @@ pub async fn resolve_lane_gate(
     // re-proposal can drop this lane without touching the policy at all, and
     // the card open on screen stays clickable. Approving it would materialize
     // and dispatch work the user has removed from the reviewed scope.
-    if let Some(dir) = crate::store::repo::get_direction(&db, direction_id).await.map_err(e)? {
-        if !lane_is_in_current_scope(&db, dir.thread_id, direction_id).await.map_err(e)? {
-            return Err("gate_out_of_scope".to_string());
+    // The scope check and everything it authorizes run under the planner's own
+    // per-thread gate, the same one `save_proposal_value_from` and confirm take.
+    // Without it the check is a TOCTOU read: a re-proposal landing between the
+    // validation and the write would still see its removed lane approved,
+    // materialized and dispatched. `GateResolutionGuard` above only excludes a
+    // second resolution of THIS lane; it says nothing about plan mutations.
+    //
+    // Lock order is thread gate → workspace write lock (materialize takes the
+    // latter), matching confirm, so the two paths cannot deadlock against each
+    // other.
+    let _plan_gate = match crate::store::repo::get_direction(&db, direction_id).await.map_err(e)? {
+        Some(dir) => {
+            let gate = crate::planner::thread_gate(dir.thread_id);
+            let held = gate.clone().lock_owned().await;
+            if !lane_is_in_current_scope(&db, dir.thread_id, direction_id).await.map_err(e)? {
+                return Err("gate_out_of_scope".to_string());
+            }
+            Some(held)
         }
-    }
+        None => None,
+    };
     crate::store::repo::record_gate_decision(
         &db,
         direction_id,

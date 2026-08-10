@@ -1576,6 +1576,23 @@ pub(crate) async fn chat_open_worker_impl(
     // review), so checking here covers them all. Read-only — `judge_lane`
     // records nothing, because a refused start is not a new decision about the
     // lane, and a board redispatching workers would otherwise bury the ledger.
+    // Held across the check AND the session/engine start below. A bare read
+    // followed by several awaits is only a narrower window: a tighten
+    // committing in between would still let the worker start under superseded
+    // rules. Policy edits are rare and human-initiated, so serialising them
+    // behind a worker start is the cheap side of this trade; the lock is the
+    // same one `set_authority_policy` and materialization take, and nothing on
+    // this path materializes, so the acquisition cannot nest.
+    let _policy_guard = match repo::get_direction(db, direction_id).await? {
+        Some(dir) => match repo::get_thread(db, dir.thread_id).await? {
+            Some(thread) => {
+                let lock = crate::materialize::workspace_write_lock(thread.workspace_id).await;
+                Some(lock.lock_owned().await)
+            }
+            None => None,
+        },
+        None => None,
+    };
     if let Some(verdict) = crate::materialize::judge_lane(db, direction_id).await? {
         if !matches!(
             verdict.decision,

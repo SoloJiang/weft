@@ -310,7 +310,10 @@ fn proposal_version() -> String {
 /// deleting a winner's direction, a re-propose landing mid-confirm). Different threads don't block
 /// each other. The REGISTRY is a lock-free DashMap; the per-thread value is a tokio Mutex held
 /// across the whole op (incl. slow git materialize — tokio::sync::Mutex is async/await-safe).
-fn thread_gate(thread_id: i32) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+/// `pub(crate)` so Gate resolution can share it: validating that a lane is
+/// still in the reviewed scope and then acting on it must exclude a concurrent
+/// re-proposal, or the check is only a TOCTOU read.
+pub(crate) fn thread_gate(thread_id: i32) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     static GATES: std::sync::OnceLock<dashmap::DashMap<i32, std::sync::Arc<tokio::sync::Mutex<()>>>> =
         std::sync::OnceLock::new();
     let gates = GATES.get_or_init(dashmap::DashMap::new);
