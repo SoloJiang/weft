@@ -1261,6 +1261,53 @@ async fn unsupported_materialized_proposal_decision_needs_a_policy_gate() {
     assert_eq!(lane.reasons[0].direction_id, Some(fixture.direction_id));
 }
 
+/// A lane with NO plan still goes through `authorize_materialize` and still
+/// gets a `decision` row. Readiness used to short-circuit the whole no-plan
+/// case to `AllowedByPolicy`, so a gated standalone lane reported as merely in
+/// progress: the Gate panel offered a card while readiness called the issue
+/// ready, and `PolicyGatePending` could never surface without a plan.
+#[tokio::test]
+async fn a_gated_lane_with_no_plan_still_reports_its_gate() {
+    let fixture = fixture(None).await;
+
+    // Newer than the row `materialize_direction` wrote for this fixture, so
+    // this is the lane's newest verdict.
+    repo::append_evidence(
+        &fixture.db,
+        repo::EvidenceWrite {
+            thread_id: fixture.thread_id,
+            direction_id: fixture.direction_id,
+            kind: repo::EVIDENCE_KIND_DECISION,
+            source: repo::EVIDENCE_SOURCE_AUTHORITY,
+            source_ref: &format!("materialize_direction:{}", fixture.direction_id),
+            revision: "",
+            // No policy is configured, so the scope resolves to "0" and this
+            // verdict is the one in force rather than a superseded one.
+            policy_revision: "0",
+            summary: "lane decision: needs_gate",
+            payload: r#"{"decision":"needs_gate"}"#,
+            collection_state: repo::EVIDENCE_COLLECTION_OK,
+        },
+    )
+    .await
+    .expect("gate verdict for a lane with no plan");
+
+    let result =
+        weft::readiness::collect(&fixture.db, &fixture.bus, &fixture.asks, fixture.thread_id)
+            .await
+            .expect("readiness");
+
+    assert_eq!(result.readiness, IssueReadiness::NeedsYou);
+    let lane = result
+        .lanes
+        .iter()
+        .find(|lane| lane.direction_id == fixture.direction_id)
+        .expect("the standalone lane is still collected");
+    assert_eq!(lane.readiness, LaneReadiness::NeedsYou);
+    assert_eq!(lane.reasons[0].code, ReasonCode::PolicyGatePending);
+    assert_eq!(lane.reasons[0].direction_id, Some(fixture.direction_id));
+}
+
 #[tokio::test]
 async fn all_pending_proposal_lanes_are_active_needs_you_lanes() {
     let db = Db::connect("sqlite::memory:").await.expect("memory db");

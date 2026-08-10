@@ -897,12 +897,67 @@ fn effective_lane_policy(
     let Some(verdict) = recorded.get(&proposed_lane.direction_id) else {
         return shape;
     };
-    let recorded_decision = match verdict.as_str() {
+    stricter_materialized_policy(shape, recorded_lane_decision(verdict))
+}
+
+/// The recorded `decision` evidence for one thread's lanes, plus whether it
+/// could be read at all.
+///
+/// Every reader asks the same three questions in the same order — was the
+/// ledger readable, is this lane's newest verdict superseded, and what did it
+/// say — so they are asked in ONE place. The paths differ only in the SHAPE
+/// they fold the answer onto: a proposal lane's shape comes from the proposal,
+/// a legacy lane's shape is the established `AllowedByPolicy`.
+struct LaneDecisionLedger {
+    unreadable: bool,
+    decisions: HashMap<i32, String>,
+    superseded: repo::SupersededLanes,
+}
+
+impl LaneDecisionLedger {
+    /// NOT best-effort. Falling back to an empty map restores the pre-#172
+    /// shape-only reading, under which every confirmed lane reads as allowed —
+    /// so a lane whose evidence says `needs_gate` or `denied` would drop out of
+    /// NeedsYou and its issue could present as ReviewReady, on the strength of
+    /// a failed read. `unreadable` instead gates every materialized lane, which
+    /// keeps the issue in NeedsYou: the recoverable direction.
+    async fn load(db: &Db, thread_id: i32) -> Self {
+        let read = repo::latest_lane_decisions(db, thread_id).await;
+        let unreadable = read.is_err();
+        let (decisions, superseded) = read.unwrap_or_default();
+        Self {
+            unreadable,
+            decisions,
+            superseded,
+        }
+    }
+
+    /// The policy a MATERIALIZED lane is actually under.
+    ///
+    /// A SUPERSEDED verdict is not the same as never having been judged.
+    /// Falling back to `shape` for one would read a confirmed lane as allowed,
+    /// so tightening a policy onto its branch would leave the issue
+    /// ReviewReady until some other surface happened to re-adjudicate. Gate it
+    /// now instead. A lane with NO decision at all predates any policy and does
+    /// keep the shape reading, or every already-materialized lane in an
+    /// upgraded install would suddenly report as gated.
+    fn materialized_policy(&self, direction_id: i32, shape: PolicyDecision) -> PolicyDecision {
+        if self.unreadable || self.superseded.contains(&direction_id) {
+            return PolicyDecision::NeedsGate;
+        }
+        let Some(verdict) = self.decisions.get(&direction_id) else {
+            return shape;
+        };
+        stricter_materialized_policy(shape, recorded_lane_decision(verdict))
+    }
+}
+
+fn recorded_lane_decision(verdict: &str) -> PolicyDecision {
+    match verdict {
         "needs_gate" => PolicyDecision::NeedsGate,
         "denied" => PolicyDecision::Denied,
         _ => PolicyDecision::AllowedByPolicy,
-    };
-    stricter_materialized_policy(shape, recorded_decision)
+    }
 }
 
 fn stricter_materialized_policy(
@@ -3727,10 +3782,20 @@ pub async fn collect_with_check_execution(
 
     match planned_lane_source(plan.as_ref()) {
         PlannedLaneSource::Legacy => {
+            // "No plan" is a statement about the PROPOSAL, not about authority.
+            // A standalone lane still goes through `authorize_materialize` and
+            // still gets a `decision` row, so assigning `AllowedByPolicy`
+            // unconditionally here published a gated lane as allowed: the Gate
+            // panel offered a card while readiness reported the issue ready,
+            // and `PolicyGatePending` never surfaced for any lane without a
+            // plan. The shape reading stays `AllowedByPolicy` — that is the
+            // established legacy path — and the ledger tightens it.
+            let ledger = LaneDecisionLedger::load(db, thread_id).await;
             for direction in &directions {
                 pending.push(PendingLaneCollection::Direction {
                     direction: direction.clone(),
-                    policy: PolicyDecision::AllowedByPolicy,
+                    policy: ledger
+                        .materialized_policy(direction.id, PolicyDecision::AllowedByPolicy),
                 });
             }
         }
@@ -3753,38 +3818,17 @@ pub async fn collect_with_check_execution(
             // Issue #172: the verdict actually recorded for each lane, so a
             // confirmed-but-gated (or denied) lane is not reported as allowed
             // just because the proposal shape says confirmed.
-            //
-            // NOT best-effort. Falling back to an empty map restores the
-            // pre-#172 shape-only reading, under which every confirmed lane
-            // reads as allowed — so a lane whose evidence says `needs_gate` or
-            // `denied` would drop out of NeedsYou and its issue could present
-            // as ReviewReady, on the strength of a failed read. When the
-            // verdicts cannot be read, every materialized lane is treated as
-            // gated instead: that keeps the issue in NeedsYou, which is the
-            // recoverable direction.
-            let recorded_lane_decisions = repo::latest_lane_decisions(db, thread_id).await;
-            let decisions_unreadable = recorded_lane_decisions.is_err();
-            let (recorded_lane_decisions, superseded_lanes) =
-                recorded_lane_decisions.unwrap_or_default();
+            let ledger = LaneDecisionLedger::load(db, thread_id).await;
+            let recorded_lane_decisions = &ledger.decisions;
             let mut materialized_policies = HashMap::new();
             for proposed_lane in &proposal_lanes {
                 if proposed_lane.direction_id == 0 {
                     continue;
                 }
-                // A SUPERSEDED verdict is not the same as never having been
-                // judged. The revision filter drops the former, and falling
-                // back to the proposal shape then reads a confirmed lane as
-                // allowed — so tightening a policy onto its branch would leave
-                // the issue ReviewReady until some other surface happened to
-                // re-adjudicate. Gate it now instead. A lane with NO decision
-                // at all predates any policy and must keep the shape reading,
-                // or every already-materialized lane in an upgraded install
-                // would suddenly report as gated.
-                let stale = superseded_lanes.contains(&proposed_lane.direction_id);
-                let policy = match decisions_unreadable || stale {
-                    true => PolicyDecision::NeedsGate,
-                    false => effective_lane_policy(phase, proposed_lane, &recorded_lane_decisions),
-                };
+                let policy = ledger.materialized_policy(
+                    proposed_lane.direction_id,
+                    proposal_lane_policy(phase, proposed_lane),
+                );
                 materialized_policies
                     .entry(proposed_lane.direction_id)
                     .and_modify(|current| {
@@ -3853,20 +3897,13 @@ pub async fn collect_with_check_execution(
                 // direction with `needs_gate` evidence. Assigning
                 // AllowedByPolicy unconditionally reported such a blocked task
                 // as merely in progress instead of NeedsYou, hiding the very
-                // thing the Gate exists to surface. Apply what was actually
-                // recorded; a lane with no verdict keeps the permissive
-                // reading, which is what a pre-policy lane must have.
-                let recorded = recorded_lane_decisions.get(&direction.id).map(String::as_str);
-                let stale = superseded_lanes.contains(&direction.id);
-                let policy = match (decisions_unreadable || stale, recorded) {
-                    (true, _) => PolicyDecision::NeedsGate,
-                    (false, Some("needs_gate")) => PolicyDecision::NeedsGate,
-                    (false, Some("denied")) => PolicyDecision::Denied,
-                    (false, _) => PolicyDecision::AllowedByPolicy,
-                };
+                // thing the Gate exists to surface. Its shape reading is the
+                // same `AllowedByPolicy` a legacy lane gets, for the same
+                // reason: no proposal ever spoke for it.
                 pending.push(PendingLaneCollection::Direction {
                     direction: direction.clone(),
-                    policy,
+                    policy: ledger
+                        .materialized_policy(direction.id, PolicyDecision::AllowedByPolicy),
                 });
             }
         }
@@ -7207,19 +7244,63 @@ mod tests {
         assert_eq!(released, CheckEvidence::Passed);
     }
 
+    /// The truncation MARKER, proven without a process or a clock.
+    ///
+    /// `noisy_check_streams_a_bounded_tail_before_its_deadline` used to be the
+    /// only coverage of this, and it could only observe a marker if the child
+    /// emitted past the budget before the deadline — a race against process
+    /// spawn, not a statement about the buffer. The semantics belong here,
+    /// where they are decided by arithmetic.
+    #[test]
+    fn output_tail_buffer_marks_only_the_writes_that_actually_discarded_bytes() {
+        let mut exact = OutputTailBuffer::new(8);
+        exact.append(b"12345678");
+        assert_eq!(exact.render(), "12345678", "a tail at the budget is whole");
+
+        let mut under = OutputTailBuffer::new(8);
+        under.append(b"abc");
+        under.append(b"de");
+        assert_eq!(under.render(), "abcde", "two writes still under the budget");
+
+        // Ring overflow across writes: the marker appears and the partial
+        // first line is dropped, so no leading fragment is ever surfaced.
+        let mut rolled = OutputTailBuffer::new(8);
+        rolled.append(b"aaaa\nbbb");
+        rolled.append(b"b\ncccc");
+        assert_eq!(rolled.render(), "…\ncccc");
+
+        // A single write larger than the whole budget keeps only its end.
+        let mut oversized = OutputTailBuffer::new(6);
+        oversized.append(b"xxxxxxxx\nyz");
+        assert_eq!(oversized.render(), "…\nyz");
+
+        // A zero budget retains nothing but must still admit it dropped data.
+        let mut none = OutputTailBuffer::new(0);
+        none.append(b"anything");
+        assert_eq!(none.render(), "…\n");
+    }
+
     #[tokio::test]
     async fn noisy_check_streams_a_bounded_tail_before_its_deadline() {
         let root = tempfile::tempdir().expect("temporary noisy check fixture");
         let started = Instant::now();
+        // The deadline is deliberately far larger than the ~1ms this loop needs
+        // to pass a 2 KB budget, because what it has to clear is not the
+        // writing — it is `sh` being spawned and scheduled at all. At 50ms this
+        // test was racing process-spawn latency on a loaded macOS runner and
+        // failing with an empty tail while the code was correct. The margin is
+        // against the machine; the loop never exits, so the deadline is still
+        // what ends the process.
+        let deadline = Duration::from_millis(1_500);
         let outcome = tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(20),
             run_bounded_check(
                 root.path(),
                 &shell_check(
                     "noisy",
                     "while :; do printf 'readiness-output-readiness-output-readiness-output\\n'; done",
                 ),
-                Duration::from_millis(50),
+                deadline,
             ),
         )
         .await
@@ -7230,7 +7311,7 @@ mod tests {
             BoundedCheckOutcome::Completed(_) => panic!("noisy check unexpectedly completed"),
         };
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(20),
             "noisy process must be killed by the bounded deadline"
         );
         assert!(
@@ -7240,7 +7321,11 @@ mod tests {
         );
         assert!(
             output_tail.starts_with("…\n"),
-            "large output must report that its retained tail was truncated"
+            "an unbroken printf loop given {deadline:?} must overrun a \
+             {CHECK_OUTPUT_TAIL_BYTES}-byte budget and say so; a tail this \
+             short means the streaming path fed the buffer nothing, got {} \
+             bytes: {output_tail:?}",
+            output_tail.as_bytes().len()
         );
     }
 
