@@ -3261,191 +3261,73 @@ pub struct LaneGateDto {
 /// registered worktree whose latest `decision` evidence names `needs_gate`.
 #[tauri::command]
 pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGateDto>> {
+    use crate::lane_state::LaneAuthorityState;
+
     let directions = crate::store::repo::list_directions(&db, thread_id).await.map_err(e)?;
-    // Direction ids the CURRENT plan still references. A re-propose that drops
-    // or replaces a gated lane leaves the old direction and its `needs_gate`
-    // evidence behind, and enumerating directions alone keeps that card
-    // actionable — approving it would materialize and dispatch work the user's
-    // reviewed scope no longer contains. Empty means the plan records no ids
-    // yet (nothing confirmed), in which case there is nothing to filter
-    // against and every lane stays eligible.
-    // A plan that exists but will not parse is NOT "no plan": reading it that
-    // way switches scope filtering off, which is the permissive direction — an
-    // obsolete planner-owned Gate would become displayable and approvable. Fail
-    // the command instead; the card is unreachable either way, and an error is
-    // recoverable where a silently widened scope is not.
-    let stored_plan = crate::store::repo::get_plan(&db, thread_id).await.map_err(e)?;
-    let current_lanes: Option<Vec<serde_json::Value>> = match stored_plan {
-        None => None,
-        Some(plan) => {
-            let parsed: serde_json::Value = serde_json::from_str(&plan.proposal)
-                .map_err(|error| format!("stored proposal is unreadable: {error}"))?;
-            let dirs = parsed
-                .get("directions")
-                .and_then(|dirs| dirs.as_array())
-                .ok_or_else(|| "stored proposal has no directions array".to_string())?;
-            Some(dirs.clone())
-        }
-    };
-    let in_scope: std::collections::HashSet<i32> = current_lanes
-        .iter()
-        .flatten()
-        .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
-        .map(|id| id as i32)
-        .filter(|id| *id != 0)
-        .collect();
-    // Filter whenever a current plan was READ, not merely when it names ids. A
-    // re-proposal that replaces every gated lane records `direction_id: 0` for
-    // all of its new lanes, so an "is the id set empty?" guard would switch
-    // filtering off exactly when the old cards became obsolete — leaving them
-    // actionable. "No plan at all" is the only case with nothing to filter
-    // against.
-    let filter_to_scope = current_lanes.is_some();
-    // Only the planner's OWN lanes can go out of scope. `create_direction`
-    // makes standalone tasks on a thread that may also have a plan, and those
-    // are never named by any proposal — filtering on plan membership alone
-    // would discard a standalone lane's Gate permanently, leaving a persisted
-    // task with no way to approve or clean it up. A lane counts as
-    // planner-owned once some plan revision has referenced it; anything the
-    // scope history has never seen is left alone.
-    // Every revision, not a page of them: a fixed cap misclassifies a direction
-    // referenced only by an older proposal as standalone, which switches the
-    // scope filter off for exactly the obsolete cards it exists to hide.
-    let planner_owned: std::collections::HashSet<i32> =
-        crate::store::repo::all_plan_revision_proposals(&db, thread_id)
-            .await
-            .map_err(e)?
-            .iter()
-            .filter_map(|proposal| serde_json::from_str::<serde_json::Value>(proposal).ok())
-            .filter_map(|value| value.get("directions").and_then(|d| d.as_array()).cloned())
-            .flatten()
-            .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
-            .map(|id| id as i32)
-            .filter(|id| *id != 0)
-            .chain(in_scope.iter().copied())
-            .collect();
     let mut out = Vec::new();
     for dir in directions {
-        if filter_to_scope && planner_owned.contains(&dir.id) && !in_scope.contains(&dir.id) {
-            continue;
-        }
-        // Whether the lane has a checkout a worker could actually run in — the
-        // same predicate materialization uses, not a path-existence probe.
-        // NOT a reason to skip on its own: the reuse fast-path re-adjudicates
-        // and can gate a lane that already HAS a live checkout (a policy that
-        // tightened after confirm), and that lane needs a card more than any
-        // other — it is paused with no other way back. What the verdict says
-        // decides whether a card is shown; this only distinguishes a healthy
-        // lane from a stranded one.
-        let checkout_ok = crate::materialize::lane_has_valid_checkout(&db, dir.id)
+        // ONE resolved state per lane, mapped exhaustively. Every predicate this
+        // used to compute inline — scope membership, revision staleness,
+        // checkout validity, session liveness, upstream blockers, terminal
+        // lifecycle — now lives in `lane_state` and is the same answer every
+        // other surface sees.
+        let state = crate::lane_state::lane_authority_state(&db, dir.id)
             .await
             .map_err(e)?;
-        let Some(mut latest_decision) =
-            crate::store::repo::latest_decision_evidence(&db, thread_id, dir.id)
-                .await
-                .map_err(e)?
-        else {
-            continue;
-        };
-        // The card must carry the revision a decision can actually be recorded
-        // under. If the policy moved since this verdict was written, recompute
-        // it now: the lane may no longer be gated at all, and if it still is,
-        // the human gets the CURRENT rule and a revision `resolve_lane_gate`
-        // will accept. Without this the card froze at a dead revision and every
-        // approval was rejected with `gate_policy_changed` forever.
-        let current_revision = current_gate_policy_revision(&db, dir.id).await.map_err(e)?;
-        if latest_decision.policy_revision != current_revision {
-            let refreshed = crate::materialize::readjudicate_lane(&db, dir.id).await.map_err(e)?;
-            if refreshed.is_none() {
-                continue;
+        let (verdict, reason) = match &state {
+            // A rule flagged it: the ordinary approve/deny card.
+            LaneAuthorityState::AwaitingGate(verdict) => {
+                (verdict.as_ref(), gate_reason_slug(verdict))
             }
-            let Some(fresh) =
-                crate::store::repo::latest_decision_evidence(&db, thread_id, dir.id)
-                    .await
-                    .map_err(e)?
-            else {
-                continue;
-            };
-            latest_decision = fresh;
-        }
-        let parsed: serde_json::Value = serde_json::from_str(&latest_decision.payload).unwrap_or_default();
-        // `needs_gate` is the ordinary card. `allowed_by_policy` on a lane with
-        // NO checkout is the recoverable-stranding case, and it must be shown
-        // too: the policy was loosened while the Gate was pending (or the git
-        // write failed after an approval), so the lane is permitted and yet
-        // nothing materialized it — hiding it because "it is allowed now" is
-        // exactly what left it with neither a card nor a worker. It carries its
-        // own reason so the copy asks to RESUME rather than to approve; the
-        // button behind it is the same resolve path, which materializes and
-        // returns the lanes to dispatch. `denied` is settled and stays hidden.
-        let verdict = parsed.get("decision").and_then(|v| v.as_str()).unwrap_or("");
-        // `needs_gate` is the ordinary card, shown whether or not a checkout
-        // exists. `allowed_by_policy` is the recoverable case — but a usable
-        // checkout does NOT mean the lane is running: a tightened policy gates
-        // a lane that keeps its worktree, confirm drops it (and its dependents)
-        // from dispatch, and if the policy is later loosened the verdict flips
-        // back to allowed with still nothing started and the proposal UI long
-        // closed. What distinguishes a healthy lane from a paused one is
-        // whether a worker was ever opened for it, not whether a directory
-        // exists. `denied` is settled and stays hidden.
-        // A lane whose worker EXITED is as stopped as one that never started —
-        // both need the resume card. `sessions_for_direction` returns history,
-        // including exited/interrupted rows, so counting rows would hide the
-        // card for any lane that ever ran once. Only a session that could still
-        // receive work counts as running.
-        let never_started = !crate::store::repo::sessions_for_direction(&db, dir.id)
-            .await
-            .map_err(e)?
-            .iter()
-            .any(|session| matches!(session.status.as_str(), "running" | "idle" | "starting"));
-        // A COMPLETED lane is not stranded, whatever its session looks like now:
-        // its worker exits by design, so "allowed, nothing running" describes
-        // every finished task. Offering it a resume card would invite starting
-        // a second worker in a worktree whose work is already done.
-        let finished = dir.status == "done";
-        // A lane whose producer is DENIED is blocked, not recoverable. Denying
-        // A leaves its dependent B allowed and unstarted, which otherwise reads
-        // as stranded — but B's resume card can never dispatch, because
-        // `lane_is_runnable` correctly refuses while A stands denied, and the
-        // reload after each attempt rebuilds the same card. Offering an action
-        // that provably cannot succeed is worse than showing nothing; B's real
-        // blocker is A's denial, which has its own record.
-        let upstream_blocked = upstream_blocks_lane(&db, thread_id, dir.id).await.map_err(e)?;
-        // A finished lane is excluded from BOTH arms, not just the recovery
-        // one. A policy change can re-adjudicate completed work as needs_gate,
-        // and an actionable card for it is worse than useless: approving it
-        // returns the lane from `released_by_gate` — whose runnability check
-        // also ignores lifecycle — and starts a second worker on work that is
-        // already done.
-        if finished {
-            continue;
-        }
-        let stranded = !upstream_blocked
-            && verdict == "allowed_by_policy"
-            && (!checkout_ok || never_started);
-        if verdict != "needs_gate" && !stranded {
-            continue;
-        }
+            // Allowed but with no usable checkout — recoverable, and the only
+            // other card: hiding it because "it is allowed now" is what left
+            // such a lane with neither a worker nor a way back.
+            LaneAuthorityState::NeedsMaterialize(verdict) => {
+                (verdict.as_ref(), "unmaterialized_lane".to_string())
+            }
+            // Everything else has no decision to offer. Denied is settled;
+            // Finished and Running have nothing to ask; OutOfScope is not the
+            // user's current scope; BlockedUpstream's real blocker is the
+            // producer, which carries its own card; ReadyToStart is simply
+            // waiting to be dispatched; NotApplicable binds no repo.
+            LaneAuthorityState::Denied(_)
+            | LaneAuthorityState::Finished
+            | LaneAuthorityState::OutOfScope
+            | LaneAuthorityState::BlockedUpstream { .. }
+            | LaneAuthorityState::ReadyToStart(_)
+            | LaneAuthorityState::Running
+            | LaneAuthorityState::NotApplicable => continue,
+        };
         out.push(LaneGateDto {
             direction_id: dir.id,
             thread_id,
             name: dir.name,
             reason: dir.reason,
             base_branch: dir.base_branch,
-            policy_revision: latest_decision.policy_revision,
-            verdict_reason: match stranded {
-                true => "unmaterialized_lane".to_string(),
-                false => parsed
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            },
-            hit_rule: parsed.get("hit_rule").and_then(|v| v.as_str()).map(str::to_string),
-            observed_at: latest_decision.observed_at,
+            policy_revision: verdict.policy_revision.clone(),
+            verdict_reason: reason,
+            hit_rule: verdict.hit_rule.clone(),
+            observed_at: verdict.decided_at.clone(),
         });
     }
     Ok(out)
+}
+
+/// The stable slug the frontend maps to copy. Derived from the verdict once,
+/// here, rather than re-read from a serialized evidence payload.
+fn gate_reason_slug(verdict: &crate::authority::LaneVerdict) -> String {
+    format!("{:?}", verdict.reason)
+        .split("::")
+        .last()
+        .unwrap_or("awaiting_gate_decision")
+        .chars()
+        .fold(String::new(), |mut acc, ch| {
+            if ch.is_uppercase() && !acc.is_empty() {
+                acc.push('_');
+            }
+            acc.extend(ch.to_lowercase());
+            acc
+        })
 }
 
 /// The policy revision a Gate for this direction must be decided under: the
@@ -3522,7 +3404,10 @@ pub async fn resolve_lane_gate(
         Some(dir) => {
             let gate = crate::planner::thread_gate(dir.thread_id);
             let held = gate.clone().lock_owned().await;
-            if !lane_is_in_current_scope(&db, dir.thread_id, direction_id).await.map_err(e)? {
+            if matches!(
+                crate::lane_state::lane_authority_state(&db, direction_id).await.map_err(e)?,
+                crate::lane_state::LaneAuthorityState::OutOfScope
+            ) {
                 return Err("gate_out_of_scope".to_string());
             }
             Some(held)
@@ -3575,137 +3460,6 @@ pub async fn resolve_lane_gate(
     }
 }
 
-/// Whether this lane still belongs to the thread's CURRENT reviewed scope.
-///
-/// A lane the planner owns but the current proposal no longer names is
-/// obsolete; a standalone lane (`create_direction`, never referenced by any
-/// plan revision) is always in scope. `list_lane_gates` hides obsolete cards,
-/// but hiding is not enforcement: a card already on screen when the lead
-/// re-proposes stays clickable, and the policy revision it carries can be
-/// unchanged, so nothing else would stop the approval from materializing and
-/// dispatching work the user removed.
-async fn lane_is_in_current_scope(db: &Db, thread_id: i32, direction_id: i32) -> anyhow::Result<bool> {
-    // Same fail-closed reading as `list_lane_gates`: an unparseable stored plan
-    // must not be treated as "no plan", which would let an obsolete lane resolve.
-    let Some(plan) = crate::store::repo::get_plan(db, thread_id).await? else {
-        return Ok(true);
-    };
-    let parsed: serde_json::Value = serde_json::from_str(&plan.proposal)
-        .map_err(|error| anyhow::anyhow!("stored proposal is unreadable: {error}"))?;
-    let current_lanes: Vec<serde_json::Value> = parsed
-        .get("directions")
-        .and_then(|dirs| dirs.as_array())
-        .ok_or_else(|| anyhow::anyhow!("stored proposal has no directions array"))?
-        .clone();
-    let in_scope: std::collections::HashSet<i32> = current_lanes
-        .iter()
-        .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
-        .map(|id| id as i32)
-        .filter(|id| *id != 0)
-        .collect();
-    if in_scope.contains(&direction_id) {
-        return Ok(true);
-    }
-    let planner_owned = crate::store::repo::all_plan_revision_proposals(db, thread_id)
-        .await?
-        .iter()
-        .filter_map(|proposal| serde_json::from_str::<serde_json::Value>(proposal).ok())
-        .filter_map(|value| value.get("directions").and_then(|d| d.as_array()).cloned())
-        .flatten()
-        .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
-        .any(|id| id as i32 == direction_id);
-    Ok(!planner_owned)
-}
-
-/// Whether any producer this lane declared is itself refused — denied, or
-/// still waiting on a Gate. Such a lane cannot be started by any action the
-/// user could take on it, so it must not be offered one.
-async fn upstream_blocks_lane(db: &Db, thread_id: i32, direction_id: i32) -> anyhow::Result<bool> {
-    for upstream in crate::store::repo::upstream_direction_ids(db, direction_id).await? {
-        let Some(row) =
-            crate::store::repo::latest_decision_evidence(db, thread_id, upstream).await?
-        else {
-            continue;
-        };
-        let parsed: serde_json::Value = serde_json::from_str(&row.payload).unwrap_or_default();
-        let verdict = parsed.get("decision").and_then(|v| v.as_str()).unwrap_or("");
-        if matches!(verdict, "denied" | "needs_gate") {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Whether one lane can run now: the CURRENT policy still allows it, its own
-/// checkout exists, and every producer it declared has one too.
-///
-/// The policy check is not redundant with the Gate that just cleared. A
-/// dependent materialized under an older revision, and the policy can have
-/// tightened while the upstream Gate sat pending — releasing it on checkout
-/// existence alone would start a worker in a lane the workspace now denies,
-/// through a path that never consults the policy again. Re-adjudicating also
-/// records the fresh verdict, so the ledger shows why a dependent was held.
-///
-/// The upstream half is what stops a join lane (two producers, one still gated)
-/// from being released by the wrong approval.
-async fn lane_is_runnable(db: &Db, direction_id: i32) -> anyhow::Result<bool> {
-    // Terminal lanes are never "runnable": releasing one starts a second worker
-    // on work that is already done. Checked here as well as at card creation,
-    // because this is what the frontend actually dispatches.
-    if crate::store::repo::get_direction(db, direction_id)
-        .await?
-        .is_some_and(|dir| dir.status == "done")
-    {
-        return Ok(false);
-    }
-    if !crate::materialize::lane_has_valid_checkout(db, direction_id).await? {
-        return Ok(false);
-    }
-    let verdict = crate::materialize::readjudicate_lane(db, direction_id).await?;
-    let allowed = match verdict {
-        // A lane binding no write repo has nothing to judge and nothing to
-        // block — its runnability rests entirely on the checks around this.
-        None => true,
-        Some(verdict) => {
-            matches!(verdict.decision, crate::authority::LaneDecision::AllowedByPolicy)
-        }
-    };
-    if !allowed {
-        return Ok(false);
-    }
-    // The WHOLE prerequisite chain, not just the direct producers. Confirm
-    // materializes a gated lane's dependents and withholds only their dispatch,
-    // so in C → B → A with A gated, B has a valid, policy-allowed checkout and
-    // was never started — checking one hop would call C runnable and start it
-    // behind a producer that never ran. Each ancestor must be materialized AND
-    // currently allowed. `seen` also makes a cyclic edge set terminate rather
-    // than recurse forever.
-    let mut seen: std::collections::HashSet<i32> = [direction_id].into_iter().collect();
-    let mut frontier = vec![direction_id];
-    while let Some(current) = frontier.pop() {
-        for upstream in crate::store::repo::upstream_direction_ids(db, current).await? {
-            if !seen.insert(upstream) {
-                continue;
-            }
-            if !crate::materialize::lane_has_valid_checkout(db, upstream).await? {
-                return Ok(false);
-            }
-            let upstream_verdict = crate::materialize::readjudicate_lane(db, upstream).await?;
-            let upstream_allowed = match upstream_verdict {
-                None => true,
-                Some(verdict) => {
-                    matches!(verdict.decision, crate::authority::LaneDecision::AllowedByPolicy)
-                }
-            };
-            if !upstream_allowed {
-                return Ok(false);
-            }
-            frontier.push(upstream);
-        }
-    }
-    Ok(true)
-}
-
 /// The lane whose Gate just cleared, plus every transitive dependent the
 /// clearance actually released. Walks downstream breadth-first and keeps only
 /// lanes that are runnable now, so a dependent still waiting on a DIFFERENT
@@ -3719,7 +3473,7 @@ async fn released_by_gate(db: &Db, direction_id: i32) -> anyhow::Result<Vec<i32>
     // descendant. It still anchors the walk either way — a lane held back by its
     // own upstream cannot release anything behind it.
     let mut released = Vec::new();
-    if lane_is_runnable(db, direction_id).await? {
+    if crate::lane_state::lane_authority_state(db, direction_id).await?.is_dispatchable() {
         released.push(direction_id);
     }
     let mut seen: std::collections::HashSet<i32> = [direction_id].into_iter().collect();
@@ -3729,7 +3483,7 @@ async fn released_by_gate(db: &Db, direction_id: i32) -> anyhow::Result<Vec<i32>
             if !seen.insert(downstream) {
                 continue;
             }
-            if !lane_is_runnable(db, downstream).await? {
+            if !crate::lane_state::lane_authority_state(db, downstream).await?.is_dispatchable() {
                 continue;
             }
             released.push(downstream);

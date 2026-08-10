@@ -1608,13 +1608,18 @@ pub(crate) async fn chat_open_worker_impl(
         },
         None => None,
     };
-    if let Some(verdict) = crate::materialize::judge_lane(db, direction_id).await? {
-        if !matches!(
-            verdict.decision,
-            crate::authority::LaneDecision::AllowedByPolicy
-        ) {
-            anyhow::bail!("the workspace policy no longer allows starting this task");
-        }
+    // The SAME resolved state the Gate panel and the dispatch set use. A raw
+    // verdict check answered only "does the policy allow this lane" and let a
+    // worker start for one that was out of scope, behind a gated producer, or
+    // already finished — each of which the panel correctly refuses to offer.
+    // Admission accepts a lane that is ready OR already running, so a reconnect
+    // is not mistaken for a fresh start.
+    let authority_state = crate::lane_state::lane_authority_state(db, direction_id).await?;
+    if !authority_state.admits_worker() {
+        anyhow::bail!(
+            "the workspace policy no longer allows starting this task ({})",
+            authority_state.label()
+        );
     }
     let mut dir = engine::ensure_worker_parent_chain(db, direction_id, repo_id).await?;
 

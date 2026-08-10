@@ -1,0 +1,316 @@
+//! Issue #172: the ONE authority state of a Lane.
+//!
+//! Every surface that cares whether a lane may proceed — the Gate panel, Gate
+//! resolution, the dispatch set, worker admission, readiness — used to derive
+//! that answer itself, from its own combination of decision evidence, worktree
+//! validity, session existence, plan membership, policy revision, upstream
+//! lanes and lifecycle status. Seven inputs, six call sites, each subtly
+//! different. Every combination one of them missed was a real defect: a card
+//! that could not be dismissed, a worker started behind a producer that never
+//! ran, a finished task offered a resume button, an obsolete card that still
+//! materialized removed work.
+//!
+//! So the inputs are read in exactly one place and collapse into one
+//! discriminated value, which callers map exhaustively (CLAUDE.md: derive ONE
+//! discriminated value, do not re-derive the same booleans at every call site).
+//! Adding a state now forces every surface to say what it does with it, which
+//! is the property that was missing.
+
+use anyhow::Result;
+
+use crate::authority::{LaneDecision, LaneVerdict};
+use crate::store::Db;
+
+/// What the workspace's authority says about one lane, right now.
+///
+/// Ordering of the arms is the order the resolver decides them, and that order
+/// is itself load-bearing: a finished lane is finished whatever the policy now
+/// says, an out-of-scope lane must not be actionable even if it would be
+/// allowed, and a lane behind a blocked producer is not "ready" merely because
+/// its own verdict is clean.
+#[derive(Clone, Debug)]
+pub enum LaneAuthorityState {
+    /// Binds no write repo, so authority has nothing to say about it.
+    NotApplicable,
+    /// Terminal lifecycle. Never actionable and never dispatchable — a policy
+    /// change can re-adjudicate completed work, and acting on that would start
+    /// a second worker on a finished task.
+    Finished,
+    /// The planner owned this lane and the current proposal no longer names it.
+    /// Not the user's reviewed scope any more, so nothing may act on it.
+    /// Standalone lanes (`create_direction`, never in any proposal) are never
+    /// out of scope.
+    OutOfScope,
+    /// Refused: a `denied_repos` rule, or a human's Gate veto.
+    Denied(Box<LaneVerdict>),
+    /// A rule flagged it and no human has resolved it yet. This is the card
+    /// that asks for a decision.
+    AwaitingGate(Box<LaneVerdict>),
+    /// Allowed, but a prerequisite is not runnable — gated, denied, missing its
+    /// checkout, or itself blocked. Starting it would run work behind a
+    /// producer that never ran.
+    BlockedUpstream { blocker: i32 },
+    /// Allowed, but has no checkout a worker could run in. Recoverable: the
+    /// human can ask for it to be set up.
+    NeedsMaterialize(Box<LaneVerdict>),
+    /// Allowed, materialized, and no worker has ever run. This is the only
+    /// state a lane may be dispatched from.
+    ReadyToStart(Box<LaneVerdict>),
+    /// Allowed, materialized, and a worker is live.
+    Running,
+}
+
+impl LaneAuthorityState {
+    /// Whether a worker may be started for this lane now.
+    pub fn is_dispatchable(&self) -> bool {
+        matches!(self, Self::ReadyToStart(_))
+    }
+
+    /// Whether a worker may be RUNNING for this lane — admission accepts an
+    /// already-live lane so a reconnect is not treated as a fresh start.
+    pub fn admits_worker(&self) -> bool {
+        matches!(self, Self::ReadyToStart(_) | Self::Running)
+    }
+
+    /// A stable, low-cardinality name for the arm. Errors and logs want to say
+    /// WHICH refusal this was without printing a whole verdict struct (a
+    /// `{:?}` of one carries rule text into places nobody reviewed it for).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Finished => "finished",
+            Self::OutOfScope => "out_of_scope",
+            Self::Denied(_) => "denied",
+            Self::AwaitingGate(_) => "awaiting_gate",
+            Self::BlockedUpstream { .. } => "blocked_upstream",
+            Self::NeedsMaterialize(_) => "needs_materialize",
+            Self::ReadyToStart(_) => "ready_to_start",
+            Self::Running => "running",
+        }
+    }
+
+    /// The verdict behind this state, when there is one. `Finished`,
+    /// `OutOfScope`, `BlockedUpstream`, `Running` and `NotApplicable` are
+    /// lifecycle or graph facts rather than judgments.
+    pub fn verdict(&self) -> Option<&LaneVerdict> {
+        match self {
+            Self::Denied(v) | Self::AwaitingGate(v) | Self::NeedsMaterialize(v) | Self::ReadyToStart(v) => {
+                Some(v)
+            }
+            Self::NotApplicable | Self::Finished | Self::OutOfScope | Self::BlockedUpstream { .. } | Self::Running => None,
+        }
+    }
+}
+
+/// This lane's own state, ignoring its prerequisites.
+///
+/// Split from the full resolve so the upstream walk can ask about ancestors
+/// without recursing: an ancestor's LOCAL state is all a consumer needs, and
+/// the walk covers the chain. That also makes a cyclic edge set terminate by
+/// construction rather than by a depth guard.
+async fn local_state(db: &Db, direction_id: i32) -> Result<LaneAuthorityState> {
+    let Some(dir) = crate::store::repo::get_direction(db, direction_id).await? else {
+        return Ok(LaneAuthorityState::NotApplicable);
+    };
+    if dir.status == "done" {
+        return Ok(LaneAuthorityState::Finished);
+    }
+    if !lane_is_in_current_scope(db, dir.thread_id, direction_id).await? {
+        return Ok(LaneAuthorityState::OutOfScope);
+    }
+    // Judged FRESH every time rather than read from the newest evidence row and
+    // compared against the active revision. That comparison is what produced
+    // the stale-card deadlock (a card frozen at a dead revision whose approval
+    // was rejected forever) and the fallback-to-an-older-row bug; asking the
+    // adjudicator now cannot be stale by construction. `judge_lane` records
+    // nothing, so this is safe on a hot path.
+    let Some(verdict) = crate::materialize::judge_lane(db, direction_id).await? else {
+        return Ok(LaneAuthorityState::NotApplicable);
+    };
+    match verdict.decision {
+        LaneDecision::Denied => return Ok(LaneAuthorityState::Denied(Box::new(verdict))),
+        LaneDecision::NeedsGate => return Ok(LaneAuthorityState::AwaitingGate(Box::new(verdict))),
+        LaneDecision::AllowedByPolicy => {}
+    }
+    if !crate::materialize::lane_has_valid_checkout(db, direction_id).await? {
+        return Ok(LaneAuthorityState::NeedsMaterialize(Box::new(verdict)));
+    }
+    // A session that EXITED leaves the lane as stopped as one that never
+    // started, so history is not the question — whether anything could still
+    // receive work is.
+    let live = crate::store::repo::sessions_for_direction(db, direction_id)
+        .await?
+        .iter()
+        .any(|session| matches!(session.status.as_str(), "running" | "idle" | "starting"));
+    match live {
+        true => Ok(LaneAuthorityState::Running),
+        false => Ok(LaneAuthorityState::ReadyToStart(Box::new(verdict))),
+    }
+}
+
+/// The full state of one lane, including its prerequisite chain.
+pub async fn lane_authority_state(db: &Db, direction_id: i32) -> Result<LaneAuthorityState> {
+    let own = local_state(db, direction_id).await?;
+    // Only a lane that is otherwise ready can be held back by a producer.
+    // A gated, denied, finished or out-of-scope lane already has its answer.
+    if !matches!(
+        own,
+        LaneAuthorityState::ReadyToStart(_) | LaneAuthorityState::NeedsMaterialize(_)
+    ) {
+        return Ok(own);
+    }
+    // The WHOLE chain, not one hop. Confirm materializes a gated lane's
+    // dependents and withholds only their dispatch, so a direct producer can
+    // look perfectly ready while ITS producer is still gated.
+    let mut seen: std::collections::HashSet<i32> = [direction_id].into_iter().collect();
+    let mut frontier = vec![direction_id];
+    while let Some(current) = frontier.pop() {
+        for upstream in crate::store::repo::upstream_direction_ids(db, current).await? {
+            if !seen.insert(upstream) {
+                continue;
+            }
+            let state = local_state(db, upstream).await?;
+            // A producer is satisfactory only once it is FINISHED or RUNNING.
+            // Anything else blocks: gated and denied obviously, but also
+            // `ReadyToStart` — a producer that has not run yet is exactly the
+            // case confirm creates when it materializes a gated lane's
+            // dependents and withholds their dispatch.
+            //
+            // A satisfactory producer ends the walk down that edge rather than
+            // continuing into ITS producers: whether the thing C waits for has
+            // run is the whole question, and if B is finished or live, what B
+            // once waited for is settled. That is why the frontier only grows
+            // through unsatisfactory edges, which is also what bounds it.
+            match state {
+                LaneAuthorityState::Finished | LaneAuthorityState::Running => continue,
+                _ => return Ok(LaneAuthorityState::BlockedUpstream { blocker: upstream }),
+            }
+        }
+    }
+    Ok(own)
+}
+
+/// Whether this lane still belongs to the thread's CURRENT reviewed scope.
+///
+/// A lane the planner owns but the current proposal no longer names is
+/// obsolete. A standalone lane (`create_direction`, never referenced by any
+/// plan revision) is always in scope. An unparseable stored plan is an ERROR,
+/// never "no plan": reading it as absent switches the check off, which is the
+/// permissive direction.
+async fn lane_is_in_current_scope(db: &Db, thread_id: i32, direction_id: i32) -> Result<bool> {
+    let Some(plan) = crate::store::repo::get_plan(db, thread_id).await? else {
+        return Ok(true);
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&plan.proposal)
+        .map_err(|error| anyhow::anyhow!("stored proposal is unreadable: {error}"))?;
+    let current_lanes = parsed
+        .get("directions")
+        .and_then(|dirs| dirs.as_array())
+        .ok_or_else(|| anyhow::anyhow!("stored proposal has no directions array"))?;
+    let in_scope = current_lanes
+        .iter()
+        .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
+        .any(|id| id as i32 == direction_id);
+    if in_scope {
+        return Ok(true);
+    }
+    // Every revision, unpaged: a page bound reclassifies a lane referenced only
+    // by an older proposal as standalone, switching the check off for exactly
+    // the obsolete cards it exists to catch.
+    let planner_owned = crate::store::repo::all_plan_revision_proposals(db, thread_id)
+        .await?
+        .iter()
+        .filter_map(|proposal| serde_json::from_str::<serde_json::Value>(proposal).ok())
+        .filter_map(|value| value.get("directions").and_then(|d| d.as_array()).cloned())
+        .flatten()
+        .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
+        .any(|id| id as i32 == direction_id);
+    Ok(!planner_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn verdict(decision: LaneDecision) -> Box<LaneVerdict> {
+        Box::new(LaneVerdict {
+            decision,
+            reason: crate::authority::VerdictReason::ProtectedBranch,
+            hit_rule: None,
+            policy_revision: "1".to_string(),
+            scope_revision: "1".to_string(),
+            decided_at: String::new(),
+            source: "test",
+        })
+    }
+
+    /// Every arm, enumerated ONCE. The behaviour tests below assert over this
+    /// whole set rather than over their own hand-listed tables, so a new arm
+    /// added to the enum without a decision here fails them instead of silently
+    /// inheriting whatever `matches!` happens to say.
+    fn all_states() -> Vec<LaneAuthorityState> {
+        vec![
+            LaneAuthorityState::NotApplicable,
+            LaneAuthorityState::Finished,
+            LaneAuthorityState::OutOfScope,
+            LaneAuthorityState::Denied(verdict(LaneDecision::Denied)),
+            LaneAuthorityState::AwaitingGate(verdict(LaneDecision::NeedsGate)),
+            LaneAuthorityState::BlockedUpstream { blocker: 7 },
+            LaneAuthorityState::NeedsMaterialize(verdict(LaneDecision::AllowedByPolicy)),
+            LaneAuthorityState::ReadyToStart(verdict(LaneDecision::AllowedByPolicy)),
+            LaneAuthorityState::Running,
+        ]
+    }
+
+    fn labels_where(predicate: impl Fn(&LaneAuthorityState) -> bool) -> Vec<&'static str> {
+        all_states()
+            .iter()
+            .filter(|state| predicate(state))
+            .map(|state| state.label())
+            .collect()
+    }
+
+    /// Exactly one state is dispatchable. This is the property the whole module
+    /// exists for: before it, six call sites each decided "may this start?"
+    /// from their own mix of inputs, and every combination one of them missed
+    /// was a real defect — a finished task offered a resume button, a worker
+    /// started behind a producer that never ran, an obsolete card that still
+    /// materialized removed work.
+    #[test]
+    fn only_ready_to_start_is_dispatchable() {
+        assert_eq!(
+            labels_where(LaneAuthorityState::is_dispatchable),
+            vec!["ready_to_start"]
+        );
+    }
+
+    /// Admission is deliberately WIDER than dispatch by exactly one state: a
+    /// lane whose worker is already live must reconnect rather than be refused
+    /// as if it were a fresh start.
+    #[test]
+    fn admission_accepts_ready_and_running_only() {
+        assert_eq!(
+            labels_where(LaneAuthorityState::admits_worker),
+            vec!["ready_to_start", "running"]
+        );
+    }
+
+    /// Labels reach error messages and logs, so two arms sharing one would make
+    /// two different refusals indistinguishable to whoever is diagnosing them.
+    #[test]
+    fn every_state_has_its_own_label() {
+        let labels: Vec<&str> = all_states().iter().map(|state| state.label()).collect();
+        let unique: std::collections::HashSet<&&str> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "{labels:?}");
+    }
+
+    /// Only judgments carry a verdict; lifecycle and graph facts do not, and
+    /// callers must not invent one for them.
+    #[test]
+    fn only_judged_states_carry_a_verdict() {
+        assert_eq!(
+            labels_where(|state| state.verdict().is_some()),
+            vec!["denied", "awaiting_gate", "needs_materialize", "ready_to_start"]
+        );
+    }
+}

@@ -942,7 +942,16 @@ fn virtual_lane_facts(
 const CHECK_EVIDENCE_TTL: Duration = Duration::from_secs(10 * 60);
 const READINESS_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
 const CHECK_INFERENCE_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(not(test))]
 const GIT_SIGNATURE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// The probe budget is wall-clock, and under `cargo test` it is spent on a
+/// machine saturated by ~2200 parallel tests rather than on a user's idle
+/// laptop. A sample that elapses becomes `None`, which `CheckFlight` reads as
+/// "the worktree changed" — so machine load, not the code under test, decides
+/// whether a readiness assertion holds. Raised here for the same reason the
+/// probe concurrency bound is: neither is the property these tests exercise.
+#[cfg(test)]
+const GIT_SIGNATURE_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
 const BOUNDED_PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_CONCURRENT_CHECK_RUNNERS: usize = 2;
 const MAX_CONCURRENT_CHECK_INFERENCES: usize = 2;

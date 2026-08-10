@@ -55,6 +55,7 @@ pub mod host;
 mod hook_test_support;
 pub mod im;
 mod inspect;
+pub mod lane_state;
 pub mod lead_chat;
 pub mod materialize;
 pub mod manifest;
