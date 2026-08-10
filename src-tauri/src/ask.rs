@@ -2222,6 +2222,29 @@ impl AskRegistry {
         risk: RiskLevel,
         action_key: &str,
     ) -> Option<Decision> {
+        // A policy DENY outranks every standing grant, and is therefore checked
+        // FIRST — ahead of Dangerous mode, Full access and an exact Always.
+        //
+        // This was left open for several rounds as a product question. The
+        // principle settles it: `deny_actions` is a constraint the workspace
+        // imposes, a standing grant is a permission one human gave one task. If
+        // the permission outranks the constraint then the constraint is not one
+        // — a policy could never actually forbid anything for any task that had
+        // ever been granted. The grant was also made under the OLD rules; the
+        // tighten is the newer and broader decision, exactly as a revoked
+        // capability does not survive because it was used before.
+        //
+        // It can only ever narrow: `deny_actions` is empty by default, so this
+        // is a no-op for every installation that has not configured a policy.
+        if matches!(self.authority_bridge_decision(thread, action_key), Some(Decision::Deny)) {
+            return Some(Decision::Deny);
+        }
+        // A policy that cannot be determined right now must not fall through to
+        // anything that auto-ALLOWS. Deferring to the human flow costs a card;
+        // the alternative approves an action the current policy may forbid.
+        if self.authority_is_indeterminate(thread) {
+            return None;
+        }
         if let Some(decision) = self.auto_decision_exact(thread, dir, action_key) {
             return Some(decision);
         }
@@ -2359,6 +2382,37 @@ impl AskRegistry {
             workspace_id,
             AuthorityBridgeEntry { applied_revision: incoming, snapshot, tombstone },
         );
+    }
+
+    /// Whether this thread's workspace policy is currently INDETERMINATE — a
+    /// suspension, not a committed absence.
+    ///
+    /// `suspend_authority_snapshot` empties the entry around every policy
+    /// mutation and after a failed read, precisely so the bridge stops answering
+    /// from rules it cannot confirm. But "the bridge has no opinion" is not a
+    /// conservative answer where auto-ALLOW paths sit below it: the read-only
+    /// batch/issue grants here, and the builtin allowlist on the hook route,
+    /// would approve an action the still-current policy forbids, for the whole
+    /// duration of the mutation. Same shape as a killed check being read as a
+    /// failing one — an unknown must not be spent as a decision.
+    ///
+    /// A committed absence (`tombstone`) is NOT indeterminate: the database says
+    /// this scope has no active policy, which is a real answer.
+    pub fn authority_is_indeterminate(&self, thread: i32) -> bool {
+        let Some(workspace_id) = self
+            .thread_workspace
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&thread)
+            .copied()
+        else {
+            return false;
+        };
+        self.authority
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&workspace_id)
+            .is_some_and(|entry| entry.snapshot.is_none() && !entry.tombstone)
     }
 
     /// The cached AuthorityPolicy snapshot for one workspace, if any — exposed
@@ -6515,11 +6569,12 @@ mod tests {
     }
 
     #[test]
-    fn bridge_never_overrides_an_exact_always_or_full_grant() {
-        // The Full/Always exact-grant check runs BEFORE the bridge (issue #172:
-        // "CLI 自身的 approval/sandbox 设置永不放宽 Weft 策略" cuts both ways — a
-        // human's own explicit standing grant is not something a LATER policy
-        // silently revokes out from under an already-running task either).
+    fn a_policy_deny_outranks_a_standing_grant_but_only_narrows() {
+        // A `deny_actions` rule is a constraint the workspace imposes; a
+        // Full/Always grant is a permission one human gave one task. If the
+        // grant won, the constraint could never forbid anything for a task that
+        // had ever been granted — it would not be a constraint. The grant was
+        // also made under the OLD rules, and the tighten is the newer decision.
         let r = bridge_registry();
         let mut rules = crate::authority::PolicyRules::default();
         rules.deny_actions = vec!["Run: git status".to_string()];
@@ -6530,7 +6585,38 @@ mod tests {
         );
         assert_eq!(
             r.auto_decision(1, "10", RiskLevel::Unknown, "Run: git status"),
+            Some(Decision::Deny),
+            "a later policy tighten must reach a task that already holds a grant"
+        );
+        // Narrowing only: an action the policy does NOT deny still resolves
+        // through the standing grant exactly as before.
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::Unknown, "Run: ls"),
             Some(Decision::Allow)
+        );
+    }
+
+    /// A policy being re-read must never be spent as "nothing objects".
+    #[test]
+    fn a_suspended_policy_defers_instead_of_reaching_an_auto_allow() {
+        let r = bridge_registry();
+        let mut rules = crate::authority::PolicyRules::default();
+        rules.deny_actions = vec!["Run: git status".to_string()];
+        r.set_authority_snapshot(1, Some(bridge_test_policy(rules)));
+        r.grant_read_only_issue(1);
+        assert_eq!(r.auto_decision(1, "10", RiskLevel::ReadOnly, "Run: ls"), Some(Decision::Allow));
+
+        // The window around every policy mutation, and after a failed read.
+        r.suspend_authority_snapshot(1);
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::ReadOnly, "Run: ls"),
+            None,
+            "an indeterminate policy defers to a human rather than auto-allowing"
+        );
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::Unknown, "Run: git status"),
+            None,
+            "…including the action it was about to deny"
         );
     }
 

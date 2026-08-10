@@ -369,6 +369,13 @@ fn matches_branch(list: &[String], name: &str) -> bool {
 /// control/whitespace and `..` cases this already refused. Blank stays valid
 /// (the repo default). `/` stays valid, so `origin/main` and `refs/heads/main`
 /// still work, as does a raw commit SHA.
+/// Whether this is a git object id rather than a branch name — 7 to 40 hex
+/// digits, the abbreviated and full SHA-1 forms git accepts interchangeably.
+fn looks_like_commit_id(value: &str) -> bool {
+    let len = value.len();
+    (7..=40).contains(&len) && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 pub fn looks_like_valid_ref(base_branch: &str) -> bool {
     if base_branch.is_empty() {
         return true;
@@ -384,6 +391,19 @@ pub fn looks_like_valid_ref(base_branch: &str) -> bool {
     }
     // A lone `@` is not a ref name in git either.
     if base_branch == "@" {
+        return false;
+    }
+    // A COMMIT ID is not a branch name, and accepting one re-opens the very
+    // bypass the metacharacter rules above close. `protected_branches` is
+    // matched by NAME; a full or abbreviated SHA of `main` resolves to the same
+    // commit, matches no name, and materializes onto the protected branch's own
+    // tip with no Gate. Nothing that resolves to a commit without naming a
+    // branch may pass this check.
+    //
+    // Fails CLOSED for the pathological case of a branch genuinely named like a
+    // SHA: it is refused rather than silently exempted. Git itself warns about
+    // such names for the same ambiguity reason.
+    if looks_like_commit_id(base_branch) {
         return false;
     }
     !base_branch.chars().any(|c| {
@@ -829,7 +849,15 @@ mod tests {
         assert!(looks_like_valid_ref("origin/main"));
         assert!(looks_like_valid_ref("refs/heads/main"));
         assert!(looks_like_valid_ref("release/2.0"));
-        assert!(looks_like_valid_ref("9fddf70ced1a2b3c4d5e6f70819a2b3c4d5e6f70"));
+        // A commit id is NOT a branch name: the full SHA of `main` resolves to
+        // the same commit and would dodge `protected_branches: ["main"]`.
+        assert!(!looks_like_valid_ref("9fddf70ced1a2b3c4d5e6f70819a2b3c4d5e6f70"));
+        assert!(!looks_like_valid_ref("9fddf70"));
+        assert!(!looks_like_valid_ref("9FDDF70CED1A2B3C"));
+        // …while ordinary names that merely contain hex characters still pass.
+        assert!(looks_like_valid_ref("beef"));
+        assert!(looks_like_valid_ref("feature/9fddf70"));
+        assert!(looks_like_valid_ref("release-2024"));
         assert!(!looks_like_valid_ref("main.lock"));
         assert!(!looks_like_valid_ref("main/"));
         assert!(!looks_like_valid_ref("/main"));
@@ -841,7 +869,15 @@ mod tests {
     fn a_revision_expression_cannot_dodge_a_protected_branch() {
         let mut policy = default_policy(PolicyScope::Workspace(1));
         policy.rules.protected_branches = vec!["main".to_string()];
-        for base in ["main", "origin/main", "refs/heads/main", "main~0", "main^0"] {
+        for base in [
+            "main",
+            "origin/main",
+            "refs/heads/main",
+            "main~0",
+            "main^0",
+            "9fddf70ced1a2b3c4d5e6f70819a2b3c4d5e6f70",
+            "9fddf70",
+        ] {
             let lane = LaneCandidate {
                 lane_id: "l1",
                 repo_known: true,

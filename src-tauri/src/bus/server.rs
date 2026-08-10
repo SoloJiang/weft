@@ -221,18 +221,13 @@ async fn handle_ask(
         // through to the allowlist and the human flow below, so this cannot
         // widen anything.
         //
-        // Standing grants (Dangerous mode, Full access, an exact Always grant)
-        // are consulted FIRST, so this check sits between them and the builtin
-        // allowlist. That ordering is deliberate: whether a policy deny should
-        // outrank a human's existing grant is an open product question (a test
-        // still codifies grants-win), and answering it only on this route would
-        // make one workspace policy behave differently per engine — the exact
-        // incongruence this check was added to remove. When that question is
-        // settled, it belongs in `auto_decision` where all three routes meet,
-        // not here.
-        if asks.auto_decision_exact(thread, &dir, &action_key).is_none()
-            && matches!(asks.authority_bridge_decision(thread, &action_key), Some(Decision::Deny))
-        {
+        // No longer guarded by "unless a standing grant already allows it". That
+        // question is settled in `auto_decision`, where all three routes meet: a
+        // policy DENY outranks Dangerous mode, Full access and an exact Always,
+        // because a constraint any prior grant can override is not a constraint.
+        // This route repeats the check here only because its builtin allowlist
+        // below returns `allow` before `auto_decision` is ever reached.
+        if matches!(asks.authority_bridge_decision(thread, &action_key), Some(Decision::Deny)) {
             return hook_decision("deny", "Denied by the workspace policy");
         }
 
@@ -240,7 +235,13 @@ async fn handle_ask(
         // is waved through, so a turn that reads twenty files doesn't cost
         // twenty human clicks. Identity and deletion markers have already been
         // proven under the lifecycle gate above, before this branch can allow.
-        match builtin_allow::safe_scope(tool, tool_name) {
+        //
+        // Skipped entirely while the workspace policy is INDETERMINATE — the
+        // window around every policy mutation, and after a failed read. The deny
+        // check above cannot speak then, and this allowlist would approve an
+        // action the still-current policy forbids. Deferring costs one card.
+        let policy_readable = !asks.authority_is_indeterminate(thread);
+        match builtin_allow::safe_scope(tool, tool_name).filter(|_| policy_readable) {
             Some(builtin_allow::SafeScope::NoTarget) => {
                 return hook_decision("allow", "read-only builtin (auto-approved)");
             }
