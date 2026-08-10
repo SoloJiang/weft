@@ -2292,12 +2292,21 @@ impl AskRegistry {
             None => observed_revision,
         };
         let cached = g.get(&workspace_id).and_then(|entry| entry.applied_revision);
+        // A REVOKE and the set it revokes share a revision: the revoke stamps
+        // `revoked_at` on that same row rather than allocating a new one. So a
+        // set-refresh that read revision N and was descheduled must not
+        // reinstall over a clear already applied at N — equality has to favour
+        // the clear, or the revoked rules come back and keep auto-approving CLI
+        // asks that the database and materialize both consider revoked.
+        let cleared_at_same_revision = g
+            .get(&workspace_id)
+            .is_some_and(|entry| entry.snapshot.is_none() && entry.applied_revision == incoming);
         let is_stale = match (cached, incoming) {
             (Some(cached), Some(incoming)) => incoming < cached,
             // Either side missing carries no ordering — take the write rather
             // than pin the cache on a value nothing can supersede.
             _ => false,
-        };
+        } || (snapshot.is_some() && cleared_at_same_revision);
         if is_stale {
             return;
         }
@@ -2959,6 +2968,37 @@ mod tests {
         // A clear with NO observed revision is a failed read: always applies.
         asks.apply_authority_refresh(7, None, None);
         assert!(asks.authority_snapshot(7).is_none());
+    }
+
+    /// A revoke stamps the SAME row it revokes, so a clear and the set it
+    /// cancels share a revision. A delayed set-refresh must not reinstall over
+    /// the clear on that equality, or the revoked rules keep auto-approving CLI
+    /// asks the database already considers revoked.
+    #[test]
+    fn a_clear_wins_against_a_snapshot_at_the_same_revision() {
+        fn snapshot(revision: &str) -> crate::authority::PolicySnapshot {
+            crate::authority::PolicySnapshot {
+                id: 1,
+                scope: crate::authority::PolicyScope::Workspace(3),
+                revision: revision.to_string(),
+                rules: Default::default(),
+                source: "test".to_string(),
+                created_at: String::new(),
+                revoked_at: String::new(),
+                rules_unreadable: false,
+            }
+        }
+        let asks = AskRegistry::new();
+        asks.set_authority_snapshot(3, Some(snapshot("9")));
+        // The revoke lands, clearing at the revision it revoked.
+        asks.apply_authority_refresh(3, None, Some(9));
+        assert!(asks.authority_snapshot(3).is_none());
+        // The delayed set-refresh that read revision 9 must NOT resurrect it.
+        asks.set_authority_snapshot(3, Some(snapshot("9")));
+        assert!(asks.authority_snapshot(3).is_none());
+        // A genuinely newer policy still installs.
+        asks.set_authority_snapshot(3, Some(snapshot("10")));
+        assert_eq!(asks.authority_snapshot(3).map(|s| s.revision), Some("10".to_string()));
     }
 
     use super::*;

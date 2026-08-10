@@ -3249,9 +3249,29 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
     // actionable. "No plan at all" is the only case with nothing to filter
     // against.
     let filter_to_scope = current_lanes.is_some();
+    // Only the planner's OWN lanes can go out of scope. `create_direction`
+    // makes standalone tasks on a thread that may also have a plan, and those
+    // are never named by any proposal — filtering on plan membership alone
+    // would discard a standalone lane's Gate permanently, leaving a persisted
+    // task with no way to approve or clean it up. A lane counts as
+    // planner-owned once some plan revision has referenced it; anything the
+    // scope history has never seen is left alone.
+    let planner_owned: std::collections::HashSet<i32> =
+        crate::store::repo::list_plan_revisions(&db, thread_id, 200)
+            .await
+            .map_err(e)?
+            .iter()
+            .filter_map(|rev| serde_json::from_str::<serde_json::Value>(&rev.proposal).ok())
+            .filter_map(|value| value.get("directions").and_then(|d| d.as_array()).cloned())
+            .flatten()
+            .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
+            .map(|id| id as i32)
+            .filter(|id| *id != 0)
+            .chain(in_scope.iter().copied())
+            .collect();
     let mut out = Vec::new();
     for dir in directions {
-        if filter_to_scope && !in_scope.contains(&dir.id) {
+        if filter_to_scope && planner_owned.contains(&dir.id) && !in_scope.contains(&dir.id) {
             continue;
         }
         // Whether the lane has a checkout a worker could actually run in — the

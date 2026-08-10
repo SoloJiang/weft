@@ -220,15 +220,23 @@ async fn authorize_materialize(
     // credential-shaped token in a configured value would otherwise land in
     // audit views, and an oversized one would write a row past the ledger's
     // budget.
-    let payload = repo::redact_secrets(&repo::truncate_bounded(
-        &serde_json::json!({
-            "decision": verdict.decision,
-            "reason": verdict.reason,
-            "hit_rule": verdict.hit_rule,
-        })
-        .to_string(),
-        repo::EVIDENCE_PAYLOAD_MAX_BYTES,
-    ));
+    // Bound and redact the FREE-TEXT field, then serialize — not the other way
+    // round. Truncating the finished JSON cuts inside `hit_rule`'s string and
+    // appends a marker without closing the quote or the object, so the row no
+    // longer parses; `list_lane_gates` reads the decision from exactly this
+    // payload, so an unparseable one hides the only recovery card the gated
+    // lane has. `decision` and `reason` are enums and cannot grow, so bounding
+    // this one field bounds the whole row.
+    let hit_rule = verdict
+        .hit_rule
+        .as_ref()
+        .map(|rule| repo::redact_secrets(&repo::truncate_bounded(rule, AUTHORITY_HIT_RULE_MAX_BYTES)));
+    let payload = serde_json::json!({
+        "decision": verdict.decision,
+        "reason": verdict.reason,
+        "hit_rule": hit_rule,
+    })
+    .to_string();
     if let Err(error) = repo::append_evidence(
         db,
         repo::EvidenceWrite {
@@ -259,6 +267,12 @@ async fn authorize_materialize(
     }
     Ok(verdict)
 }
+
+/// Byte budget for the operator-configured `hit_rule` text copied into decision
+/// evidence. Far below the ledger's own 8 KiB payload bound, so the serialized
+/// row cannot approach it no matter what a policy names — and bounding the
+/// field rather than the finished JSON keeps the payload parseable.
+const AUTHORITY_HIT_RULE_MAX_BYTES: usize = 512;
 
 /// Whether a lane's recorded checkout is one a worker can actually be started
 /// in: a git worktree REGISTERED to the lane's repo, on the lane's branch.
@@ -1005,6 +1019,31 @@ fn materialize_recreate_fault(repo_path: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Decision evidence must stay parseable no matter how large a configured
+    /// rule is: `list_lane_gates` reads the verdict from this payload and
+    /// nowhere else, so JSON cut mid-string hides the gated lane's only card.
+    #[test]
+    fn an_oversized_hit_rule_still_serializes_to_valid_json() {
+        let huge = "x".repeat(64 * 1024);
+        let hit_rule = Some(repo::redact_secrets(&repo::truncate_bounded(
+            &huge,
+            AUTHORITY_HIT_RULE_MAX_BYTES,
+        )));
+        let payload = serde_json::json!({
+            "decision": "needs_gate",
+            "reason": "protected_branch",
+            "hit_rule": hit_rule,
+        })
+        .to_string();
+
+        assert!(payload.len() < repo::EVIDENCE_PAYLOAD_MAX_BYTES);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("bounded payload must still parse");
+        assert_eq!(parsed.get("decision").and_then(|v| v.as_str()), Some("needs_gate"));
+        assert!(parsed.get("hit_rule").and_then(|v| v.as_str()).is_some());
+    }
+
     use super::*;
 
     #[test]
