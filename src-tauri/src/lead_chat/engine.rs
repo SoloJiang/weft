@@ -7484,6 +7484,15 @@ async fn codex_consumer(
                 let (tool, summary, detail, risk, action_key) =
                     codex_approval_fields(&method, &params);
                 let registry = app.state::<crate::ask::AskRegistry>().inner().clone();
+                // Issue #172: register this thread's workspace so the sync
+                // Permission Bridge resolves the right policy. A Codex thread
+                // that never emitted an ACP or PreToolUse ask would otherwise
+                // reach auto_decision with no mapping, and the bridge would
+                // defer BOTH deny_actions and allow_actions to a human card —
+                // enforcing the policy inconsistently across engines.
+                if let Ok(Some(row)) = repo::get_thread(&db, thread_id).await {
+                    registry.note_thread_workspace(thread_id, row.workspace_id);
+                }
                 // `risk` gates issue #103's read-only batch/issue grants inside
                 // auto_decision; it never widens Full/Always, which ignore it.
                 match registry.auto_decision(thread_id, &dir, risk, &action_key) {

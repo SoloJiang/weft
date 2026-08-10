@@ -152,7 +152,17 @@ pub fn run() {
     {
         let db = db.clone();
         let asks = asks.clone();
-        tauri::async_runtime::block_on(async move { auth_persist::seed(&db, &asks).await });
+        tauri::async_runtime::block_on(async move {
+            auth_persist::seed(&db, &asks).await;
+            // Issue #172: install every workspace's active AuthorityPolicy into
+            // the Permission Bridge in this SAME pre-serve step. It has to be
+            // here, not in `setup()`: the bus server below starts serving asks
+            // before the Tauri builder runs, and revive re-drives in-flight
+            // tasks from inside setup itself — either could reach
+            // `auto_decision` while a deferred seed was still in flight and
+            // defer a configured `deny_actions` rule to a human card.
+            commands::seed_authority_bridge(&db, &asks).await;
+        });
     }
     let bus_base: String = {
         let bus = bus.clone();
@@ -269,15 +279,6 @@ pub fn run() {
                 let db = app.state::<store::Db>().inner().clone();
                 commands::spawn_pending_repo_action_cleanups(db.clone());
                 commands::spawn_pending_repo_action_feedback(db.clone(), None);
-                // Issue #172: install every workspace's active AuthorityPolicy
-                // into the Permission Bridge before any CLI ask can arrive.
-                // Without it the bridge starts empty every launch and a
-                // configured policy silently stops applying to CLI asks.
-                let bridge_asks = app.state::<ask::AskRegistry>().inner().clone();
-                let bridge_db = db.clone();
-                tauri::async_runtime::spawn(async move {
-                    commands::seed_authority_bridge(&bridge_db, &bridge_asks).await;
-                });
                 tauri::async_runtime::spawn(async move {
                     curator::resume_running_analyses(&db).await;
                 });

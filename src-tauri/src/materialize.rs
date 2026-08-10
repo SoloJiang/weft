@@ -245,6 +245,37 @@ async fn authorize_materialize(
     Ok(verdict)
 }
 
+/// Re-run adjudication for one already-created lane at the CURRENT policy and
+/// scope revision, recording the fresh verdict in the evidence ledger. No git
+/// or filesystem work happens — this is the read-only half of
+/// [`materialize_direction`]'s gate.
+///
+/// `list_lane_gates` needs this because a Gate card carries the policy revision
+/// its verdict was computed under, and `resolve_lane_gate` refuses a decision
+/// made against a superseded revision. Without a way to recompute, a policy
+/// change while a Gate was pending left the card frozen at the dead revision:
+/// every approval was rejected and reloading returned the same stale card, so
+/// the lane could never progress.
+///
+/// `Ok(None)` when the lane binds no write repo — there is nothing to judge.
+pub async fn readjudicate_lane(db: &Db, direction_id: i32) -> Result<Option<authority::LaneVerdict>> {
+    use sea_orm::EntityTrait;
+    let dir = entities::direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+        .context("task not found")?;
+    let thread = entities::thread::Entity::find_by_id(dir.thread_id)
+        .one(&db.0)
+        .await?
+        .context("thread not found")?;
+    let Some(repo_ref) = repo::direction_repo_of(db, direction_id).await? else {
+        return Ok(None);
+    };
+    let base = effective_base_branch(&repo_ref, &dir);
+    let verdict = authorize_materialize(db, &dir, &repo_ref, thread.workspace_id, &base).await?;
+    Ok(Some(verdict))
+}
+
 pub async fn materialize_direction(db: &Db, direction_id: i32) -> Result<MaterializeOutcome> {
     use sea_orm::EntityTrait;
     let dir = entities::direction::Entity::find_by_id(direction_id)

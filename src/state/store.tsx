@@ -497,6 +497,10 @@ interface Store {
   refreshWorkspaces: () => Promise<void>;
   selectThread: (threadId: number) => Promise<void>;
   loadThreadChildren: (threadId: number) => Promise<void>;
+  /** Start the worker for a materialized lane. Exposed because approving a
+   *  Gate materializes a lane that confirm deliberately left out of its
+   *  dispatch set — without this the lane gets a worktree and then sits idle. */
+  dispatchDirection: (directionId: number) => Promise<void>;
   /** Leave the active thread for the workspace portfolio board. */
   backToWorkspace: () => void;
 
@@ -3674,6 +3678,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshWorkspaces,
     selectThread,
     loadThreadChildren,
+    dispatchDirection,
     backToWorkspace,
     createWorkspace,
     renameWorkspace,

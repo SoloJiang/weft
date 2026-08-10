@@ -3169,22 +3169,51 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
     let directions = crate::store::repo::list_directions(&db, thread_id).await.map_err(e)?;
     let mut out = Vec::new();
     for dir in directions {
-        let has_worktree = crate::store::repo::worktree_for(&db, dir.id, dir.repo_id)
+        // A worktree ROW is not a materialized lane: `materialize_direction`
+        // re-adjudicates (and can gate) a lane whose checkout was reclaimed or
+        // replaced out-of-band, and that path deliberately keeps the stale row.
+        // Testing `.is_some()` would hide the Gate raised for the recreation
+        // behind the very row the recreation exists to replace. Presence on
+        // disk is the same predicate the frontend's dispatch filter uses.
+        let live_worktree = crate::store::repo::worktree_for(&db, dir.id, dir.repo_id)
             .await
             .map_err(e)?
-            .is_some();
-        if has_worktree {
+            .is_some_and(|w| std::path::Path::new(&w.path).exists());
+        if live_worktree {
             continue;
         }
         let evidence = crate::store::repo::list_evidence(&db, thread_id, Some(dir.id), 20)
             .await
             .map_err(e)?;
-        let Some(latest_decision) = evidence
+        let Some(mut latest_decision) = evidence
             .into_iter()
             .find(|row| row.kind == crate::store::repo::EVIDENCE_KIND_DECISION)
         else {
             continue;
         };
+        // The card must carry the revision a decision can actually be recorded
+        // under. If the policy moved since this verdict was written, recompute
+        // it now: the lane may no longer be gated at all, and if it still is,
+        // the human gets the CURRENT rule and a revision `resolve_lane_gate`
+        // will accept. Without this the card froze at a dead revision and every
+        // approval was rejected with `gate_policy_changed` forever.
+        let current_revision = current_gate_policy_revision(&db, dir.id).await.map_err(e)?;
+        if latest_decision.policy_revision != current_revision {
+            let refreshed = crate::materialize::readjudicate_lane(&db, dir.id).await.map_err(e)?;
+            if refreshed.is_none() {
+                continue;
+            }
+            let evidence = crate::store::repo::list_evidence(&db, thread_id, Some(dir.id), 20)
+                .await
+                .map_err(e)?;
+            let Some(fresh) = evidence
+                .into_iter()
+                .find(|row| row.kind == crate::store::repo::EVIDENCE_KIND_DECISION)
+            else {
+                continue;
+            };
+            latest_decision = fresh;
+        }
         let parsed: serde_json::Value = serde_json::from_str(&latest_decision.payload).unwrap_or_default();
         if parsed.get("decision").and_then(|v| v.as_str()) != Some("needs_gate") {
             continue;

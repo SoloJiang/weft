@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { AlertTriangle, Check, X } from "lucide-react";
 import type { LaneGate } from "../lib/types";
 import { api } from "../lib/api";
+import { useStore } from "../state/store";
 import { Button } from "../components/ui/Button";
 
 /** A stable, machine-readable Gate reason (mirrors Rust `authority::
@@ -59,6 +60,7 @@ type GateFetchState = "idle" | "loading" | "resolved" | "rejected";
  */
 export function LaneGatePanel({ threadId }: { threadId: number | null }) {
   const { t } = useTranslation();
+  const { dispatchDirection, directionsByThread, proposal } = useStore();
   const [gates, setGates] = useState<LaneGate[]>([]);
   const [fetchState, setFetchState] = useState<GateFetchState>("idle");
   const [actionState, setActionState] = useState<Record<number, GateActionState>>({});
@@ -90,19 +92,36 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
       });
   }, [threadId]);
 
+  // Confirming a proposal on the ALREADY-ACTIVE thread is what raises most
+  // Gates, and it changes neither `threadId` nor this component's identity — it
+  // reloads the thread's children and clears the proposal. Depending on those
+  // two signals is what makes the card appear on that confirm instead of only
+  // after a thread switch or an app reload.
+  const laneSignature = threadId == null
+    ? ""
+    : (directionsByThread[threadId] ?? []).map((d) => d.id).join(",");
+  const proposalSignature = proposal ? `${proposal.status}:${proposal.created_at}` : "";
+
   useEffect(() => {
     reload();
-  }, [reload]);
+  }, [reload, laneSignature, proposalSignature]);
 
   async function resolve(gate: LaneGate, decision: "approved" | "denied") {
     setActionState((prev) => ({ ...prev, [gate.direction_id]: "resolving" }));
     try {
-      await api.resolveLaneGate(gate.direction_id, gate.policy_revision, decision);
+      const worktrees = await api.resolveLaneGate(gate.direction_id, gate.policy_revision, decision);
       setActionState((prev) => {
         const next = { ...prev };
         delete next[gate.direction_id];
         return next;
       });
+      // Confirm deliberately left this lane out of its dispatch set (it had no
+      // worktree then), and nothing else will pick it up: approving created the
+      // worktree, which also drops the lane from `list_lane_gates`, so without
+      // this it would vanish from the UI and sit idle forever.
+      if (decision === "approved" && worktrees.length > 0) {
+        void dispatchDirection(gate.direction_id);
+      }
       reload();
     } catch (error) {
       // The backend rejects a decision made against a superseded policy
