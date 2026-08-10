@@ -346,6 +346,19 @@ pub async fn save_proposal(db: &Db, thread_id: i32, proposal: &Proposal) -> Resu
 /// fields. Unknown hints are normalized to `normal`; `depends_on` is a bare
 /// name reference, resolved to an id later (see `confirm`).
 pub async fn save_proposal_value(db: &Db, thread_id: i32, input: &Value) -> Result<()> {
+    save_proposal_value_from(db, thread_id, input, "lead").await
+}
+
+/// [`save_proposal_value`], attributing the scope-history snapshot to `source`
+/// — `"lead"` for a planner proposal, `"user"` for one a human saved from the
+/// proposal editor. The history is an audit surface, so a human edit recorded
+/// as a lead proposal misreports who changed the scope.
+pub async fn save_proposal_value_from(
+    db: &Db,
+    thread_id: i32,
+    input: &Value,
+    source: &str,
+) -> Result<()> {
     let gate = thread_gate(thread_id);
     let _gate = gate.lock().await;
     let mut p: Proposal = serde_json::from_value(input.clone())?;
@@ -384,12 +397,13 @@ pub async fn save_proposal_value(db: &Db, thread_id: i32, input: &Value) -> Resu
     repo::set_plan_created_at(db, thread_id, &version).await?;
     // Issue #172: append the immutable scope-history snapshot BEHIND the
     // working `plan` head this call just wrote — same version, same JSON.
-    // Source is "lead": this is the ONE function every fresh
-    // `propose_directions`/re-propose call goes through. Best-effort: the
+    // Source comes from the CALLER: this one function serves both the lead's
+    // fresh `propose_directions`/re-propose and the human proposal editor, and
+    // the history is an audit surface where the difference matters. Best-effort: the
     // working plan write above already succeeded and is the source of truth
     // for materialize/confirm; a failure here only loses history, never
     // correctness, so it is logged rather than propagated.
-    if let Err(error) = repo::insert_plan_revision(db, thread_id, &version, &json, "lead").await {
+    if let Err(error) = repo::insert_plan_revision(db, thread_id, &version, &json, source).await {
         eprintln!("[weft][plan_revision] snapshot for thread {thread_id}: {error}");
     }
     Ok(())

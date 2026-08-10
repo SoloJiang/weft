@@ -2745,7 +2745,7 @@ pub async fn save_proposal(
     thread_id: i32,
     proposal: serde_json::Value,
 ) -> R<()> {
-    crate::planner::save_proposal_value(&db, thread_id, &proposal)
+    crate::planner::save_proposal_value_from(&db, thread_id, &proposal, "user")
         .await
         .map_err(e)
 }
@@ -3074,6 +3074,12 @@ pub async fn set_authority_policy(
     // through the bridge refresh too, so the cache lands with the row.
     let workspace_lock = crate::materialize::workspace_write_lock(workspace_id).await;
     let _write_guard = workspace_lock.lock().await;
+    // Close the cache BEFORE the commit. `auto_decision` is synchronous and
+    // takes no lock, so between the database commit and the refresh below it
+    // would keep answering from the pre-change snapshot — a tighten from
+    // auto-allow to deny would auto-approve the very action it was written to
+    // forbid. Suspended, the bridge defers to a human card for that window.
+    asks.suspend_authority_snapshot(workspace_id);
     let row = crate::store::repo::create_authority_policy(&db, "workspace", workspace_id, &rules_json, "user")
         .await
         .map_err(e)?;
@@ -3095,6 +3101,8 @@ pub async fn revoke_authority_policy(
     // and must not land between a lane's verdict and its writes.
     let workspace_lock = crate::materialize::workspace_write_lock(workspace_id).await;
     let _write_guard = workspace_lock.lock().await;
+    // See `set_authority_policy` — the same commit-to-refresh window applies.
+    asks.suspend_authority_snapshot(workspace_id);
     crate::store::repo::revoke_authority_policy(&db, "workspace", workspace_id)
         .await
         .map_err(e)?;
@@ -3147,7 +3155,13 @@ pub async fn refresh_authority_bridge_snapshot(
             // of the process while the UI reported the revoke as successful.
             // Clearing costs a human card; keeping costs an un-revokable grant.
             eprintln!("[weft][authority] bridge snapshot refresh for workspace {workspace_id}: {error}");
-            asks.set_authority_snapshot(workspace_id, None);
+            // Suspend rather than clear: the bridge must stop answering from
+            // rules this read could not confirm, but forgetting how far the
+            // cache had advanced would let a delayed refresh carrying an OLDER
+            // revision pass the no-ordering branch and reinstall superseded
+            // rules — which a startup seed overlapping an early policy edit can
+            // produce.
+            asks.suspend_authority_snapshot(workspace_id);
         }
     }
 }

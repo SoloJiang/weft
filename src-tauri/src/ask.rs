@@ -2280,6 +2280,25 @@ impl AskRegistry {
     /// numeric comparison is enough. A refresh with NO observed revision is a
     /// failed read: it always applies, because deferring to a human is the
     /// right answer when the policy cannot be determined at all.
+    /// Stop honouring a workspace's cached policy WITHOUT forgetting how far
+    /// the cache had advanced. The bridge defers to the human flow while this
+    /// holds — the conservative answer — and the retained watermark keeps a
+    /// slow older refresh rejectable.
+    ///
+    /// Two callers need exactly this. A failed policy READ must not answer from
+    /// rules it could not confirm, but dropping the watermark with them would
+    /// let a delayed refresh carrying revision N-1 pass the no-ordering branch
+    /// and reinstall superseded rules. And a policy MUTATION commits to the
+    /// database before the new snapshot can be installed; without closing the
+    /// cache first, a CLI ask arriving in that window is still answered by the
+    /// pre-change rules — a tighten from allow to deny would auto-approve the
+    /// very action it was written to forbid.
+    pub fn suspend_authority_snapshot(&self, workspace_id: i32) {
+        let mut g = self.authority.write().unwrap_or_else(|e| e.into_inner());
+        let applied_revision = g.get(&workspace_id).and_then(|entry| entry.applied_revision);
+        g.insert(workspace_id, AuthorityBridgeEntry { applied_revision, snapshot: None });
+    }
+
     pub fn apply_authority_refresh(
         &self,
         workspace_id: i32,
@@ -2968,6 +2987,40 @@ mod tests {
         // A clear with NO observed revision is a failed read: always applies.
         asks.apply_authority_refresh(7, None, None);
         assert!(asks.authority_snapshot(7).is_none());
+    }
+
+    /// A failed policy READ must stop the bridge answering from rules it could
+    /// not confirm, but it must not forget how far the cache had advanced — or
+    /// a delayed refresh carrying an OLDER revision passes the no-ordering
+    /// branch and reinstalls superseded rules.
+    #[test]
+    fn a_suspended_snapshot_keeps_rejecting_older_refreshes() {
+        fn snapshot(revision: &str) -> crate::authority::PolicySnapshot {
+            crate::authority::PolicySnapshot {
+                id: 1,
+                scope: crate::authority::PolicyScope::Workspace(11),
+                revision: revision.to_string(),
+                rules: Default::default(),
+                source: "test".to_string(),
+                created_at: String::new(),
+                revoked_at: String::new(),
+                rules_unreadable: false,
+            }
+        }
+        let asks = AskRegistry::new();
+        asks.set_authority_snapshot(11, Some(snapshot("5")));
+
+        // A read failure suspends: no rules are honoured…
+        asks.suspend_authority_snapshot(11);
+        assert!(asks.authority_snapshot(11).is_none());
+
+        // …and an older refresh still cannot resurrect anything.
+        asks.set_authority_snapshot(11, Some(snapshot("4")));
+        assert!(asks.authority_snapshot(11).is_none());
+
+        // A refresh at or beyond the watermark restores service.
+        asks.set_authority_snapshot(11, Some(snapshot("6")));
+        assert_eq!(asks.authority_snapshot(11).map(|s| s.revision), Some("6".to_string()));
     }
 
     /// A revoke stamps the SAME row it revokes, so a clear and the set it
