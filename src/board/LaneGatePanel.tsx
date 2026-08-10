@@ -145,20 +145,28 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
   // already cleared. Without this the recovery cards stayed on screen
   // indefinitely while the workers were happily running.
   //
-  // Liveness, not mere presence: an exited session stays in `sessions`, so
-  // testing for an entry made this signature blind to the running → exited
-  // transition — the exact moment the backend moves a materialized non-review
-  // lane back to `ReadyToStart` and a recovery card becomes due. The card then
-  // waited on some unrelated navigation or plan change to appear. This is the
-  // same `status !== "exited"` liveness the rest of the app uses, so the two
-  // sides agree on when a lane is occupied.
+  // `sessions` is keyed by SESSION id, not by direction id, so a lane's worker
+  // has to be found by scanning for its `directionId` — the same way
+  // `WorkerConversation` finds it. Indexing by the direction id read an
+  // unrelated session on the rare id collision and nothing at all otherwise,
+  // which left this signature constant across the very transitions it exists
+  // to catch.
+  //
+  // Liveness, not mere presence: an exited session stays in the map, so
+  // testing only for existence would still be blind to running → exited — the
+  // moment the backend moves a materialized non-review lane back to
+  // `ReadyToStart` and a recovery card becomes due. `status !== "exited"` is
+  // the liveness the rest of the app uses, so both sides agree on when a lane
+  // is occupied.
+  const liveDirectionIds = new Set(
+    Object.values(sessions)
+      .filter((s) => s.status !== "exited")
+      .map((s) => s.directionId),
+  );
   const liveSessionSignature = threadId == null
     ? ""
     : (directionsByThread[threadId] ?? [])
-        .filter((d) => {
-          const session = sessions[d.id];
-          return session !== undefined && session.status !== "exited";
-        })
+        .filter((d) => liveDirectionIds.has(d.id))
         .map((d) => d.id)
         .join(",");
 

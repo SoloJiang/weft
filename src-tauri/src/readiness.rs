@@ -952,11 +952,23 @@ impl LaneDecisionLedger {
     }
 }
 
+/// One recorded verdict string, read as a policy.
+///
+/// `authority::LaneDecision` serialises `snake_case`, so the vocabulary is
+/// closed at exactly these three. Anything else is a row this build cannot
+/// interpret — corruption, or a newer writer — and it GATES rather than
+/// falling through to allowed. The wildcard used to point the other way, so a
+/// single unreadable value could keep a confirmed lane green and let its issue
+/// present as review-ready on a verdict nothing could actually read.
+///
+/// The same reasoning as an unparseable payload one layer down in
+/// `latest_lane_decisions`: an unknown must not be spent as a decision.
 fn recorded_lane_decision(verdict: &str) -> PolicyDecision {
     match verdict {
+        "allowed_by_policy" => PolicyDecision::AllowedByPolicy,
         "needs_gate" => PolicyDecision::NeedsGate,
         "denied" => PolicyDecision::Denied,
-        _ => PolicyDecision::AllowedByPolicy,
+        _ => PolicyDecision::NeedsGate,
     }
 }
 
@@ -5039,6 +5051,56 @@ mod tests {
             checks_are_preempted(&lane),
             "an occupied merged lane must not launch verification"
         );
+    }
+
+    /// The recorded-verdict vocabulary is closed, so anything outside it is a
+    /// row this build cannot read — and an unreadable verdict must gate, never
+    /// allow. The wildcard pointed at `AllowedByPolicy`, so one corrupt or
+    /// newer-writer value kept a confirmed lane green and could carry its
+    /// issue to review-ready on a decision nothing had actually understood.
+    #[test]
+    fn an_unreadable_recorded_verdict_gates_rather_than_allows() {
+        assert_eq!(
+            recorded_lane_decision("allowed_by_policy"),
+            PolicyDecision::AllowedByPolicy
+        );
+        assert_eq!(recorded_lane_decision("needs_gate"), PolicyDecision::NeedsGate);
+        assert_eq!(recorded_lane_decision("denied"), PolicyDecision::Denied);
+        for unknown in ["", "approved", "allowed", "ALLOWED_BY_POLICY", "{}", "null"] {
+            assert_eq!(
+                recorded_lane_decision(unknown),
+                PolicyDecision::NeedsGate,
+                "{unknown:?} is not a verdict this build understands"
+            );
+        }
+    }
+
+    /// Every arm `authority::LaneDecision` can serialise round-trips through
+    /// the reader, so adding a variant there cannot silently land in the
+    /// fail-closed bucket and gate every lane that carries it.
+    #[test]
+    fn every_serialisable_lane_decision_is_understood_by_the_reader() {
+        for decision in [
+            crate::authority::LaneDecision::AllowedByPolicy,
+            crate::authority::LaneDecision::NeedsGate,
+            crate::authority::LaneDecision::Denied,
+        ] {
+            let Ok(serde_json::Value::String(wire)) = serde_json::to_value(decision) else {
+                panic!("{decision:?} must serialise to a string");
+            };
+            let expected = match decision {
+                crate::authority::LaneDecision::AllowedByPolicy => {
+                    PolicyDecision::AllowedByPolicy
+                }
+                crate::authority::LaneDecision::NeedsGate => PolicyDecision::NeedsGate,
+                crate::authority::LaneDecision::Denied => PolicyDecision::Denied,
+            };
+            assert_eq!(
+                recorded_lane_decision(&wire),
+                expected,
+                "{wire} is written by the authority path and must be readable"
+            );
+        }
     }
 
     #[test]
