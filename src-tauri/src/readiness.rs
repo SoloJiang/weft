@@ -1653,7 +1653,14 @@ struct WorkerSessionFacts {
     active: bool,
 }
 
-fn worker_session_occupies_worktree(status: &str) -> bool {
+/// The worktree-reclaim safety boundary: statuses under which SOMETHING may
+/// still be writing to the checkout. `stopped` is in the set because that is
+/// what a terminal takeover persists — the human may be driving the worktree
+/// by hand — which is also why `coordinator::deliver` refuses to wake it.
+///
+/// `pub(crate)` so `lane_state` can build on this rather than keep a second
+/// copy of the list; a list that exists twice is a list that drifts.
+pub(crate) fn worker_session_occupies_worktree(status: &str) -> bool {
     matches!(status, "running" | "starting" | "stopped")
 }
 

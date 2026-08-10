@@ -211,13 +211,10 @@ async fn local_state(
     if !crate::materialize::lane_has_valid_checkout(db, direction_id).await? {
         return Ok(LaneAuthorityState::NeedsMaterialize(Box::new(verdict)));
     }
-    // A session that EXITED leaves the lane as stopped as one that never
-    // started, so history is not the question — whether anything could still
-    // receive work is.
     let live = crate::store::repo::sessions_for_direction(db, direction_id)
         .await?
         .iter()
-        .any(|session| matches!(session.status.as_str(), "running" | "idle" | "starting"));
+        .any(|session| session_staffs_lane(&session.status));
     if live {
         return Ok(LaneAuthorityState::Running);
     }
@@ -234,6 +231,33 @@ async fn local_state(
         return Ok(LaneAuthorityState::AwaitingReview);
     }
     Ok(LaneAuthorityState::ReadyToStart(Box::new(verdict)))
+}
+
+/// Whether a session STAFFS its lane — which bars a second worker and bars the
+/// stranded-lane Resume card.
+///
+/// A session that exited leaves the lane as free as one that never started, so
+/// history is not the question. There are two independent ways a lane is
+/// staffed, and it takes only one:
+///
+/// - **Something may still be writing to the checkout.** That is exactly
+///   `worker_session_occupies_worktree`, the boundary `materialize` uses to
+///   refuse a worktree reclaim — and it includes `stopped`, the status a
+///   TERMINAL TAKEOVER persists. Omitting it resolved a taken-over lane as
+///   `ReadyToStart`, drew a Resume card, and let `chat_open_worker_impl` admit
+///   a headless worker into a checkout the human was driving by hand.
+///   `coordinator::deliver` already refuses to wake such a session for that
+///   exact reason; lane state has to agree, or weft breaks its own
+///   single-writer invariant through the Gate panel.
+/// - **The session can still RECEIVE work.** `idle` is that and only that: no
+///   resident engine, so it does not hold the worktree — which is why the
+///   occupancy predicate rightly excludes it — but the coordinator lazily
+///   attaches an idle worker and drives it, so the lane is not free either.
+///
+/// Built ON the occupancy predicate rather than restating its list, so
+/// widening that boundary cannot leave this behind.
+pub(crate) fn session_staffs_lane(status: &str) -> bool {
+    crate::readiness::worker_session_occupies_worktree(status) || status == "idle"
 }
 
 /// The full state of one lane, including its prerequisite chain.
@@ -422,6 +446,36 @@ impl ScopeCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lane is staffed by anything that holds the checkout OR can still be
+    /// handed work. `stopped` is the one that matters most: it is what a
+    /// terminal takeover persists, so calling it free would let the Gate
+    /// panel's Resume card start a headless worker against a checkout the
+    /// human is editing — the single-writer break `coordinator::deliver` and
+    /// `materialize`'s reclaim guard both exist to prevent.
+    #[test]
+    fn a_lane_is_staffed_by_a_holder_of_the_checkout_or_anything_still_drivable() {
+        for status in ["running", "starting", "stopped", "idle"] {
+            assert!(
+                session_staffs_lane(status),
+                "{status} must bar a second worker"
+            );
+        }
+        for status in ["exited", "reviving", "complete", "error"] {
+            assert!(
+                !session_staffs_lane(status),
+                "{status} leaves the lane free to be started"
+            );
+        }
+        // The occupancy half is not a copy of that list — it is the list.
+        for status in ["running", "starting", "stopped"] {
+            assert!(
+                crate::readiness::worker_session_occupies_worktree(status)
+                    && session_staffs_lane(status),
+                "{status} must stay in lockstep with the worktree-reclaim boundary"
+            );
+        }
+    }
 
     fn verdict(decision: LaneDecision) -> Box<LaneVerdict> {
         Box::new(LaneVerdict {
