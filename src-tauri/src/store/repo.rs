@@ -9064,6 +9064,23 @@ pub async fn append_evidence(db: &Db, write: EvidenceWrite<'_>) -> Result<eviden
 /// poll. Rows arrive newest-first, so the FIRST row seen for a direction is its
 /// current verdict and later (older) rows are skipped.
 pub async fn latest_lane_decisions(db: &Db, thread_id: i32) -> Result<HashMap<i32, String>> {
+    // The revision these verdicts have to have been computed under. A policy
+    // change writes no replacement evidence for lanes nobody re-materializes,
+    // so without this an old `allowed_by_policy` keeps readiness green under a
+    // rule that now denies, and an old `needs_gate` keeps an issue blocked
+    // after the rule is loosened. A verdict from a superseded revision is not
+    // this map's to speak for — it is dropped, and the lane reads as having no
+    // decision until something adjudicates it again.
+    //
+    // `None` means the workspace or its policy could not be read at all, which
+    // carries no revision to compare: filtering on that would silently blank
+    // every lane, so the rows are taken as-is.
+    let active_revision = match get_thread(db, thread_id).await? {
+        Some(thread) => get_active_authority_policy(db, "workspace", thread.workspace_id)
+            .await?
+            .map(|row| row.revision),
+        None => None,
+    };
     let rows = evidence::Entity::find()
         .filter(evidence::Column::ThreadId.eq(thread_id))
         .filter(evidence::Column::Kind.eq(EVIDENCE_KIND_DECISION))
@@ -9074,6 +9091,11 @@ pub async fn latest_lane_decisions(db: &Db, thread_id: i32) -> Result<HashMap<i3
     for row in rows {
         if row.direction_id == 0 || out.contains_key(&row.direction_id) {
             continue;
+        }
+        if let Some(active) = active_revision.as_deref() {
+            if !row.policy_revision.is_empty() && row.policy_revision != active {
+                continue;
+            }
         }
         let parsed: serde_json::Value = serde_json::from_str(&row.payload).unwrap_or_default();
         // A row whose payload carries no `decision` key is not a verdict this
