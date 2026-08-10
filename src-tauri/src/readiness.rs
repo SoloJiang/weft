@@ -946,7 +946,22 @@ const GIT_SIGNATURE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const BOUNDED_PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_CONCURRENT_CHECK_RUNNERS: usize = 2;
 const MAX_CONCURRENT_CHECK_INFERENCES: usize = 2;
+/// Bounds concurrent Git probe children in a RUNNING app, so a large portfolio
+/// and a slow fsmonitor cannot build an unbounded backlog of overlapping
+/// readiness refreshes.
+#[cfg(not(test))]
 const MAX_CONCURRENT_GIT_PROBES: usize = 4;
+/// Under `cargo test` this gate is process-global across a binary that runs
+/// ~2200 tests in parallel, and `GitSignatureProbe::sample`'s timeout is one
+/// total budget that INCLUDES time queued on it. Four permits therefore make
+/// unrelated tests fail each other: a queued sample elapses, `.ok()` turns the
+/// error into `None`, and `CheckFlight` reads "signature changed" from what is
+/// really "signature unknown" — discarding a valid report and asserting on an
+/// empty `repo_checks`. The backlog bound is not the property these tests
+/// exercise; raising it here removes the cross-test coupling without touching
+/// what ships.
+#[cfg(test)]
+const MAX_CONCURRENT_GIT_PROBES: usize = 256;
 const MAX_CONCURRENT_MARKER_SWEEPS: usize = 2;
 const MARKER_SWEEP_TIMEOUT: Duration = Duration::from_millis(250);
 const CHECK_OUTPUT_TAIL_BYTES: usize = 2_000;
@@ -1736,6 +1751,29 @@ impl GitSignatureProbe {
             head_sha,
             dirty: !porcelain.stdout.is_empty(),
         })
+    }
+}
+
+#[cfg(test)]
+impl GitSignatureProbe {
+    /// `readiness()` with a PRIVATE concurrency limit, for tests that drive the
+    /// real `git`.
+    ///
+    /// `sample`'s timeout is one total budget that INCLUDES time queued on the
+    /// process-global probe semaphore. In a parallel test binary that semaphore
+    /// is shared by every test, so an unrelated test's queue can consume this
+    /// one's whole budget; the sample then fails, `.ok()` turns it into `None`,
+    /// and `CheckFlight` reads "signature changed" from what is really
+    /// "signature unknown" — discarding the report and yielding an empty
+    /// `repo_checks`. That is a load-dependent failure of the harness, not of
+    /// the code under test, and it is what made these tests flaky on CI while
+    /// passing under `--test-threads=1`.
+    fn isolated_readiness() -> Self {
+        Self {
+            program: PathBuf::from("git"),
+            timeout: GIT_SIGNATURE_PROBE_TIMEOUT,
+            limit: Some(Arc::new(Semaphore::new(1))),
+        }
     }
 }
 
@@ -3623,16 +3661,28 @@ pub async fn collect_with_check_execution(
                 .collect();
             // Issue #172: the verdict actually recorded for each lane, so a
             // confirmed-but-gated (or denied) lane is not reported as allowed
-            // just because the proposal shape says confirmed. Best-effort — a
-            // read failure leaves the pre-#172 shape-only reading.
-            let recorded_lane_decisions =
-                repo::latest_lane_decisions(db, thread_id).await.unwrap_or_default();
+            // just because the proposal shape says confirmed.
+            //
+            // NOT best-effort. Falling back to an empty map restores the
+            // pre-#172 shape-only reading, under which every confirmed lane
+            // reads as allowed — so a lane whose evidence says `needs_gate` or
+            // `denied` would drop out of NeedsYou and its issue could present
+            // as ReviewReady, on the strength of a failed read. When the
+            // verdicts cannot be read, every materialized lane is treated as
+            // gated instead: that keeps the issue in NeedsYou, which is the
+            // recoverable direction.
+            let recorded_lane_decisions = repo::latest_lane_decisions(db, thread_id).await;
+            let decisions_unreadable = recorded_lane_decisions.is_err();
+            let recorded_lane_decisions = recorded_lane_decisions.unwrap_or_default();
             let mut materialized_policies = HashMap::new();
             for proposed_lane in &proposal_lanes {
                 if proposed_lane.direction_id == 0 {
                     continue;
                 }
-                let policy = effective_lane_policy(phase, proposed_lane, &recorded_lane_decisions);
+                let policy = match decisions_unreadable {
+                    true => PolicyDecision::NeedsGate,
+                    false => effective_lane_policy(phase, proposed_lane, &recorded_lane_decisions),
+                };
                 materialized_policies
                     .entry(proposed_lane.direction_id)
                     .and_modify(|current| {
@@ -3909,7 +3959,7 @@ mod tests {
         let error = verification_targets_for_direction(
             &db,
             direction.id,
-            &GitSignatureProbe::readiness(),
+            &GitSignatureProbe::isolated_readiness(),
             VerificationTargetPurpose::ReadinessCollection,
         )
         .await
@@ -3960,7 +4010,7 @@ mod tests {
             let error = verification_targets_for_direction(
                 &db,
                 direction.id,
-                &GitSignatureProbe::readiness(),
+                &GitSignatureProbe::isolated_readiness(),
                 VerificationTargetPurpose::ReadinessCollection,
             )
             .await
@@ -4057,7 +4107,7 @@ mod tests {
             "an idle worker does not occupy the verification target"
         );
 
-        let probe = GitSignatureProbe::readiness();
+        let probe = GitSignatureProbe::isolated_readiness();
         for active_status in ["starting", "running", "stopped"] {
             repo::set_session_status(&db, worker.id, active_status)
                 .await
@@ -4291,7 +4341,7 @@ mod tests {
             &open_asks,
             open_pr_snapshot_freshness(1_000, 60),
             CheckExecution::RunAllowed,
-            &GitSignatureProbe::readiness(),
+            &GitSignatureProbe::isolated_readiness(),
         )
         .await
         .expect("worker failure must preempt lane collection");
@@ -4423,7 +4473,7 @@ mod tests {
     }
 
     async fn sampled_check_target(path: &Path, stored_path: String) -> CheckTarget {
-        let signature = GitSignatureProbe::readiness()
+        let signature = GitSignatureProbe::isolated_readiness()
             .sample(path)
             .await
             .expect("sample test worktree signature");
@@ -5517,7 +5567,7 @@ mod tests {
         let stored_path = root.path().display().to_string();
         let pre_targets = vec![sampled_check_target(root.path(), stored_path).await];
         let changed_path = root.path().join("README.md");
-        let probe = GitSignatureProbe::readiness();
+        let probe = GitSignatureProbe::isolated_readiness();
         let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
 
         let evidence = checks_for_targets_with_runner_and_post_targets(
@@ -5563,7 +5613,7 @@ mod tests {
         let pre_head = pre_targets[0].head_sha.clone();
         let pre_branch = pre_targets[0].branch.clone();
         let switched_path = root.path().to_path_buf();
-        let probe = GitSignatureProbe::readiness();
+        let probe = GitSignatureProbe::isolated_readiness();
         let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
 
         let evidence = checks_for_targets_with_runner_and_post_targets(
@@ -5580,7 +5630,7 @@ mod tests {
         .await
         .expect("same-HEAD branch-switch result");
 
-        let after = GitSignatureProbe::readiness()
+        let after = GitSignatureProbe::isolated_readiness()
             .sample(root.path())
             .await
             .expect("sample switched branch");

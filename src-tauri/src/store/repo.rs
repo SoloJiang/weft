@@ -2594,6 +2594,19 @@ pub async fn record_gate_decision(
     if decision != "approved" && decision != "denied" {
         anyhow::bail!("gate decision must be \"approved\" or \"denied\", got {decision:?}");
     }
+    // This table has no foreign key, so a deletion committing after the caller
+    // loaded the direction would cascade `lane_gate_decision` away and then let
+    // this row land — leaving an orphaned denial, and its free-text reason, in
+    // the database and in backups. Same fence every thread-owned write takes,
+    // re-checked after the insert because the two are not one transaction.
+    let thread_id = direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+        .map(|dir| dir.thread_id);
+    let Some(thread_id) = thread_id else {
+        anyhow::bail!("task {direction_id} no longer exists");
+    };
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let inserted = lane_gate_decision::Entity::insert(lane_gate_decision::ActiveModel {
         id: NotSet,
         direction_id: Set(direction_id),
@@ -2604,6 +2617,12 @@ pub async fn record_gate_decision(
     })
     .exec(&db.0)
     .await?;
+    if let Err(error) = ensure_thread_workspace_accepts_writes(db, thread_id).await {
+        let _ = lane_gate_decision::Entity::delete_by_id(inserted.last_insert_id)
+            .exec(&db.0)
+            .await;
+        return Err(error);
+    }
     lane_gate_decision::Entity::find_by_id(inserted.last_insert_id)
         .one(&db.0)
         .await?

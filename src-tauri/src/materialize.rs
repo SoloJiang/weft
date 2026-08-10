@@ -488,22 +488,31 @@ pub async fn materialize_direction(db: &Db, direction_id: i32) -> Result<Materia
             // `pnpm install` would park every policy edit in the workspace
             // behind a download, which is the phase `workspace_write_lock`
             // documents excluding.
-            let admitted = {
+            let recheck = {
                 let workspace_lock = workspace_write_lock(thread.workspace_id).await;
                 let _guard = workspace_lock.lock().await;
-                let recheck = authorize_materialize(
+                authorize_materialize(
                     db,
                     &dir,
                     &repo_ref,
                     thread.workspace_id,
                     &effective_base_branch(&repo_ref, &dir),
                 )
-                .await?;
-                matches!(recheck.decision, authority::LaneDecision::AllowedByPolicy)
+                .await?
             };
-            if !admitted {
-                // The checkout itself is left alone — only the new write stops.
-                return Ok(MaterializeOutcome::Ready(vec![existing]));
+            // Report the REFUSAL, do not swallow it. Returning `Ready` here sent
+            // callers down their success arms — confirm would commit the lane
+            // and hand it to dispatch — for a lane the policy had just refused,
+            // with no worker and no card. The existing checkout is still left
+            // untouched; only the answer changes.
+            match recheck.decision {
+                authority::LaneDecision::AllowedByPolicy => {}
+                authority::LaneDecision::NeedsGate => {
+                    return Ok(MaterializeOutcome::Gated(recheck))
+                }
+                authority::LaneDecision::Denied => {
+                    return Ok(MaterializeOutcome::Denied(recheck))
+                }
             }
             bootstrap_worktree_deps(&existing.path).await;
             return Ok(MaterializeOutcome::Ready(vec![existing]));
