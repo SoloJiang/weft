@@ -8909,6 +8909,13 @@ pub const EVIDENCE_KIND_EXECUTION: &str = "execution";
 pub const EVIDENCE_KIND_DECISION: &str = "decision";
 pub const EVIDENCE_KIND_HANDOFF: &str = "handoff";
 
+/// The one `source` whose `decision` rows carry an AUTHORITY policy revision in
+/// `policy_revision`. Every other producer of a `decision` row stamps something
+/// from its own namespace — the planner writes the plan's OCC version
+/// (`plan.created_at`) — so `policy_revision` is only comparable against an
+/// `authority_policy` revision when the row came from here.
+pub const EVIDENCE_SOURCE_AUTHORITY: &str = "authority";
+
 const EVIDENCE_KINDS: &[&str] = &[
     EVIDENCE_KIND_CODE,
     EVIDENCE_KIND_VERIFICATION,
@@ -9254,8 +9261,31 @@ pub async fn latest_lane_decisions(
         {
             continue;
         }
+        // Only an `authority` row's `policy_revision` IS an authority policy
+        // revision. The planner stamps the plan's OCC version
+        // (`plan.created_at`) into the same column, so comparing that against
+        // an `authority_policy` revision compares two different namespaces and
+        // never matches — which would file every planner row as superseded.
+        //
+        // That is the upgrade path from the parent schema: installs predating
+        // this feature have `source: "planner"` decision rows for lanes the
+        // user already confirmed, and treating them as superseded would put a
+        // Gate in front of every one of them at once.
+        //
+        // Taking them as-is is also what they mean. A pre-policy row is the
+        // same situation as a lane with NO decision row — never adjudicated
+        // under a policy — and that case already keeps the proposal-shape
+        // reading. It is not a permissive hole either: `effective_lane_policy`
+        // takes the STRICTER of shape and record, so a legacy
+        // `allowed_by_policy` is inert against the shape it came from, while a
+        // planner `denied` still lands as `Denied` — which is right, since a
+        // human denial is not something a policy revision should expire.
+        let carries_authority_revision = row.source == EVIDENCE_SOURCE_AUTHORITY;
         if let Some(active) = active_revision.as_deref() {
-            if !row.policy_revision.is_empty() && row.policy_revision != active {
+            if carries_authority_revision
+                && !row.policy_revision.is_empty()
+                && row.policy_revision != active
+            {
                 // The NEWEST decision for this lane was computed under a
                 // superseded revision, so the lane is undecided under the
                 // policy now in force. Mark it settled rather than continuing:
@@ -18500,6 +18530,108 @@ mod tests {
         assert!(
             err.to_string().contains("approved") || err.to_string().contains("denied"),
             "an unrecognized decision value must be rejected outright: {err}"
+        );
+    }
+
+    /// `policy_revision` is not one namespace. The planner stamps the PLAN's
+    /// OCC version into that column; only an `authority` row stamps an
+    /// authority policy revision. Comparing a plan token against a policy
+    /// revision can never match, so filing those rows as superseded would put
+    /// a Gate in front of every lane an upgrading install had already
+    /// confirmed — the whole board blocked at once, on a category error.
+    #[tokio::test]
+    async fn a_pre_policy_planner_row_is_not_superseded_by_the_active_revision() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "svc", "/tmp/svc-upgrade", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "t", "issue", "claude").await.unwrap();
+        let legacy = create_direction(&db, t.id, "legacy", "claude", r.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+        let vetoed = create_direction(&db, t.id, "vetoed", "claude", r.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+        let current = create_direction(&db, t.id, "current", "claude", r.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+
+        // A policy exists now, so the active revision is a real one and every
+        // row gets compared against it.
+        let rules = serde_json::to_string(&crate::authority::PolicyRules::default()).unwrap();
+        create_authority_policy(&db, "workspace", ws.id, &rules, "user").await.unwrap();
+        let active = resolve_policy_snapshot(&db, crate::authority::PolicyScope::Workspace(ws.id))
+            .await
+            .unwrap()
+            .revision;
+
+        // What the parent schema left behind: planner rows carrying
+        // `plan.created_at`, which is a timestamp and not a policy revision.
+        let plan_occ = "2024-01-01T00:00:00Z";
+        assert_ne!(plan_occ, active, "the premise is that these never match");
+        for (direction_id, decision) in [(legacy.id, "allowed_by_policy"), (vetoed.id, "denied")] {
+            append_evidence(
+                &db,
+                EvidenceWrite {
+                    thread_id: t.id,
+                    direction_id,
+                    kind: EVIDENCE_KIND_DECISION,
+                    source: "planner",
+                    source_ref: "deny_direction:1:0",
+                    revision: "",
+                    policy_revision: plan_occ,
+                    summary: "lane decision",
+                    payload: &serde_json::json!({ "decision": decision }).to_string(),
+                    collection_state: EVIDENCE_COLLECTION_OK,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // …and an authority row that genuinely IS stale, to prove the filter
+        // still bites where the revision is comparable.
+        append_evidence(
+            &db,
+            EvidenceWrite {
+                thread_id: t.id,
+                direction_id: current.id,
+                kind: EVIDENCE_KIND_DECISION,
+                source: EVIDENCE_SOURCE_AUTHORITY,
+                source_ref: "materialize_direction:1",
+                revision: "",
+                policy_revision: "a-superseded-policy-revision",
+                summary: "lane decision",
+                payload: &serde_json::json!({ "decision": "allowed_by_policy" }).to_string(),
+                collection_state: EVIDENCE_COLLECTION_OK,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (decisions, superseded) = latest_lane_decisions(&db, t.id).await.unwrap();
+
+        assert!(
+            !superseded.contains(&legacy.id),
+            "a pre-policy planner row carries no authority revision to be stale against"
+        );
+        assert_eq!(
+            decisions.get(&legacy.id).map(String::as_str),
+            Some("allowed_by_policy"),
+            "it is read as-is, and `effective_lane_policy` still takes the stricter of it and shape"
+        );
+        assert_eq!(
+            decisions.get(&vetoed.id).map(String::as_str),
+            Some("denied"),
+            "a human veto does not expire because a policy was configured afterwards"
+        );
+        assert!(
+            superseded.contains(&current.id),
+            "an authority row at a revision no longer in force IS superseded"
+        );
+        assert!(
+            !decisions.contains_key(&current.id),
+            "and must not answer for its lane"
         );
     }
 

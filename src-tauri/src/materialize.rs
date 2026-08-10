@@ -334,7 +334,10 @@ async fn record_lane_decision(
             thread_id: dir.thread_id,
             direction_id: dir.id,
             kind: repo::EVIDENCE_KIND_DECISION,
-            source: "authority",
+            // The marker `latest_lane_decisions` reads to know this row's
+            // `policy_revision` is an authority revision and not some other
+            // producer's version token.
+            source: repo::EVIDENCE_SOURCE_AUTHORITY,
             source_ref: &format!("materialize_direction:{}", dir.id),
             revision: &verdict.scope_revision,
             policy_revision: &verdict.policy_revision,
