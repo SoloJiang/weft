@@ -2603,12 +2603,35 @@ pub async fn resolve_policy_snapshot(
 ) -> Result<crate::authority::PolicySnapshot> {
     let kind = scope.kind();
     let id = scope.id();
+    // Checked BEFORE the active-row read, because the same ranking picks that
+    // row: if any revision cannot be ordered, "the active one" is not a fact.
+    if list_authority_policy_revisions(db, kind, id)
+        .await?
+        .iter()
+        .any(|row| row.revision.parse::<i64>().is_err())
+    {
+        let mut unreadable = crate::authority::default_policy(scope);
+        unreadable.rules_unreadable = true;
+        return Ok(unreadable);
+    }
     if let Some(row) = get_active_authority_policy(db, kind, id).await? {
         return Ok(crate::authority::snapshot_from_row(row, scope));
     }
     // Newest first, so this is the revision that was revoked.
-    let Some(revoked) = list_authority_policy_revisions(db, kind, id).await?.into_iter().next()
-    else {
+    let history = list_authority_policy_revisions(db, kind, id).await?;
+    // A row whose `revision` is not a number cannot be ordered, and the ranking
+    // treats it as zero — so a malformed NEWEST row silently loses to an older
+    // numeric one, and both adjudication and the bridge then enforce the older,
+    // more permissive rules. Unlike malformed rules JSON, nothing marked that
+    // unreadable, so nothing failed closed. Refuse to rank what cannot be
+    // ordered: the scope resolves to an unreadable policy, which Gates lanes and
+    // makes the bridge defer.
+    if history.iter().any(|row| row.revision.parse::<i64>().is_err()) {
+        let mut unreadable = crate::authority::default_policy(scope);
+        unreadable.rules_unreadable = true;
+        return Ok(unreadable);
+    }
+    let Some(revoked) = history.into_iter().next() else {
         return Ok(crate::authority::default_policy(scope));
     };
     Ok(crate::authority::revoked_policy(scope, revoked.revision, revoked.revoked_at))

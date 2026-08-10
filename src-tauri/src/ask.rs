@@ -1714,20 +1714,31 @@ impl Inner {
     /// `answer`'s own covered-asks sweep. Returns how many were resolved.
     /// Deliberately does NOT call `emit_persist` — a read-only grant is never
     /// persisted (see `read_only_session`'s doc on this struct).
-    fn resolve_read_only(&mut self, hit: Vec<Ask>) -> usize {
+    /// `denied` is the CURRENT policy's verdict per ask, supplied by the caller
+    /// because the bridge lives on the registry rather than on this inner state.
+    ///
+    /// A batch release is a convenience for the human, never a way around a
+    /// constraint: an ask that opened before a tighten must not ride out on a
+    /// backlog sweep that predates it.
+    fn resolve_read_only(&mut self, hit: Vec<Ask>, denied: &HashSet<u64>) -> usize {
         let ids: HashSet<u64> = hit.iter().map(|a| a.id).collect();
         self.open.retain(|a| !ids.contains(&a.id));
         for ask in &hit {
             if let Some(tx) = self.waiters.remove(&ask.id) {
-                let _ = tx.send(Decision::Allow);
+                let verdict = match denied.contains(&ask.id) {
+                    true => Decision::Deny,
+                    false => Decision::Allow,
+                };
+                let _ = tx.send(verdict);
             }
         }
         let n = hit.len();
         for ask in hit {
-            self.emit(AskEvent::Resolved {
-                ask,
-                answer: Answer::Allow,
-            });
+            let answer = match denied.contains(&ask.id) {
+                true => Answer::Deny,
+                false => Answer::Allow,
+            };
+            self.emit(AskEvent::Resolved { ask, answer });
         }
         n
     }
@@ -2132,14 +2143,24 @@ impl AskRegistry {
             .into_iter()
             .partition(|a| action_key_is_gui(&a.action_key));
         g.open = kept;
+        // Dangerous mode releases the backlog, but it does not outrank the
+        // workspace's own constraint — the same ordering `auto_decision` and
+        // `answer` apply. An ask that opened before a tighten is denied here
+        // too, rather than escaping through a sweep that predates the rule.
+        let denied = self.policy_denied_ids(&cleared);
         for ask in cleared {
+            let verdict = match denied.contains(&ask.id) {
+                true => Decision::Deny,
+                false => Decision::Allow,
+            };
             if let Some(tx) = g.waiters.remove(&ask.id) {
-                let _ = tx.send(Decision::Allow);
+                let _ = tx.send(verdict);
             }
-            g.emit(AskEvent::Resolved {
-                ask,
-                answer: Answer::Allow,
-            });
+            let answer = match verdict {
+                Decision::Deny => Answer::Deny,
+                Decision::Allow => Answer::Allow,
+            };
+            g.emit(AskEvent::Resolved { ask, answer });
         }
     }
 
@@ -2506,6 +2527,23 @@ impl AskRegistry {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&thread_id);
+    }
+
+    /// Which of these asks the CURRENT policy denies.
+    ///
+    /// Every batch release consults this. A sweep resolves asks that opened at
+    /// different times, and one that opened before a tighten must not be
+    /// released by a mechanism the tighten never reached.
+    fn policy_denied_ids(&self, asks: &[Ask]) -> HashSet<u64> {
+        asks.iter()
+            .filter(|ask| {
+                matches!(
+                    self.authority_bridge_decision(ask.thread, &ask.action_key),
+                    Some(Decision::Deny)
+                )
+            })
+            .map(|ask| ask.id)
+            .collect()
     }
 
     /// Record that the startup seed could not enumerate workspaces.
@@ -2938,7 +2976,8 @@ impl AskRegistry {
             })
             .cloned()
             .collect();
-        g.resolve_read_only(hit)
+        let denied = self.policy_denied_ids(&hit);
+        g.resolve_read_only(hit, &denied)
     }
 
     /// Issue-wide counterpart of `grant_read_only_session` (issue #103's
@@ -2963,7 +3002,8 @@ impl AskRegistry {
             })
             .cloned()
             .collect();
-        g.resolve_read_only(hit)
+        let denied = self.policy_denied_ids(&hit);
+        g.resolve_read_only(hit, &denied)
     }
 
     /// Revoke one session's read-only batch grant (issue #103). Returns whether

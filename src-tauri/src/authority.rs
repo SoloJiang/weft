@@ -406,6 +406,20 @@ pub fn looks_like_valid_ref(base_branch: &str) -> bool {
     if looks_like_commit_id(base_branch) {
         return false;
     }
+    // Only BRANCH namespaces. `refs/tags/x` is a ref that resolves to a commit
+    // without naming a branch, so a tag pointing at protected `main` matched no
+    // `protected_branches` entry and materialized from the protected commit —
+    // the same bypass as a revision expression or a raw SHA, one namespace over.
+    // `git.rs` accepts a `refs/...` start point verbatim, so this is the only
+    // place that can refuse it.
+    //
+    // Enumerating what is ALLOWED rather than what is denied: `refs/heads/…` is
+    // a branch, and anything else under `refs/` (tags, notes, remotes-as-refs,
+    // replace, stash, and whatever git adds next) is not. Chasing prefixes one
+    // at a time is what let this class recur three times.
+    if base_branch.starts_with("refs/") && !base_branch.starts_with("refs/heads/") {
+        return false;
+    }
     !base_branch.chars().any(|c| {
         c.is_whitespace()
             || c.is_control()
@@ -858,6 +872,12 @@ mod tests {
         assert!(looks_like_valid_ref("beef"));
         assert!(looks_like_valid_ref("feature/9fddf70"));
         assert!(looks_like_valid_ref("release-2024"));
+        // Tag and other non-branch namespaces resolve to a commit without
+        // naming a branch, so they dodge `protected_branches` the same way.
+        assert!(!looks_like_valid_ref("refs/tags/main-tip"));
+        assert!(!looks_like_valid_ref("refs/tags/v1.0"));
+        assert!(!looks_like_valid_ref("refs/remotes/origin/main"));
+        assert!(!looks_like_valid_ref("refs/notes/commits"));
         assert!(!looks_like_valid_ref("main.lock"));
         assert!(!looks_like_valid_ref("main/"));
         assert!(!looks_like_valid_ref("/main"));
@@ -877,6 +897,7 @@ mod tests {
             "main^0",
             "9fddf70ced1a2b3c4d5e6f70819a2b3c4d5e6f70",
             "9fddf70",
+            "refs/tags/main-tip",
         ] {
             let lane = LaneCandidate {
                 lane_id: "l1",
