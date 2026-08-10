@@ -3392,11 +3392,32 @@ pub async fn resolve_lane_gate(
     }
 }
 
-/// Whether one lane can run now: its own checkout exists, and every producer it
-/// declared has one too. The second half is what stops a join lane (two
-/// upstreams, one still gated) from being released by the wrong approval.
+/// Whether one lane can run now: the CURRENT policy still allows it, its own
+/// checkout exists, and every producer it declared has one too.
+///
+/// The policy check is not redundant with the Gate that just cleared. A
+/// dependent materialized under an older revision, and the policy can have
+/// tightened while the upstream Gate sat pending — releasing it on checkout
+/// existence alone would start a worker in a lane the workspace now denies,
+/// through a path that never consults the policy again. Re-adjudicating also
+/// records the fresh verdict, so the ledger shows why a dependent was held.
+///
+/// The upstream half is what stops a join lane (two producers, one still gated)
+/// from being released by the wrong approval.
 async fn lane_is_runnable(db: &Db, direction_id: i32) -> anyhow::Result<bool> {
     if !crate::store::repo::direction_has_live_worktree(db, direction_id).await? {
+        return Ok(false);
+    }
+    let verdict = crate::materialize::readjudicate_lane(db, direction_id).await?;
+    let allowed = match verdict {
+        // A lane binding no write repo has nothing to judge and nothing to
+        // block — its runnability rests entirely on the checks around this.
+        None => true,
+        Some(verdict) => {
+            matches!(verdict.decision, crate::authority::LaneDecision::AllowedByPolicy)
+        }
+    };
+    if !allowed {
         return Ok(false);
     }
     for upstream in crate::store::repo::upstream_direction_ids(db, direction_id).await? {
