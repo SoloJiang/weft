@@ -9325,6 +9325,39 @@ pub async fn latest_lane_decisions(
             }
         }
     }
+    // A human's DENIAL is durable in its own table and, by `get_gate_decision`'s
+    // rule, unconditional: it is a statement about the LANE, so no policy
+    // revision expires it and nothing but deleting the lane undoes it.
+    //
+    // The evidence ledger is a DERIVED record of that act, written after the
+    // fact and best-effort — `resolve_lane_gate` deliberately does not fail a
+    // denial when the write does, because the decision is already durable. But
+    // readiness read only the ledger, so a transient failure left the two
+    // disagreeing: `lane_state` said `Denied` and drew no card, while readiness
+    // still saw the old `needs_gate` row and pinned the issue at
+    // `PolicyGatePending` with nothing to act on. The same split opens whenever
+    // the denial's row is superseded by a later revision.
+    //
+    // Overlaying the durable veto LAST settles it in the direction the design
+    // already chose everywhere else: the human's act outranks any record of it.
+    // One query for the whole thread rather than one per lane: readiness runs
+    // often and a thread can carry many lanes.
+    let direction_ids: Vec<i32> = list_directions(db, thread_id)
+        .await?
+        .into_iter()
+        .map(|direction| direction.id)
+        .collect();
+    if !direction_ids.is_empty() {
+        let vetoed = lane_gate_decision::Entity::find()
+            .filter(lane_gate_decision::Column::DirectionId.is_in(direction_ids))
+            .filter(lane_gate_decision::Column::Decision.eq("denied"))
+            .all(&db.0)
+            .await?;
+        for veto in vetoed {
+            out.insert(veto.direction_id, "denied".to_string());
+            superseded.remove(&veto.direction_id);
+        }
+    }
     Ok((out, superseded))
 }
 
@@ -18530,6 +18563,70 @@ mod tests {
         assert!(
             err.to_string().contains("approved") || err.to_string().contains("denied"),
             "an unrecognized decision value must be rejected outright: {err}"
+        );
+    }
+
+    /// A human's veto is durable in `lane_gate_decision`, and the evidence
+    /// ledger is only a derived record of it. `resolve_lane_gate` deliberately
+    /// does not fail a denial when that derived write fails — the decision is
+    /// already recorded — so readiness must not depend on it either, or a
+    /// transient failure leaves `lane_state` saying `Denied` (no card) while
+    /// readiness still reports `PolicyGatePending` with nothing to act on.
+    #[tokio::test]
+    async fn a_durable_veto_answers_for_its_lane_even_with_no_evidence_of_it() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "svc", "/tmp/svc-veto-ledger", "main", "", true)
+            .await
+            .unwrap();
+        let t = create_thread(&db, ws.id, "t", "issue", "claude").await.unwrap();
+        let vetoed = create_direction(&db, t.id, "vetoed", "claude", r.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+        let sibling = create_direction(&db, t.id, "sibling", "claude", r.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+
+        // The gate that was raised, and the human's answer to it. The evidence
+        // write that would normally follow never lands.
+        for direction_id in [vetoed.id, sibling.id] {
+            append_evidence(
+                &db,
+                EvidenceWrite {
+                    thread_id: t.id,
+                    direction_id,
+                    kind: EVIDENCE_KIND_DECISION,
+                    source: EVIDENCE_SOURCE_AUTHORITY,
+                    source_ref: "materialize_direction:1",
+                    revision: "",
+                    policy_revision: "0",
+                    summary: "lane decision: needs_gate",
+                    payload: r#"{"decision":"needs_gate"}"#,
+                    collection_state: EVIDENCE_COLLECTION_OK,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        record_gate_decision(&db, vetoed.id, "0", "denied", "not this branch")
+            .await
+            .unwrap();
+
+        let (decisions, superseded) = latest_lane_decisions(&db, t.id).await.unwrap();
+
+        assert_eq!(
+            decisions.get(&vetoed.id).map(String::as_str),
+            Some("denied"),
+            "the human's durable veto answers for the lane, not the stale ledger row"
+        );
+        assert!(
+            !superseded.contains(&vetoed.id),
+            "and it is a settled answer, not an unresolved one"
+        );
+        assert_eq!(
+            decisions.get(&sibling.id).map(String::as_str),
+            Some("needs_gate"),
+            "a lane nobody vetoed still reads from its own evidence"
         );
     }
 

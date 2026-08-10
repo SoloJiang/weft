@@ -1683,35 +1683,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setHomeTab("board");
   }, []);
 
-  // Spawn (or focus) a worker for a (direction, repo) slot. focus=true opens it
-  // full-screen (a click); focus=false dispatches it in the background.
-  const spawnWorker = useCallback(
-    async (directionId: number, repoId: number, focus: boolean) => {
-      const existing = Object.values(sessionsRef.current).find(
-        (s) => s.directionId === directionId && s.repoId === repoId,
-      );
-      if (existing) {
-        if (focus) openWorker(directionId, repoId);
-        return;
-      }
-      const info = await api.chatOpenWorker(directionId, repoId, currentLang());
-      setSessions((m) => ({
-        ...m,
-        [info.session_id]: {
-          info,
-          status: "running",
-          directionId,
-          repoId,
-          threadId: info.thread_id,
-          nativeId: info.native_id,
-          eventDriven: true,
-        },
-      }));
-      if (focus) openWorker(directionId, repoId);
-    },
-    [openWorker],
-  );
-
   const viewDirection = useCallback(
     (directionId: number, repoId: number, opts?: { sidePanel?: "diff" | "files" }) => {
       setViewing({ directionId, repoId, sidePanel: opts?.sidePanel });
@@ -1988,7 +1959,25 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   // Automation-first (§4 principle 7): once a task is materialized, dispatch its
   // worker(s) right away — every write worktree gets an agent, no human click.
-  const dispatchDirection = useCallback(
+  //
+  // Goes through `driveDirection` rather than a second spawn helper of its own.
+  // That helper existed and was `driveDirection` minus the `status !== "exited"`
+  // filter, so it treated an EXITED session as an occupied slot and returned
+  // without ever calling `chatOpenWorker`. Recovery dispatch is exactly the case
+  // where the previous session has exited: the Gate panel's stranded-lane card
+  // approved, the lane stayed `ReadyToStart` on the backend, and the next reload
+  // presented the very same card again. Nothing wanted the old behaviour — a
+  // dead session should never stand in for a live one — so the duplicate is gone
+  // rather than repaired in parallel.
+  // Drive every live worktree of a direction, attaching to a live worker or
+  // resuming/starting one per repo.
+  //
+  // First dispatch and restart-continuity revive ask for exactly this, and once
+  // dispatch stopped using a spawn helper of its own the two were the same
+  // function written twice. `driveDirection` is idempotent for a live slot, so
+  // one implementation serves both — the distinct names below stay because the
+  // call sites mean different things, not because the behaviour differs.
+  const driveDirectionWorktrees = useCallback(
     async (directionId: number) => {
       let wts;
       try {
@@ -1996,33 +1985,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       } catch (e) {
         return;
       }
-      // Skip reclaimed worktrees (exists=false): the directory is gone, so
-      // spawning a worker in it would fail.
-      for (const w of wts.filter((w) => w.exists)) {
-        try {
-          await spawnWorker(directionId, w.repo_id, false);
-        } catch (error) {
-          notifyBackgroundWorkerDispatchFailed(error);
-          return;
-        }
-      }
-    },
-    [spawnWorker],
-  );
-
-  // Restart continuity (§4 principle 7): bring a working task's worker back by
-  // RESUME (not a fresh re-run) once per repo. Reuses driveDirection's
-  // resume-or-fresh + dedupe-by-live logic.
-  const reviveDirection = useCallback(
-    async (directionId: number) => {
-      let wts;
-      try {
-        wts = await api.listWorktrees(directionId);
-      } catch (e) {
-        return;
-      }
-      // Skip reclaimed worktrees (exists=false): a resume would drive a worker
-      // into a missing cwd.
+      // Skip reclaimed worktrees (exists=false): the directory is gone, so a
+      // worker would be driven into a missing cwd.
       for (const w of wts.filter((w) => w.exists)) {
         try {
           await driveDirection(directionId, w.repo_id, false);
@@ -2034,6 +1998,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     },
     [driveDirection],
   );
+
+  const dispatchDirection = driveDirectionWorktrees;
+
+  // Restart continuity (§4 principle 7): bring a working task's worker back by
+  // RESUME (not a fresh re-run) once per repo.
+  const reviveDirection = driveDirectionWorktrees;
 
   const createDirection = useCallback(
     async (
