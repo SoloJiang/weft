@@ -121,6 +121,19 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
         gate.policy_revision,
         decision,
       );
+      // Drop the row NOW rather than waiting for `reload()` to replace the
+      // list. Clearing only the busy flag left a settled card on screen with
+      // live buttons for the whole duration of a slow refetch; a second click
+      // is sequential, so it passes the backend's in-flight guard, records
+      // another decision and returns the dispatch set again — opening the same
+      // workers twice, since the dispatches are not awaited.
+      setGates((prev) => {
+        if (prev === null) return prev;
+        return {
+          threadId: prev.threadId,
+          rows: prev.rows.filter((row) => row.direction_id !== gate.direction_id),
+        };
+      });
       setActionState((prev) => {
         const next = { ...prev };
         delete next[gate.direction_id];

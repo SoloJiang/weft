@@ -3206,8 +3206,30 @@ pub struct LaneGateDto {
 #[tauri::command]
 pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGateDto>> {
     let directions = crate::store::repo::list_directions(&db, thread_id).await.map_err(e)?;
+    // Direction ids the CURRENT plan still references. A re-propose that drops
+    // or replaces a gated lane leaves the old direction and its `needs_gate`
+    // evidence behind, and enumerating directions alone keeps that card
+    // actionable — approving it would materialize and dispatch work the user's
+    // reviewed scope no longer contains. Empty means the plan records no ids
+    // yet (nothing confirmed), in which case there is nothing to filter
+    // against and every lane stays eligible.
+    let in_scope: std::collections::HashSet<i32> = crate::store::repo::get_plan(&db, thread_id)
+        .await
+        .map_err(e)?
+        .and_then(|plan| serde_json::from_str::<serde_json::Value>(&plan.proposal).ok())
+        .and_then(|value| value.get("directions").cloned())
+        .and_then(|dirs| dirs.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
+        .map(|id| id as i32)
+        .filter(|id| *id != 0)
+        .collect();
     let mut out = Vec::new();
     for dir in directions {
+        if !in_scope.is_empty() && !in_scope.contains(&dir.id) {
+            continue;
+        }
         // Whether the lane has a checkout a worker could actually run in — the
         // same predicate materialization uses, not a path-existence probe.
         // NOT a reason to skip on its own: the reuse fast-path re-adjudicates
@@ -3263,10 +3285,19 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
         // returns the lanes to dispatch. `denied` is settled and stays hidden.
         let verdict = parsed.get("decision").and_then(|v| v.as_str()).unwrap_or("");
         // `needs_gate` is the ordinary card, shown whether or not a checkout
-        // exists. `allowed_by_policy` with NO usable checkout is the stranded
-        // case. Everything else — an allowed lane that materialized fine, or a
-        // settled denial — has nothing to decide.
-        let stranded = verdict == "allowed_by_policy" && !checkout_ok;
+        // exists. `allowed_by_policy` is the recoverable case — but a usable
+        // checkout does NOT mean the lane is running: a tightened policy gates
+        // a lane that keeps its worktree, confirm drops it (and its dependents)
+        // from dispatch, and if the policy is later loosened the verdict flips
+        // back to allowed with still nothing started and the proposal UI long
+        // closed. What distinguishes a healthy lane from a paused one is
+        // whether a worker was ever opened for it, not whether a directory
+        // exists. `denied` is settled and stays hidden.
+        let never_started = crate::store::repo::sessions_for_direction(&db, dir.id)
+            .await
+            .map_err(e)?
+            .is_empty();
+        let stranded = verdict == "allowed_by_policy" && (!checkout_ok || never_started);
         if verdict != "needs_gate" && !stranded {
             continue;
         }

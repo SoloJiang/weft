@@ -2251,12 +2251,41 @@ impl AskRegistry {
         snapshot: Option<crate::authority::PolicySnapshot>,
     ) {
         let mut g = self.authority.write().unwrap_or_else(|e| e.into_inner());
+        // Refreshes are not ordered. Two overlapping policy mutations each read
+        // the database and then install; the EARLIER read can be descheduled
+        // and land last, caching a superseded revision (or a revoke clearing a
+        // snapshot a later `set` just installed) while materialization already
+        // enforces the newer row. CLI asks would then run on rules the database
+        // has moved past — auto-allowing what the current policy denies, until
+        // some unrelated refresh or a restart happened to fix it.
+        //
+        // Revisions are monotonic per scope (see `create_authority_policy`), so
+        // comparing them numerically is enough to drop a stale install. A CLEAR
+        // is never dropped: it is the fail-closed answer, used both for a real
+        // revoke and for a failed read, and deferring to a human is always a
+        // safe outcome.
+        let cached_revision = g
+            .get(&workspace_id)
+            .and_then(|current| current.revision.parse::<i64>().ok());
         match snapshot {
             // A revoked/absent policy REMOVES the entry rather than leaving a
             // stale one: the hard-coded conservative default then applies, and
             // the bridge defers to the human flow exactly as it did pre-#172.
-            None => g.remove(&workspace_id),
-            Some(snapshot) => g.insert(workspace_id, snapshot),
+            None => {
+                g.remove(&workspace_id);
+            }
+            Some(snapshot) => {
+                let incoming = snapshot.revision.parse::<i64>().ok();
+                let is_stale = match (cached_revision, incoming) {
+                    (Some(cached), Some(incoming)) => incoming < cached,
+                    // An unparseable revision on either side carries no ordering
+                    // to compare, so take the write rather than pin the cache.
+                    _ => false,
+                };
+                if !is_stale {
+                    g.insert(workspace_id, snapshot);
+                }
+            }
         };
     }
 
