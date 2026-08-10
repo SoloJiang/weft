@@ -1582,7 +1582,22 @@ pub(crate) async fn chat_open_worker_impl(
     // rules. Policy edits are rare and human-initiated, so serialising them
     // behind a worker start is the cheap side of this trade; the lock is the
     // same one `set_authority_policy` and materialization take, and nothing on
-    // this path materializes, so the acquisition cannot nest.
+    // this path materializes, so the acquisition cannot nest. It is taken AFTER
+    // the initial-route gate below — see the ordering note there.
+    // A planner's final manual pin and a worker's first engine registration
+    // own the same initial route. Hold this through the first start/send so a
+    // stale no-native engine cannot appear between the planner's liveness check
+    // and its durable route transaction.
+    let _initial_route_guard = engine::initial_worker_route_gate(direction_id)
+        .lock_owned()
+        .await;
+    // …and only THEN the workspace lock. Order matters and is not free choice:
+    // `approve_direction_with_pin_with_session_liveness` already holds this
+    // route gate and then calls `materialize_direction`, which waits on the
+    // workspace lock. Taking them the other way round here — as this did when
+    // the guard was first added above the route gate — is an ABBA inversion
+    // that hangs both operations indefinitely when a worker open races a manual
+    // approval of a reused lane. Route gate → workspace lock, everywhere.
     let _policy_guard = match repo::get_direction(db, direction_id).await? {
         Some(dir) => match repo::get_thread(db, dir.thread_id).await? {
             Some(thread) => {
@@ -1601,14 +1616,6 @@ pub(crate) async fn chat_open_worker_impl(
             anyhow::bail!("the workspace policy no longer allows starting this task");
         }
     }
-
-    // A planner's final manual pin and a worker's first engine registration
-    // own the same initial route. Hold this through the first start/send so a
-    // stale no-native engine cannot appear between the planner's liveness check
-    // and its durable route transaction.
-    let _initial_route_guard = engine::initial_worker_route_gate(direction_id)
-        .lock_owned()
-        .await;
     let mut dir = engine::ensure_worker_parent_chain(db, direction_id, repo_id).await?;
 
     // An unpinned direction that has not yet established a native conversation

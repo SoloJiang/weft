@@ -3399,8 +3399,16 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
         // that provably cannot succeed is worse than showing nothing; B's real
         // blocker is A's denial, which has its own record.
         let upstream_blocked = upstream_blocks_lane(&db, thread_id, dir.id).await.map_err(e)?;
-        let stranded = !finished
-            && !upstream_blocked
+        // A finished lane is excluded from BOTH arms, not just the recovery
+        // one. A policy change can re-adjudicate completed work as needs_gate,
+        // and an actionable card for it is worse than useless: approving it
+        // returns the lane from `released_by_gate` — whose runnability check
+        // also ignores lifecycle — and starts a second worker on work that is
+        // already done.
+        if finished {
+            continue;
+        }
+        let stranded = !upstream_blocked
             && verdict == "allowed_by_policy"
             && (!checkout_ok || never_started);
         if verdict != "needs_gate" && !stranded {
@@ -3626,6 +3634,15 @@ async fn upstream_blocks_lane(db: &Db, thread_id: i32, direction_id: i32) -> any
 /// The upstream half is what stops a join lane (two producers, one still gated)
 /// from being released by the wrong approval.
 async fn lane_is_runnable(db: &Db, direction_id: i32) -> anyhow::Result<bool> {
+    // Terminal lanes are never "runnable": releasing one starts a second worker
+    // on work that is already done. Checked here as well as at card creation,
+    // because this is what the frontend actually dispatches.
+    if crate::store::repo::get_direction(db, direction_id)
+        .await?
+        .is_some_and(|dir| dir.status == "done")
+    {
+        return Ok(false);
+    }
     if !crate::materialize::lane_has_valid_checkout(db, direction_id).await? {
         return Ok(false);
     }

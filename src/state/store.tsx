@@ -2043,9 +2043,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       repoId: number,
       reason: string,
     ) => {
-      const dir = await api.createDirection(threadId, name, tool, repoId, reason);
-      await loadThreadChildren(threadId);
-      void dispatchDirection(dir.id);
+      try {
+        const dir = await api.createDirection(threadId, name, tool, repoId, reason);
+        await loadThreadChildren(threadId);
+        void dispatchDirection(dir.id);
+      } catch (error) {
+        // A policy-gated standalone task is PERSISTED and then reported as an
+        // error: the direction and its Gate evidence exist, but returning here
+        // without reloading left the thread stale, so the panel — which keys on
+        // the thread's lane ids — never learned the lane existed and its only
+        // approval surface stayed hidden until a navigation or restart. Reload
+        // regardless of outcome, then re-raise for the caller's own handling.
+        await loadThreadChildren(threadId);
+        throw error;
+      }
     },
     [loadThreadChildren, dispatchDirection],
   );
