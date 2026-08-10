@@ -321,6 +321,7 @@ export const en = {
       approveFailed: "Couldn't approve — try again.",
       denyFailed: "Couldn't deny — try again.",
       policyChanged: "The policy changed while this was open — re-read the updated card and decide again.",
+      noLongerPending: "This task moved on while the card was open — there's nothing to decide here now.",
       loadFailed: "Couldn't load pending decisions — some tasks may be waiting.",
       retry: "Try again",
       reason: {

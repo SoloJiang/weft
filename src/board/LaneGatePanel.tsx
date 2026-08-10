@@ -28,6 +28,17 @@ function failureFor(decision: "approved" | "denied"): GateActionState {
   return "denyFailed";
 }
 
+/** What a failed resolve means for the row: "stale" and "obsolete" are cards to
+ *  replace, "retry" is a genuine failure to report. The backend's refusal slugs
+ *  are the contract (`commands::resolve_lane_gate`); anything else is a real
+ *  error and must NOT quietly remove a card the user still has to act on. */
+function resolveFailure(error: unknown): "stale" | "obsolete" | "retry" {
+  const text = String(error);
+  if (text.includes("gate_policy_changed")) return "stale";
+  if (text.includes("gate_not_actionable")) return "obsolete";
+  return "retry";
+}
+
 function gateReasonKey(reason: string): GateReasonKey {
   switch (reason) {
     case "protected_branch":
@@ -47,7 +58,13 @@ function gateReasonKey(reason: string): GateReasonKey {
  *  booleans, mapped exhaustively where it's rendered. The two failure arms are
  *  distinct on purpose: telling someone "couldn't approve" after they clicked
  *  Deny reads, on a permission surface, as if they had just approved. */
-type GateActionState = "idle" | "resolving" | "approveFailed" | "denyFailed" | "stale";
+type GateActionState =
+  | "idle"
+  | "resolving"
+  | "approveFailed"
+  | "denyFailed"
+  | "stale"
+  | "obsolete";
 
 /** Whether the whole list has loaded. A failed fetch must NOT look like "no
  *  Gates pending" — that is the state in which a user concludes everything is
@@ -181,16 +198,26 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
       );
       if (liveThreadId.current === gate.thread_id) reload();
     } catch (error) {
-      // The backend rejects a decision made against a superseded policy
-      // revision rather than recording one the adjudicator would ignore. That
-      // is not a failed click, it is a card the user must re-read — say so, and
-      // reload so the row comes back stamped with the rules now in force.
-      const stale = String(error).includes("gate_policy_changed");
+      // Two backend refusals are not failed clicks — they are cards that no
+      // longer describe reality — and both are answered by reloading rather
+      // than by telling the user their action failed. Derived once, here, and
+      // mapped exhaustively below (CLAUDE.md).
+      //
+      // `gate_policy_changed`: the decision was made against a superseded
+      // policy revision, which the adjudicator would ignore. The row must come
+      // back stamped with the rules now in force.
+      //
+      // `gate_not_actionable`: the lane reached a terminal or out-of-scope
+      // state while this card sat open. Nothing else removes it — the reload
+      // effect keys off the thread's direction ids, which a status change does
+      // not alter — so without reloading here the user is left clicking a dead
+      // card that reports a failure every time.
+      const outcome = resolveFailure(error);
       setActionState((prev) => ({
         ...prev,
-        [gate.direction_id]: stale ? "stale" : failureFor(decision),
+        [gate.direction_id]: outcome === "retry" ? failureFor(decision) : outcome,
       }));
-      if (stale && liveThreadId.current === gate.thread_id) reload();
+      if (outcome !== "retry" && liveThreadId.current === gate.thread_id) reload();
     }
   }
 
@@ -300,5 +327,7 @@ function GateRowStatus({ state }: { state: GateActionState }) {
       return <div className="text-[10.5px] text-danger">{t("scope.gate.denyFailed")}</div>;
     case "stale":
       return <div className="text-[10.5px] text-danger">{t("scope.gate.policyChanged")}</div>;
+    case "obsolete":
+      return <div className="text-[10.5px] text-ink-faint">{t("scope.gate.noLongerPending")}</div>;
   }
 }

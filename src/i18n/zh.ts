@@ -312,6 +312,7 @@ export const zh = {
       approveFailed: "批准失败，请重试。",
       denyFailed: "拒绝失败，请重试。",
       policyChanged: "策略在此期间发生了变化——请重新查看更新后的卡片再做决定。",
+      noLongerPending: "这个任务在卡片打开期间已经变化，这里不再需要你决定。",
       loadFailed: "待决定事项加载失败——可能仍有任务在等待。",
       retry: "重试",
       reason: {
