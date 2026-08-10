@@ -381,14 +381,29 @@ fn denylist_catches_repo(list: &[String], name: &str) -> bool {
 /// through. The rule side is normalized too, so configuring `refs/heads/main`
 /// protects `main` rather than nothing at all.
 fn bare_branch_name(name: &str) -> &str {
-    let name = name.trim();
-    if let Some(rest) = name.strip_prefix("refs/remotes/") {
-        return rest.strip_prefix("origin/").unwrap_or(rest);
+    // Stripped to a FIXPOINT rather than one prefix per call, because git
+    // accepts composites and the resolver collapses them. `refs/heads/origin/main`
+    // used to stop after `refs/heads/` and compare as `origin/main`, so
+    // `protected_branches: ["main"]` did not match — while `git::normalize_target`
+    // strips both prefixes in sequence and `resolve_base_ref` then selects
+    // `refs/heads/main`, branching the lane off protected `main` with no Gate.
+    // Any disagreement between what this collapses and what the resolver
+    // collapses is a bypass, so this one loops until nothing more can come off.
+    //
+    // Over-collapsing is the safe direction here: `matches_branch` only ever
+    // REFUSES, so a spelling that folds into a protected name gates rather than
+    // slips through.
+    let mut name = name.trim();
+    loop {
+        let stripped = name
+            .strip_prefix("refs/remotes/")
+            .or_else(|| name.strip_prefix("refs/heads/"))
+            .or_else(|| name.strip_prefix("origin/"));
+        match stripped {
+            Some(rest) if rest != name => name = rest,
+            _ => return name,
+        }
     }
-    if let Some(rest) = name.strip_prefix("refs/heads/") {
-        return rest;
-    }
-    name.strip_prefix("origin/").unwrap_or(name)
 }
 
 /// `matches_name` over branch spellings — both sides collapsed to the bare name.
@@ -947,6 +962,69 @@ mod tests {
         let after = adjudicate_lane(&tightened, "rev-1", &base_lane());
         assert_eq!(after.decision, LaneDecision::Denied);
         assert_eq!(after.policy_revision, "2");
+    }
+
+    /// Protection is matched on the BARE name, so every spelling git accepts
+    /// for a branch has to collapse to the same thing this side and on the
+    /// resolver's side. Any disagreement is a bypass.
+    ///
+    /// The composite `refs/heads/origin/main` is the one that got through:
+    /// stripping a single prefix left `origin/main`, which matched no rule,
+    /// while `git::normalize_target` strips both in sequence and
+    /// `resolve_base_ref` then selects `refs/heads/main` — branching the lane
+    /// off protected `main` with no Gate.
+    #[test]
+    fn every_spelling_of_a_protected_branch_collapses_to_the_same_name() {
+        let mut policy = default_policy(PolicyScope::Workspace(1));
+        policy.rules.protected_branches = vec!["main".to_string()];
+
+        // Spellings a lane may legitimately carry. `refs/heads/origin/main` is
+        // the composite that used to stop after one strip and compare as
+        // `origin/main`, matching nothing.
+        for spelling in ["main", "origin/main", "refs/heads/main", "refs/heads/origin/main"] {
+            let mut lane = base_lane();
+            lane.base_branch = spelling;
+            let verdict = adjudicate_lane(&policy, "rev-1", &lane);
+            assert_eq!(
+                verdict.decision,
+                LaneDecision::NeedsGate,
+                "{spelling:?} must not slip past protected `main`"
+            );
+            assert_eq!(verdict.reason, VerdictReason::ProtectedBranch);
+        }
+        // A `refs/remotes/` base never reaches the branch comparison at all —
+        // `looks_like_valid_ref` refuses the whole namespace first, which is a
+        // stronger answer than gating. Asserted so a future loosening of that
+        // rule cannot quietly turn these into an allow.
+        for spelling in ["refs/remotes/origin/main", "refs/remotes/origin/refs/heads/main"] {
+            let mut lane = base_lane();
+            lane.base_branch = spelling;
+            assert_ne!(
+                adjudicate_lane(&policy, "rev-1", &lane).decision,
+                LaneDecision::AllowedByPolicy,
+                "{spelling:?} must never materialize unreviewed"
+            );
+        }
+
+        // The rule side is normalized too, so writing the composite in the
+        // POLICY protects the plain branch rather than nothing at all.
+        let mut composite_rule = default_policy(PolicyScope::Workspace(1));
+        composite_rule.rules.protected_branches = vec!["refs/heads/origin/main".to_string()];
+        let mut lane = base_lane();
+        lane.base_branch = "main";
+        assert_eq!(
+            adjudicate_lane(&composite_rule, "rev-1", &lane).reason,
+            VerdictReason::ProtectedBranch
+        );
+
+        // …and an unrelated branch is still not protected, so this is not
+        // simply matching everything.
+        let mut other = base_lane();
+        other.base_branch = "feature/x";
+        assert_eq!(
+            adjudicate_lane(&policy, "rev-1", &other).decision,
+            LaneDecision::AllowedByPolicy
+        );
     }
 
     /// `protected_branches` is matched by NAME, so a start point that has no
