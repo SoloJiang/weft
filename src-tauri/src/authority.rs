@@ -378,11 +378,29 @@ fn matches_branch(list: &[String], name: &str) -> bool {
 /// control/whitespace and `..` cases this already refused. Blank stays valid
 /// (the repo default). `/` stays valid, so `origin/main` and `refs/heads/main`
 /// still work, as does a raw commit SHA.
-/// Whether this is a git object id rather than a branch name — 7 to 40 hex
-/// digits, the abbreviated and full SHA-1 forms git accepts interchangeably.
+/// Whether this is a git object id rather than a branch name — 7 to 64 hex
+/// digits, covering every abbreviated and full form git accepts in BOTH hash
+/// formats: SHA-1 tops out at 40, SHA-256 at 64.
+///
+/// The bound has to span both, because this function cannot ask which one the
+/// repository uses. `adjudicate_lane` is pure by design and reaches neither git
+/// nor the store, and the hash format is a property of the repository.
+///
+/// Stopping at 40 was a hole, not a simplification: weft supports SHA-256
+/// repositories explicitly (`git::is_full_commit_oid` is documented
+/// hash-agnostic, and `materialize` discriminates on it), so an untrusted
+/// proposal could name protected `main` by its 64-hex object id. That resolves
+/// to the protected branch's own commit, matches no `protected_branches` NAME,
+/// and materialized onto it with no Gate — exactly the bypass the metacharacter
+/// rules above exist to close, just spelled in a hash format the bound had
+/// never been widened for.
+///
+/// Fails CLOSED for the pathological branch genuinely named like a hash: it is
+/// refused rather than silently exempted, which is the same trade the 7..=40
+/// bound already made. Git itself warns about such names for this ambiguity.
 fn looks_like_commit_id(value: &str) -> bool {
     let len = value.len();
-    (7..=40).contains(&len) && value.chars().all(|c| c.is_ascii_hexdigit())
+    (7..=64).contains(&len) && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 pub fn looks_like_valid_ref(base_branch: &str) -> bool {
@@ -896,6 +914,26 @@ mod tests {
         assert!(!looks_like_valid_ref("9fddf70ced1a2b3c4d5e6f70819a2b3c4d5e6f70"));
         assert!(!looks_like_valid_ref("9fddf70"));
         assert!(!looks_like_valid_ref("9FDDF70CED1A2B3C"));
+        // The SAME bypass in the other hash format. Weft supports SHA-256
+        // repositories explicitly (`git::is_full_commit_oid` is hash-agnostic),
+        // so a 64-hex object id names protected `main`'s commit just as well as
+        // a 40-hex one — and this check cannot ask which format the repository
+        // uses, because `adjudicate_lane` reaches neither git nor the store.
+        // Every length git accepts in either format has to be refused.
+        let sha256 = "9fddf70ced1a2b3c4d5e6f70819a2b3c4d5e6f709fddf70ced1a2b3c4d5e6f70";
+        assert_eq!(sha256.len(), 64, "the fixture must be a full SHA-256 id");
+        assert!(!looks_like_valid_ref(sha256));
+        // …and its abbreviations, including the 41..=63 window that only exists
+        // for SHA-256 and that a 40-digit bound let straight through.
+        for length in [41, 48, 63] {
+            let abbreviated = &sha256[..length];
+            assert!(
+                !looks_like_valid_ref(abbreviated),
+                "a {length}-digit object id must not pass as a branch name"
+            );
+        }
+        // 65 hex digits is longer than any id git mints, so it is a name again.
+        assert!(looks_like_valid_ref(&format!("{sha256}a")));
         // …while ordinary names that merely contain hex characters still pass.
         assert!(looks_like_valid_ref("beef"));
         assert!(looks_like_valid_ref("feature/9fddf70"));
