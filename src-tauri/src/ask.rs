@@ -2199,6 +2199,17 @@ impl AskRegistry {
     /// every OTHER caller (the ordinary [`auto_decision`], the PreToolUse hook
     /// path in `bus::server::handle`) keeps honoring `dangerous`, unchanged.
     pub fn auto_decision_gui(&self, thread: i32, dir: &str, action_key: &str) -> Option<Decision> {
+        // The SAME policy ordering `auto_decision` applies, for the same reason:
+        // a deny is a constraint, and a constraint one route honours and another
+        // does not is not a constraint. This path deliberately ignores Dangerous
+        // mode and the coarse read-only grants (see this method's own doc); that
+        // is unchanged, and adding these two checks can only narrow further.
+        if matches!(self.authority_bridge_decision(thread, action_key), Some(Decision::Deny)) {
+            return Some(Decision::Deny);
+        }
+        if self.authority_is_indeterminate(thread) {
+            return None;
+        }
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         Self::exact_grant(&g, thread, dir, action_key)
     }
@@ -6741,6 +6752,37 @@ mod tests {
             r.auto_decision(7, "10", RiskLevel::ReadOnly, "Run: ls"),
             Some(Decision::Allow)
         );
+    }
+
+    /// The GUI approval route honours a policy deny like every other route.
+    ///
+    /// It reaches `auto_decision_gui` rather than `auto_decision`, which existed
+    /// only to EXCLUDE Dangerous mode and the coarse read-only grants from
+    /// desktop-wide GUI control. Excluding those must not also exclude the
+    /// workspace's own constraint — a deny one route honours and another does
+    /// not is not a constraint.
+    #[test]
+    fn the_gui_route_honours_a_policy_deny_and_an_unknown_policy() {
+        let r = bridge_registry();
+        let gui_key = "[\"Gui\",\"screenshot\"]";
+        r.answer(
+            r.request(1, "10", "computer", "s", "d", RiskLevel::Unknown, gui_key).0,
+            Answer::Full,
+        );
+        assert_eq!(r.auto_decision_gui(1, "10", gui_key), Some(Decision::Allow));
+
+        let mut rules = crate::authority::PolicyRules::default();
+        rules.deny_actions = vec![gui_key.to_string()];
+        r.set_authority_snapshot(1, Some(bridge_test_policy(rules)));
+        assert_eq!(
+            r.auto_decision_gui(1, "10", gui_key),
+            Some(Decision::Deny),
+            "a Full grant must not outrank the workspace constraint here either"
+        );
+
+        // …and an unknown policy defers rather than falling back to the grant.
+        r.suspend_authority_snapshot(1);
+        assert_eq!(r.auto_decision_gui(1, "10", gui_key), None);
     }
 
     /// Revoking may only tighten — for the CLI bridge as well as for lanes.
