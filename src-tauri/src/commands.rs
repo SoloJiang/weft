@@ -3402,13 +3402,20 @@ async fn list_lane_gates_impl(db: &Db, thread_id: i32) -> R<Vec<LaneGateDto>> {
             | LaneAuthorityState::Running
             | LaneAuthorityState::NotApplicable => continue,
         };
+        // Identity of THIS card, not just of the policy behind it — see
+        // `gate_card_token`. The frontend round-trips it unread.
+        let token = gate_card_token(
+            &verdict.policy_revision,
+            &reason,
+            &effective_gate_base(db, &dir).await,
+        );
         out.push(LaneGateDto {
             direction_id: dir.id,
             thread_id,
             name: dir.name,
             reason: dir.reason,
             base_branch: dir.base_branch,
-            policy_revision: verdict.policy_revision.clone(),
+            policy_revision: token,
             verdict_reason: reason,
             hit_rule: verdict.hit_rule.clone(),
             observed_at: verdict.decided_at.clone(),
@@ -3440,6 +3447,69 @@ fn gate_reason_slug(verdict: &crate::authority::LaneVerdict) -> String {
 /// was ever configured. Resolved server-side so a caller can never record a
 /// decision against a revision that is not in force — neither a stale one read
 /// off an old card nor a not-yet-minted one.
+/// The identity of the card a human is looking at: the policy revision behind
+/// it, WHICH card it is, and the base it authorizes.
+///
+/// The revision alone was not that identity. `offers_decision` admits three
+/// materially different cards — a rule's approve/deny, and the two
+/// stranded-lane recovery prompts — and a click carries no record of which one
+/// was on screen. So a `stranded_lane` card ("nothing is running this, start
+/// it") could be answered after the lane had become `AwaitingGate` and have the
+/// approval read as "yes, materialize onto that protected branch". The policy
+/// revision does not move when a REPOSITORY's default branch does, so nothing
+/// caught it.
+///
+/// The base is in here for the narrower case the slug alone misses: a
+/// `protected_branch` card whose effective base changes to a DIFFERENT
+/// protected branch keeps its slug and its revision, and the approval would
+/// carry over to a base the card never named.
+///
+/// Opaque to the frontend, which only round-trips it. Deliberately NOT what the
+/// decision is stored under — `adjudicate_lane` looks a gate override up by the
+/// policy revision alone, so keying the row on this would make every approval
+/// unfindable.
+fn gate_card_token(policy_revision: &str, slug: &str, base: &str) -> String {
+    format!("{policy_revision}|{slug}|{base}")
+}
+
+/// The effective base a lane would materialize from, resolved the way
+/// `materialize` resolves it so a blank `base_branch` compares as the
+/// repository default rather than as "".
+async fn effective_gate_base(db: &Db, dir: &crate::store::entities::direction::Model) -> String {
+    match crate::store::repo::direction_repo_of(db, dir.id).await {
+        Ok(Some(repo_ref)) => crate::materialize::effective_base_branch(&repo_ref, dir),
+        // No repo to resolve against: the lane binds none, or the read failed.
+        // Either way an empty base is a value the live recompute will produce
+        // identically, so the comparison stays honest rather than accidentally
+        // invalidating every card.
+        Ok(None) | Err(_) => dir.base_branch.clone(),
+    }
+}
+
+/// Recompute the token for whatever card this lane offers RIGHT NOW, so a
+/// stale click can be told apart from a current one.
+async fn current_gate_card_token(db: &Db, direction_id: i32) -> anyhow::Result<String> {
+    use crate::lane_state::LaneAuthorityState;
+    let Some(dir) = crate::store::repo::get_direction(db, direction_id).await? else {
+        anyhow::bail!("lane {direction_id} not found");
+    };
+    let state = crate::lane_state::lane_authority_state(db, direction_id).await?;
+    let (verdict, slug) = match &state {
+        LaneAuthorityState::AwaitingGate(verdict) => {
+            (verdict.as_ref(), gate_reason_slug(verdict))
+        }
+        LaneAuthorityState::NeedsMaterialize(verdict)
+        | LaneAuthorityState::ReadyToStart(verdict) => {
+            (verdict.as_ref(), "stranded_lane".to_string())
+        }
+        // Offers no card at all. `resolve_lane_gate_impl` rejects these by
+        // `offers_decision` before it ever compares tokens; returning the
+        // lane's label keeps this total without inventing a card.
+        _ => return Ok(gate_card_token(&current_gate_policy_revision(db, direction_id).await?, state.label(), &effective_gate_base(db, &dir).await)),
+    };
+    Ok(gate_card_token(&verdict.policy_revision, &slug, &effective_gate_base(db, &dir).await))
+}
+
 async fn current_gate_policy_revision(db: &Db, direction_id: i32) -> anyhow::Result<String> {
     let Some(dir) = crate::store::repo::get_direction(db, direction_id).await? else {
         anyhow::bail!("lane {direction_id} not found");
@@ -3504,10 +3574,10 @@ async fn resolve_lane_gate_impl(
     // Parsed BEFORE any work, so an unrecognized string is refused rather than
     // reaching the branch below as "not denied" and being treated as approval.
     let intent = GateDecision::parse(decision).ok_or_else(|| "gate_decision_invalid".to_string())?;
+    // What the decision is STORED under is the policy revision alone, because
+    // that is what `adjudicate_lane` looks an override up by. The card's own
+    // identity is a wider thing and is checked separately below.
     let current = current_gate_policy_revision(db, direction_id).await.map_err(e)?;
-    if policy_revision != current {
-        return Err("gate_policy_changed".to_string());
-    }
     // The policy revision alone does not prove the card is still meaningful: a
     // re-proposal can drop this lane without touching the policy at all, and
     // the card open on screen stays clickable. Approving it would materialize
@@ -3539,6 +3609,22 @@ async fn resolve_lane_gate_impl(
                 crate::lane_state::lane_authority_state(db, direction_id).await.map_err(e)?;
             if !state.offers_decision() {
                 return Err(format!("gate_not_actionable:{}", state.label()));
+            }
+            // The CARD's identity, not merely the policy's — see
+            // `gate_card_token`. A recovery card answered after the lane became
+            // `AwaitingGate` would otherwise record "start this" as "yes,
+            // materialize onto that protected branch", and a repository default
+            // branch moving is invisible to the policy revision.
+            //
+            // AFTER `offers_decision` on purpose. A terminal lane fails both
+            // checks, and `gate_not_actionable:done` is the answer worth
+            // giving — the token mismatch would be true but would say only
+            // "reload", hiding that the lane is over. Under the thread gate for
+            // the same reason the scope check is: comparing outside it makes
+            // the comparison a TOCTOU read against a concurrent re-proposal.
+            let current_card = current_gate_card_token(db, direction_id).await.map_err(e)?;
+            if policy_revision != current_card {
+                return Err("gate_policy_changed".to_string());
             }
             Some(held)
         }
@@ -5681,7 +5767,9 @@ mod tests {
             "the protected base branch must raise a Gate, got {gated:?}"
         );
 
-        let revision = current_gate_policy_revision(&db, dir.id).await.unwrap();
+        // The CARD's token, which is what resolution compares — see
+        // `gate_card_token`. The policy revision alone no longer identifies it.
+        let revision = current_gate_card_token(&db, dir.id).await.unwrap();
         let resolved = resolve_lane_gate_impl(&db, dir.id, &revision, "denied", Some("no"))
             .await
             .unwrap();
@@ -5932,6 +6020,97 @@ mod tests {
     /// `offers_decision`, the resolver rejected `OutOfScope` by name and let
     /// everything else through, so approving the stale card recorded an override
     /// `materialize_direction` honors — a fresh checkout for finished work.
+    /// A card authorizes ONE thing. If the lane's effective base moves under an
+    /// open card, the click no longer means what the card said.
+    ///
+    /// The concrete route: a BLANK-base lane (one that has not materialized, so
+    /// nothing has pinned its base yet) shows the allowed `stranded_lane`
+    /// recovery card, and the repository's default branch is then repointed at
+    /// a PROTECTED branch. The lane is now `AwaitingGate` — but both states
+    /// satisfy `offers_decision`, and a repository's default branch moving does
+    /// not touch the policy revision, so the revision check passed and the
+    /// recovery click was recorded as a gate approval. That override is honored
+    /// ahead of the protected-branch rule, so the lane would materialize from a
+    /// branch the card never named.
+    #[tokio::test]
+    async fn a_gate_card_is_refused_once_its_effective_base_moves() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-gate-base-move-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r =
+            repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+                .await
+                .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        // A REAL branch, because the recorded `base_ref` is only trusted when it
+        // resolves — otherwise the fallback walks back to main/master and the
+        // effective base never moves.
+        let branched = std::process::Command::new("git")
+            .args(["branch", "release"])
+            .current_dir(&repo_path)
+            .status()
+            .unwrap();
+        assert!(branched.success(), "fixture needs a second branch");
+
+        // Protect a branch the repo does NOT currently default to, so the lane
+        // starts allowed and its card is the recovery one.
+        let rules = crate::authority::PolicyRules {
+            protected_branches: vec!["release".to_string()],
+            ..Default::default()
+        };
+        let rules_json = serde_json::to_string(&rules).unwrap();
+        repo::create_authority_policy(&db, "workspace", ws.id, &rules_json, "user")
+            .await
+            .unwrap();
+
+        // Blank base and never materialized: the base is still whatever the
+        // repository defaults to, which is what makes it movable.
+        let dir = repo::create_direction(&db, t.id, "lane", "claude", r.id, "why", "plan+impl", "")
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::lane_state::lane_authority_state(&db, dir.id).await.unwrap().label(),
+            "needs_materialize",
+            "the lane starts allowed, so its card is the recovery one"
+        );
+        let card = current_gate_card_token(&db, dir.id).await.unwrap();
+
+        // The repository default is repointed at the PROTECTED branch. No
+        // policy revision moves; the lane's own row is untouched.
+        let before = current_gate_policy_revision(&db, dir.id).await.unwrap();
+        repo::set_repo_base_ref(&db, r.id, "release").await.unwrap();
+        let after = current_gate_policy_revision(&db, dir.id).await.unwrap();
+        assert_eq!(before, after, "the premise: the policy revision does not move");
+        assert_eq!(
+            crate::lane_state::lane_authority_state(&db, dir.id).await.unwrap().label(),
+            "awaiting_gate",
+            "and the lane is now gated on a base the card never showed"
+        );
+
+        let refused = resolve_lane_gate_impl(&db, dir.id, &card, "approved", None).await;
+        assert_eq!(
+            refused.err().as_deref(),
+            Some("gate_policy_changed"),
+            "a card whose base moved must not be resolvable"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     #[tokio::test]
     async fn a_gate_card_left_open_on_a_terminal_lane_cannot_be_resolved() {
         use crate::store::repo;
@@ -5974,7 +6153,7 @@ mod tests {
                     .await
                     .unwrap();
             crate::materialize::materialize_direction(&db, dir.id).await.unwrap();
-            let revision = current_gate_policy_revision(&db, dir.id).await.unwrap();
+            let revision = current_gate_card_token(&db, dir.id).await.unwrap();
             assert_eq!(
                 list_lane_gates_impl(&db, t.id)
                     .await

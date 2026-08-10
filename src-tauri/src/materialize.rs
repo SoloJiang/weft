@@ -166,7 +166,12 @@ async fn bootstrap_worktree_deps(path: &str) {
 /// blank instead would make `protected_branches: ["main"]` miss every lane that
 /// took the default — i.e. nearly all of them — and only start matching after
 /// materialize writes the resolved name back into the row, one write too late.
-fn effective_base_branch(repo_ref: &entities::repo_ref::Model, dir: &entities::direction::Model) -> String {
+/// `pub(crate)` so the Gate card can bind itself to the SAME base adjudication
+/// resolves, rather than to the raw (possibly blank) column.
+pub(crate) fn effective_base_branch(
+    repo_ref: &entities::repo_ref::Model,
+    dir: &entities::direction::Model,
+) -> String {
     let explicit = dir.base_branch.trim();
     if !explicit.is_empty() {
         return explicit.to_string();
