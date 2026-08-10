@@ -3422,8 +3422,23 @@ async fn lane_is_runnable(db: &Db, direction_id: i32) -> anyhow::Result<bool> {
     if !allowed {
         return Ok(false);
     }
+    // Each producer must be BOTH materialized and currently allowed. A checkout
+    // alone is not enough: one policy tighten can gate several producers at
+    // once, and they keep their valid worktrees while paused — approving one of
+    // them would otherwise release a shared dependent while the other's Gate is
+    // still pending and its own worker still stopped.
     for upstream in crate::store::repo::upstream_direction_ids(db, direction_id).await? {
         if !crate::materialize::lane_has_valid_checkout(db, upstream).await? {
+            return Ok(false);
+        }
+        let upstream_verdict = crate::materialize::readjudicate_lane(db, upstream).await?;
+        let upstream_allowed = match upstream_verdict {
+            None => true,
+            Some(verdict) => {
+                matches!(verdict.decision, crate::authority::LaneDecision::AllowedByPolicy)
+            }
+        };
+        if !upstream_allowed {
             return Ok(false);
         }
     }

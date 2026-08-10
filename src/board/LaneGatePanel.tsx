@@ -63,7 +63,12 @@ type GateFetchState = "idle" | "loading" | "resolved" | "rejected";
 export function LaneGatePanel({ threadId }: { threadId: number | null }) {
   const { t } = useTranslation();
   const { dispatchDirection, directionsByThread, proposal } = useStore();
-  const [gates, setGates] = useState<LaneGate[]>([]);
+  // Rows are stored WITH the thread they were fetched for. Keeping a bare array
+  // left the previous thread's rows on screen for the whole duration of the new
+  // thread's fetch — actionable approve/deny buttons that resolve the OLD lane,
+  // since the command keys off the row's own direction id. Pairing them makes
+  // that window unrepresentable rather than merely short.
+  const [gates, setGates] = useState<{ threadId: number; rows: LaneGate[] } | null>(null);
   const [fetchState, setFetchState] = useState<GateFetchState>("idle");
   const [actionState, setActionState] = useState<Record<number, GateActionState>>({});
   // Bumped on every reload so a slow earlier response can never overwrite a
@@ -74,7 +79,7 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
 
   const reload = useCallback(() => {
     if (threadId == null) {
-      setGates([]);
+      setGates(null);
       setFetchState("idle");
       return;
     }
@@ -85,7 +90,7 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
       .listLaneGates(threadId)
       .then((rows) => {
         if (seq !== requestSeq.current) return;
-        setGates(rows);
+        setGates({ threadId, rows });
         setFetchState("resolved");
       })
       .catch(() => {
@@ -154,17 +159,19 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
       </div>
     );
   }
-  if (gates.length === 0) return null;
+  // Anything fetched for another thread is not this board's state.
+  const rows = gates?.threadId === threadId ? gates.rows : [];
+  if (rows.length === 0) return null;
 
   return (
     <div className="flex flex-col gap-2 rounded-[var(--radius-lg)] border border-waiting/35 bg-waiting/10 px-4 py-3">
       <div className="flex items-center gap-1.5 text-[11px] font-semibold text-waiting">
         <AlertTriangle size={13} />
-        {t("scope.gate.title", { count: gates.length })}
+        {t("scope.gate.title", { count: rows.length })}
       </div>
       <div className="text-[10.5px] leading-snug text-ink-faint">{t("scope.gate.hint")}</div>
       <div className="flex flex-col gap-2">
-        {gates.map((gate) => (
+        {rows.map((gate) => (
           <LaneGateRow
             key={gate.direction_id}
             gate={gate}

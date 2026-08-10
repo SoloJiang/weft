@@ -246,10 +246,16 @@ async fn authorize_materialize(
     )
     .await
     {
-        eprintln!(
-            "[weft][evidence] materialize decision evidence for direction {}: {error}",
+        // NOT best-effort. This row IS the Gate: `list_lane_gates` discovers
+        // pending Gates from the decision evidence and nowhere else, so logging
+        // and continuing would return `Gated`, have confirm keep the direction
+        // and drop it from dispatch, and leave a lane paused with no card ever
+        // rendered for it. Failing the whole materialization is recoverable —
+        // the user retries confirm; a silently un-appealable lane is not.
+        return Err(anyhow::anyhow!(
+            "could not record the authority decision for task {}: {error}",
             dir.id
-        );
+        ));
     }
     Ok(verdict)
 }
