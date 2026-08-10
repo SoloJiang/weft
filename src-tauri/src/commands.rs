@@ -6008,6 +6008,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&weft_home);
     }
 
+    /// Verdicts produced under a REVOKED policy must not read as superseded.
+    ///
+    /// Adjudication keeps the revoked row's revision, so readiness has to
+    /// resolve the revision the same way. Reading the active row and falling
+    /// back to `"0"` classified every fresh verdict as stale: the lane's own
+    /// decision was discarded and it reported an unresolved Gate forever, while
+    /// the Gate panel — which resolves the revision correctly — showed a card
+    /// that matched. The two must agree.
+    #[tokio::test]
+    async fn readiness_reads_verdicts_written_under_a_revoked_policy() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-revoked-readiness-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r =
+            repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+                .await
+                .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "why", "plan+impl", "")
+            .await
+            .unwrap();
+
+        // Configure a policy, then revoke it. The scope now adjudicates at the
+        // revoked row's revision, not at "0".
+        let rules_json = serde_json::to_string(&crate::authority::PolicyRules::default()).unwrap();
+        let created =
+            repo::create_authority_policy(&db, "workspace", ws.id, &rules_json, "user")
+                .await
+                .unwrap();
+        repo::revoke_authority_policy(&db, "workspace", ws.id).await.unwrap();
+
+        let scope = crate::authority::PolicyScope::Workspace(ws.id);
+        let resolved = repo::resolve_policy_snapshot(&db, scope).await.unwrap();
+        assert_eq!(
+            resolved.revision, created.revision,
+            "a revoked scope keeps the revoked revision, not the default's \"0\""
+        );
+
+        // A fresh verdict under that policy, written the way materialize writes it.
+        crate::materialize::readjudicate_lane(&db, dir.id).await.unwrap();
+        let (decisions, superseded) = repo::latest_lane_decisions(&db, t.id).await.unwrap();
+        assert!(
+            decisions.contains_key(&dir.id),
+            "readiness must see the verdict adjudication just wrote, got {decisions:?}"
+        );
+        assert!(
+            !superseded.contains(&dir.id),
+            "a verdict at the revision in force is not superseded"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     #[test]
     fn waiting_dingtalk_bridge_retries_after_copy_was_already_initialized() {
         assert!(dingtalk_copy_should_start_bridge(

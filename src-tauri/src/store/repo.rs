@@ -9188,18 +9188,28 @@ pub async fn latest_lane_decisions(
     // `None` means the workspace or its policy could not be read at all, which
     // carries no revision to compare: filtering on that would silently blank
     // every lane, so the rows are taken as-is.
-    // A REVOKED (or never-configured) policy is not "no revision to compare" —
-    // the hard-coded conservative default is revision "0", which is exactly what
-    // adjudication stamps on verdicts it produces. Conflating that with an
-    // unreadable workspace would keep feeding readiness evidence from the
-    // revoked revision, so an old allow stays green or an old Gate stays
-    // blocking. Only a thread we cannot read at all yields `None`.
+    // Resolved through `resolve_policy_snapshot`, the SAME path adjudication
+    // uses, so the revision compared here is the revision verdicts are stamped
+    // with. Reading the active row and falling back to `"0"` was right only
+    // while a revoked scope meant the hard-coded default; now that it keeps the
+    // revoked row's own revision, that fallback classified every fresh verdict
+    // under a revoked policy as superseded — an approved and running lane kept
+    // reporting `NeedsYou`/`PolicyGatePending`, and a denied lane reported the
+    // same unresolved state while the Gate panel correctly offered no card.
+    //
+    // A never-configured scope still resolves to `"0"`, unchanged.
+    //
+    // `None` means the thread — and so the scope to resolve — could not be read
+    // at all, which carries no revision to compare: filtering on that would
+    // silently blank every lane, so the rows are taken as-is.
     let active_revision = match get_thread(db, thread_id).await? {
         Some(thread) => Some(
-            get_active_authority_policy(db, "workspace", thread.workspace_id)
-                .await?
-                .map(|row| row.revision)
-                .unwrap_or_else(|| "0".to_string()),
+            resolve_policy_snapshot(
+                db,
+                crate::authority::PolicyScope::Workspace(thread.workspace_id),
+            )
+            .await?
+            .revision,
         ),
         None => None,
     };

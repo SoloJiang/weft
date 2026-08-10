@@ -1772,6 +1772,43 @@ impl GitSignatureProbe {
     }
 }
 
+#[cfg(test)]
+impl GitSignatureProbe {
+    /// `readiness()` with a PRIVATE concurrency limit, for tests that drive the
+    /// real `git`.
+    ///
+    /// NOT about the probe's time budget. Queue time no longer costs a probe its
+    /// execution budget (see `GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT`), and that
+    /// fix — not this one — is what made the `tests/readiness.rs` binary stop
+    /// flaking, from a named failure every run to 49/49.
+    ///
+    /// What remains is a residual, load-dependent flake in the LIB binary, where
+    /// these probes spawn real `git` children alongside ~2200 concurrent tests —
+    /// including tests that exercise `proc_registry`'s reaper directly. The
+    /// observed failure is a probe child exiting ON A SIGNAL (`code -1`, empty
+    /// stderr) rather than on any deadline; `.ok()` turns that into `None`, and
+    /// `verification_targets_for_direction` then reports no targets at all,
+    /// which surfaces as an empty `repo_checks`.
+    ///
+    /// A private one-permit gate narrows the window in which one of these probes
+    /// is in flight. Be honest about how much that buys: the flake is
+    /// intermittent in both configurations, and this has NOT been shown to
+    /// eliminate it — the residual coupling is the process reaper, which no
+    /// semaphore can fence. It is kept because it can only reduce overlap and
+    /// because removing it coincided with a macOS CI failure. The real fix is to
+    /// stop letting "the probe did not answer" be indistinguishable from "the
+    /// worktree changed" at the consumer, which is a wider change than the issue
+    /// this shim sits under.
+    fn isolated_readiness() -> Self {
+        Self {
+            program: PathBuf::from("git"),
+            timeout: GIT_SIGNATURE_PROBE_TIMEOUT,
+            admission_timeout: GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT,
+            limit: Some(Arc::new(Semaphore::new(1))),
+        }
+    }
+}
+
 fn git_probe_limit() -> &'static Arc<Semaphore> {
     static LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
     LIMIT.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_GIT_PROBES)))
@@ -4030,7 +4067,7 @@ mod tests {
         let error = verification_targets_for_direction(
             &db,
             direction.id,
-            &GitSignatureProbe::readiness(),
+            &GitSignatureProbe::isolated_readiness(),
             VerificationTargetPurpose::ReadinessCollection,
         )
         .await
@@ -4081,7 +4118,7 @@ mod tests {
             let error = verification_targets_for_direction(
                 &db,
                 direction.id,
-                &GitSignatureProbe::readiness(),
+                &GitSignatureProbe::isolated_readiness(),
                 VerificationTargetPurpose::ReadinessCollection,
             )
             .await
@@ -4178,7 +4215,7 @@ mod tests {
             "an idle worker does not occupy the verification target"
         );
 
-        let probe = GitSignatureProbe::readiness();
+        let probe = GitSignatureProbe::isolated_readiness();
         for active_status in ["starting", "running", "stopped"] {
             repo::set_session_status(&db, worker.id, active_status)
                 .await
@@ -4412,7 +4449,7 @@ mod tests {
             &open_asks,
             open_pr_snapshot_freshness(1_000, 60),
             CheckExecution::RunAllowed,
-            &GitSignatureProbe::readiness(),
+            &GitSignatureProbe::isolated_readiness(),
         )
         .await
         .expect("worker failure must preempt lane collection");
@@ -4544,7 +4581,7 @@ mod tests {
     }
 
     async fn sampled_check_target(path: &Path, stored_path: String) -> CheckTarget {
-        let signature = GitSignatureProbe::readiness()
+        let signature = GitSignatureProbe::isolated_readiness()
             .sample(path)
             .await
             .expect("sample test worktree signature");
@@ -5638,7 +5675,7 @@ mod tests {
         let stored_path = root.path().display().to_string();
         let pre_targets = vec![sampled_check_target(root.path(), stored_path).await];
         let changed_path = root.path().join("README.md");
-        let probe = GitSignatureProbe::readiness();
+        let probe = GitSignatureProbe::isolated_readiness();
         let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
 
         let evidence = checks_for_targets_with_runner_and_post_targets(
@@ -5684,7 +5721,7 @@ mod tests {
         let pre_head = pre_targets[0].head_sha.clone();
         let pre_branch = pre_targets[0].branch.clone();
         let switched_path = root.path().to_path_buf();
-        let probe = GitSignatureProbe::readiness();
+        let probe = GitSignatureProbe::isolated_readiness();
         let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
 
         let evidence = checks_for_targets_with_runner_and_post_targets(
@@ -5701,7 +5738,7 @@ mod tests {
         .await
         .expect("same-HEAD branch-switch result");
 
-        let after = GitSignatureProbe::readiness()
+        let after = GitSignatureProbe::isolated_readiness()
             .sample(root.path())
             .await
             .expect("sample switched branch");
