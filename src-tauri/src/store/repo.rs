@@ -2542,6 +2542,23 @@ pub async fn get_gate_decision(
     direction_id: i32,
     policy_revision: &str,
 ) -> Result<Option<lane_gate_decision::Model>> {
+    // A standing human DENIAL is checked first and WITHOUT the revision filter.
+    // Revision-keying makes an APPROVAL expire when the policy changes, which is
+    // the fail-closed half of the design — but applying it to a denial is
+    // fail-OPEN: revoking the policy (or minting any new revision) drops the
+    // veto, `adjudicate_lane` then sees no override, and a lane a human
+    // explicitly refused materializes on the next retry. A veto is a statement
+    // about the LANE, not about one revision's rules, so it outlives them; the
+    // only way to undo it is to delete the lane.
+    let denial = lane_gate_decision::Entity::find()
+        .filter(lane_gate_decision::Column::DirectionId.eq(direction_id))
+        .filter(lane_gate_decision::Column::Decision.eq("denied"))
+        .order_by_desc(lane_gate_decision::Column::Id)
+        .one(&db.0)
+        .await?;
+    if denial.is_some() {
+        return Ok(denial);
+    }
     Ok(lane_gate_decision::Entity::find()
         .filter(lane_gate_decision::Column::DirectionId.eq(direction_id))
         .filter(lane_gate_decision::Column::PolicyRevision.eq(policy_revision))
@@ -18137,6 +18154,55 @@ mod tests {
         assert!(
             err.to_string().contains("approved") || err.to_string().contains("denied"),
             "an unrecognized decision value must be rejected outright: {err}"
+        );
+    }
+
+    /// Expiring an APPROVAL when the policy changes is fail-closed. Expiring a
+    /// DENIAL the same way is fail-open: revoking the policy would drop a human's
+    /// veto and let the refused lane materialize on the next retry.
+    #[tokio::test]
+    async fn a_human_denial_outlives_every_later_policy_revision() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "svc", "/tmp/svc-veto", "main", "", true).await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "issue", "claude").await.unwrap();
+        let dir = create_direction(&db, t.id, "x", "claude", r.id, "because", "plan+impl", "")
+            .await
+            .unwrap();
+
+        record_gate_decision(&db, dir.id, "1", "denied", "not this branch").await.unwrap();
+
+        for revision in ["1", "2", "0"] {
+            let found = get_gate_decision(&db, dir.id, revision)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("the veto must still be found at revision {revision}"));
+            assert_eq!(found.decision, "denied");
+        }
+    }
+
+    /// The veto is per LANE, so it must not bleed onto a sibling lane that was
+    /// never refused — otherwise one denial would freeze the whole issue.
+    #[tokio::test]
+    async fn a_denial_on_one_lane_leaves_its_siblings_decidable() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "svc", "/tmp/svc-veto-sib", "main", "", true).await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "issue", "claude").await.unwrap();
+        let refused = create_direction(&db, t.id, "a", "claude", r.id, "because", "plan+impl", "")
+            .await
+            .unwrap();
+        let sibling = create_direction(&db, t.id, "b", "claude", r.id, "because", "plan+impl", "")
+            .await
+            .unwrap();
+
+        record_gate_decision(&db, refused.id, "1", "denied", "no").await.unwrap();
+
+        assert!(get_gate_decision(&db, sibling.id, "1").await.unwrap().is_none());
+        record_gate_decision(&db, sibling.id, "1", "approved", "yes").await.unwrap();
+        assert_eq!(
+            get_gate_decision(&db, sibling.id, "1").await.unwrap().unwrap().decision,
+            "approved"
         );
     }
 
