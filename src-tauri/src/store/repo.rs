@@ -9112,12 +9112,26 @@ pub async fn latest_lane_decisions(db: &Db, thread_id: i32) -> Result<HashMap<i3
         .all(&db.0)
         .await?;
     let mut out: HashMap<i32, String> = HashMap::new();
+    // Lanes whose newest decision was rejected above. Tracked separately from
+    // `out` so an older row cannot answer for them.
+    let mut seen_without_verdict: std::collections::HashSet<i32> = std::collections::HashSet::new();
     for row in rows {
-        if row.direction_id == 0 || out.contains_key(&row.direction_id) {
+        if row.direction_id == 0
+            || out.contains_key(&row.direction_id)
+            || seen_without_verdict.contains(&row.direction_id)
+        {
             continue;
         }
         if let Some(active) = active_revision.as_deref() {
             if !row.policy_revision.is_empty() && row.policy_revision != active {
+                // The NEWEST decision for this lane was computed under a
+                // superseded revision, so the lane is undecided under the
+                // policy now in force. Mark it settled rather than continuing:
+                // scanning further would walk back to an even OLDER row — a
+                // pre-policy revision-"0" verdict, say, after the configured
+                // policy was revoked — and resurrect a stale allow or Gate that
+                // nothing has re-adjudicated.
+                seen_without_verdict.insert(row.direction_id);
                 continue;
             }
         }

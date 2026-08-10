@@ -3391,8 +3391,18 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
         // every finished task. Offering it a resume card would invite starting
         // a second worker in a worktree whose work is already done.
         let finished = dir.status == "done";
-        let stranded =
-            !finished && verdict == "allowed_by_policy" && (!checkout_ok || never_started);
+        // A lane whose producer is DENIED is blocked, not recoverable. Denying
+        // A leaves its dependent B allowed and unstarted, which otherwise reads
+        // as stranded — but B's resume card can never dispatch, because
+        // `lane_is_runnable` correctly refuses while A stands denied, and the
+        // reload after each attempt rebuilds the same card. Offering an action
+        // that provably cannot succeed is worse than showing nothing; B's real
+        // blocker is A's denial, which has its own record.
+        let upstream_blocked = upstream_blocks_lane(&db, thread_id, dir.id).await.map_err(e)?;
+        let stranded = !finished
+            && !upstream_blocked
+            && verdict == "allowed_by_policy"
+            && (!checkout_ok || never_started);
         if verdict != "needs_gate" && !stranded {
             continue;
         }
@@ -3518,6 +3528,25 @@ pub async fn resolve_lane_gate(
         }
         crate::materialize::MaterializeOutcome::Gated(_) => Err("gate_still_pending".to_string()),
     }
+}
+
+/// Whether any producer this lane declared is itself refused — denied, or
+/// still waiting on a Gate. Such a lane cannot be started by any action the
+/// user could take on it, so it must not be offered one.
+async fn upstream_blocks_lane(db: &Db, thread_id: i32, direction_id: i32) -> anyhow::Result<bool> {
+    for upstream in crate::store::repo::upstream_direction_ids(db, direction_id).await? {
+        let Some(row) =
+            crate::store::repo::latest_decision_evidence(db, thread_id, upstream).await?
+        else {
+            continue;
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&row.payload).unwrap_or_default();
+        let verdict = parsed.get("decision").and_then(|v| v.as_str()).unwrap_or("");
+        if matches!(verdict, "denied" | "needs_gate") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether one lane can run now: the CURRENT policy still allows it, its own

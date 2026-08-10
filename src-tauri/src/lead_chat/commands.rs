@@ -1568,6 +1568,22 @@ pub(crate) async fn chat_open_worker_impl(
     if !cwd.exists() {
         anyhow::bail!("worktree directory no longer exists for that direction+repo");
     }
+    // Issue #172: the policy must hold at ADMISSION, not merely when something
+    // decided to dispatch. `resolve_lane_gate` hands the frontend a plain list
+    // of direction ids and a tighten can land before the click arrives, so an
+    // id that was releasable a moment ago is not proof of anything now. This is
+    // the chokepoint every driver funnels through (card, revive, redispatch,
+    // review), so checking here covers them all. Read-only — `judge_lane`
+    // records nothing, because a refused start is not a new decision about the
+    // lane, and a board redispatching workers would otherwise bury the ledger.
+    if let Some(verdict) = crate::materialize::judge_lane(db, direction_id).await? {
+        if !matches!(
+            verdict.decision,
+            crate::authority::LaneDecision::AllowedByPolicy
+        ) {
+            anyhow::bail!("the workspace policy no longer allows starting this task");
+        }
+    }
 
     // A planner's final manual pin and a worker's first engine registration
     // own the same initial route. Hold this through the first start/send so a

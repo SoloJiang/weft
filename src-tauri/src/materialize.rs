@@ -176,7 +176,47 @@ fn effective_base_branch(repo_ref: &entities::repo_ref::Model, dir: &entities::d
         .unwrap_or_else(|| git::recorded_base_or_default(repo_path, &repo_ref.base_ref, repo_ref.base_ref_is_default))
 }
 
+/// Judge a lane at the CURRENT policy without recording anything.
+///
+/// `authorize_materialize` is this plus the evidence write. Admission-time
+/// checks — a worker about to start — need the verdict but must not append a
+/// decision row per attempt: a board redispatching workers would bury the
+/// ledger in rows that record no new decision.
+pub async fn judge_lane(db: &Db, direction_id: i32) -> Result<Option<authority::LaneVerdict>> {
+    use sea_orm::EntityTrait;
+    let dir = entities::direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+        .context("task not found")?;
+    let thread = entities::thread::Entity::find_by_id(dir.thread_id)
+        .one(&db.0)
+        .await?
+        .context("thread not found")?;
+    let Some(repo_ref) = repo::direction_repo_of(db, direction_id).await? else {
+        return Ok(None);
+    };
+    let base = effective_base_branch(&repo_ref, &dir);
+    Ok(Some(
+        judge_materialize(db, &dir, &repo_ref, thread.workspace_id, &base).await?,
+    ))
+}
+
 async fn authorize_materialize(
+    db: &Db,
+    dir: &entities::direction::Model,
+    repo_ref: &entities::repo_ref::Model,
+    thread_workspace_id: i32,
+    effective_base: &str,
+) -> Result<authority::LaneVerdict> {
+    let verdict =
+        judge_materialize(db, dir, repo_ref, thread_workspace_id, effective_base).await?;
+    record_lane_decision(db, dir, &verdict).await?;
+    Ok(verdict)
+}
+
+/// The pure half of [`authorize_materialize`]: assemble the candidate and ask
+/// `authority::adjudicate_lane`. No writes.
+async fn judge_materialize(
     db: &Db,
     dir: &entities::direction::Model,
     repo_ref: &entities::repo_ref::Model,
@@ -213,6 +253,17 @@ async fn authorize_materialize(
         gate_override,
     };
     let verdict = authority::adjudicate_lane(&policy, &scope_revision, &lane);
+    Ok(verdict)
+}
+
+/// Append one lane verdict to the evidence ledger. Split out of
+/// [`authorize_materialize`] so a read-only consultation (`judge_lane`) can
+/// reuse the judgment without recording a decision that nothing acted on.
+async fn record_lane_decision(
+    db: &Db,
+    dir: &entities::direction::Model,
+    verdict: &authority::LaneVerdict,
+) -> Result<()> {
     let summary = format!("lane decision: {:?} ({:?})", verdict.decision, verdict.reason);
     // `hit_rule` is operator-configured text (a repo or branch pattern) copied
     // verbatim into a durable, backed-up ledger. `append_evidence` deliberately
@@ -245,7 +296,7 @@ async fn authorize_materialize(
             kind: repo::EVIDENCE_KIND_DECISION,
             source: "authority",
             source_ref: &format!("materialize_direction:{}", dir.id),
-            revision: &scope_revision,
+            revision: &verdict.scope_revision,
             policy_revision: &verdict.policy_revision,
             summary: &summary,
             payload: &payload,
@@ -265,7 +316,7 @@ async fn authorize_materialize(
             dir.id
         ));
     }
-    Ok(verdict)
+    Ok(())
 }
 
 /// The lock that makes a policy change and a lane's authorize-then-write
@@ -585,6 +636,12 @@ pub async fn materialize_direction(db: &Db, direction_id: i32) -> Result<Materia
                 return Ok(MaterializeOutcome::Ready(vec![updated]));
             }
         }
+        // The unchanged-metadata exit — the common case when the row already
+        // records a Weft-owned checkout — has to release too. Holding the
+        // workspace lock through a `pnpm install` would park every policy edit
+        // and every other lane in the workspace behind a dependency download,
+        // which is exactly the phase `workspace_write_lock` documents excluding.
+        drop(workspace_write_guard);
         bootstrap_worktree_deps(&existing.path).await;
         return Ok(MaterializeOutcome::Ready(vec![existing]));
     }
