@@ -1861,6 +1861,11 @@ pub struct AskRegistry {
     /// SOME workspace's policy to an ask whose workspace is unknown is exactly
     /// the cross-workspace leak this map exists to prevent.
     thread_workspace: Arc<std::sync::RwLock<HashMap<i32, i32>>>,
+    /// Threads whose workspace lookup FAILED, as opposed to never having been
+    /// attempted. See `note_thread_workspace_unresolved`: absence cannot carry
+    /// that meaning, because it is also the state of every thread nobody has
+    /// asked about yet.
+    thread_workspace_unresolved: Arc<std::sync::RwLock<std::collections::HashSet<i32>>>,
     /// Serializes the durable-revoke command path (mutate → acked flush → rollback).
     /// Without it, two overlapping revokes of the same grant can race: the earlier
     /// one's rollback (on a failed write) re-seeds a grant a later, already-succeeded
@@ -2398,7 +2403,23 @@ impl AskRegistry {
     ///
     /// A committed absence (`tombstone`) is NOT indeterminate: the database says
     /// this scope has no active policy, which is a real answer.
+    ///
+    /// An UNREADABLE snapshot is. `snapshot_from_row` installs a row whose rules
+    /// JSON did not parse with empty rules and `rules_unreadable: true`, exactly
+    /// so nobody mistakes the emptiness for the user's configuration —
+    /// `adjudicate_lane` already fails closed on that flag. The bridge did not:
+    /// it saw a present snapshot with no matching rule, deferred, and let the
+    /// grants and allowlists below auto-approve an action the unreadable rules
+    /// may well have denied. Emptiness we cannot vouch for is an unknown.
     pub fn authority_is_indeterminate(&self, thread: i32) -> bool {
+        if self
+            .thread_workspace_unresolved
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&thread)
+        {
+            return true;
+        }
         let Some(workspace_id) = self
             .thread_workspace
             .read()
@@ -2412,7 +2433,13 @@ impl AskRegistry {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(&workspace_id)
-            .is_some_and(|entry| entry.snapshot.is_none() && !entry.tombstone)
+            .is_some_and(|entry| match &entry.snapshot {
+                // Suspended: emptied on purpose while a mutation or a failed
+                // read is in flight. A committed absence is a real answer.
+                None => !entry.tombstone,
+                // Present, but its rules could not be parsed — the same unknown.
+                Some(snapshot) => snapshot.rules_unreadable,
+            })
     }
 
     /// The cached AuthorityPolicy snapshot for one workspace, if any — exposed
@@ -2433,6 +2460,43 @@ impl AskRegistry {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(thread_id, workspace_id);
+        // A successful read clears any earlier failure: the policy is knowable
+        // again.
+        self.thread_workspace_unresolved
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&thread_id);
+    }
+
+    /// Record that this thread's workspace could NOT be read.
+    ///
+    /// The routes that map a thread do so with a fallible read, and a failure
+    /// used to leave the mapping simply absent — which the bridge reports as "no
+    /// opinion", falling through to the standing grants and allowlists that
+    /// auto-approve. A transient database error could therefore let an action
+    /// the workspace denies run without a human, on the ACP and Codex routes.
+    ///
+    /// Absence alone cannot be the signal: a thread nobody has mapped yet is
+    /// indistinguishable from one whose read failed, and treating every unmapped
+    /// thread as indeterminate would defer asks for installations that have no
+    /// policy at all. Recording the FAILURE is precise — it fails closed exactly
+    /// where the failure happened.
+    ///
+    /// A workspace already known from an earlier ask is kept: that mapping is
+    /// still true, and a later failed re-read does not unlearn it.
+    pub fn note_thread_workspace_unresolved(&self, thread_id: i32) {
+        if self
+            .thread_workspace
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&thread_id)
+        {
+            return;
+        }
+        self.thread_workspace_unresolved
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(thread_id);
     }
 
     /// The Permission Bridge's decisive half (issue #172): `Some(Allow)` /
@@ -6592,6 +6656,62 @@ mod tests {
         // through the standing grant exactly as before.
         assert_eq!(
             r.auto_decision(1, "10", RiskLevel::Unknown, "Run: ls"),
+            Some(Decision::Allow)
+        );
+    }
+
+    /// An unreadable policy is an unknown, not an empty rule set.
+    ///
+    /// `snapshot_from_row` installs a row whose rules JSON did not parse with
+    /// EMPTY rules and `rules_unreadable: true`, so the bridge saw a present
+    /// snapshot with no matching rule and deferred — straight into the grants
+    /// that auto-approve.
+    #[test]
+    fn an_unreadable_policy_defers_instead_of_reaching_an_auto_allow() {
+        let r = bridge_registry();
+        r.grant_read_only_issue(1);
+        assert_eq!(r.auto_decision(1, "10", RiskLevel::ReadOnly, "Run: ls"), Some(Decision::Allow));
+
+        let mut unreadable = bridge_test_policy(crate::authority::PolicyRules::default());
+        unreadable.rules_unreadable = true;
+        r.set_authority_snapshot(1, Some(unreadable));
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::ReadOnly, "Run: ls"),
+            None,
+            "rules we cannot parse must not be read as rules that permit"
+        );
+    }
+
+    /// A FAILED workspace lookup must fail closed; a thread nobody has mapped
+    /// yet must not, or every ask in an unconfigured installation would defer.
+    #[test]
+    fn a_failed_workspace_lookup_fails_closed_but_an_unmapped_thread_does_not() {
+        let r = AskRegistry::new();
+        r.grant_read_only_issue(7);
+        assert_eq!(
+            r.auto_decision(7, "10", RiskLevel::ReadOnly, "Run: ls"),
+            Some(Decision::Allow),
+            "never-mapped is the ordinary state and keeps the existing flow"
+        );
+
+        r.note_thread_workspace_unresolved(7);
+        assert_eq!(
+            r.auto_decision(7, "10", RiskLevel::ReadOnly, "Run: ls"),
+            None,
+            "a lookup that failed cannot be spent as 'no policy objects'"
+        );
+
+        // A later successful read clears it.
+        r.note_thread_workspace(7, 1);
+        assert_eq!(
+            r.auto_decision(7, "10", RiskLevel::ReadOnly, "Run: ls"),
+            Some(Decision::Allow)
+        );
+
+        // …and a failed re-read does not unlearn a workspace already known.
+        r.note_thread_workspace_unresolved(7);
+        assert_eq!(
+            r.auto_decision(7, "10", RiskLevel::ReadOnly, "Run: ls"),
             Some(Decision::Allow)
         );
     }

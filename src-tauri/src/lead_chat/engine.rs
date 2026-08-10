@@ -6741,8 +6741,13 @@ async fn acp_consumer(
                 let want = if let Some(asks) = asks {
                     // Issue #172: register this thread's workspace so the sync
                     // Permission Bridge resolves the right policy (unknown -> defer).
-                    if let Ok(Some(row)) = repo::get_thread(&db, thread_id).await {
-                        asks.note_thread_workspace(thread_id, row.workspace_id);
+                    // A failed read is RECORDED, not ignored: leaving the
+                    // mapping absent makes the bridge report "no opinion", and
+                    // the grants below would then auto-approve an action this
+                    // workspace's `deny_actions` covers.
+                    match repo::get_thread(&db, thread_id).await {
+                        Ok(Some(row)) => asks.note_thread_workspace(thread_id, row.workspace_id),
+                        Ok(None) | Err(_) => asks.note_thread_workspace_unresolved(thread_id),
                     }
                     match asks.auto_decision(thread_id, &dir, risk, &action_key) {
                         Some(crate::ask::Decision::Allow) => crate::acp::Want::AllowOnce,
@@ -7490,8 +7495,10 @@ async fn codex_consumer(
                 // reach auto_decision with no mapping, and the bridge would
                 // defer BOTH deny_actions and allow_actions to a human card —
                 // enforcing the policy inconsistently across engines.
-                if let Ok(Some(row)) = repo::get_thread(&db, thread_id).await {
-                    registry.note_thread_workspace(thread_id, row.workspace_id);
+                // A failed read is RECORDED, not ignored — see the ACP route.
+                match repo::get_thread(&db, thread_id).await {
+                    Ok(Some(row)) => registry.note_thread_workspace(thread_id, row.workspace_id),
+                    Ok(None) | Err(_) => registry.note_thread_workspace_unresolved(thread_id),
                 }
                 // `risk` gates issue #103's read-only batch/issue grants inside
                 // auto_decision; it never widens Full/Always, which ignore it.
