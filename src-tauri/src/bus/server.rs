@@ -174,8 +174,8 @@ async fn handle_ask(
         // human wait below must never block deletion or an answer path.
         let lifecycle_gate = bus.thread_lifecycle_gate(thread);
         let _lifecycle = lifecycle_gate.lock().await;
-        let identity = match admit_bus_identity(&db, thread, &dir, source_session_id).await {
-            Ok(identity) => identity,
+        let (workspace_id, identity) = match admit_bus_identity(&db, thread, &dir, source_session_id).await {
+            Ok(admitted) => admitted,
             Err(error) => {
                 return hook_decision(
                     "deny",
@@ -202,11 +202,16 @@ async fn handle_ask(
 
         // Issue #172: tell the SYNC Permission Bridge which workspace this ask
         // belongs to, so it consults THIS workspace's policy and never another's.
-        // A read failure simply leaves the mapping unset and the bridge defers to
-        // the human flow — the same conservative answer as having no policy.
-        if let Ok(Some(row)) = crate::store::repo::get_thread(&db, thread).await {
-            asks.note_thread_workspace(thread, row.workspace_id);
-        }
+        //
+        // Taken from ADMISSION, which already proved it under the lifecycle gate
+        // above, rather than re-read here. A second read could fail transiently,
+        // and "the mapping is simply unset" is not the conservative answer it
+        // looks like on THIS route: the bridge then returns `None`, the deny
+        // check below cannot fire, and the read-only builtin allowlist a few
+        // lines further down auto-approves Read/Grep/Glob — without a human —
+        // even when the workspace policy names them in `deny_actions`. Using the
+        // already-proven value removes the window rather than guarding it.
+        asks.note_thread_workspace(thread, workspace_id);
         // …and consult an explicit policy DENY before the convenience allowlist
         // below. `deny_actions` naming a safe builtin (Claude's Read/Grep/Glob)
         // would otherwise never be evaluated on this route: the builtin branch
@@ -723,13 +728,18 @@ async fn admit_bus_identity(
     thread_id: i32,
     direction_scope: &str,
     source_session_id: Option<&str>,
-) -> anyhow::Result<AdmittedBusIdentity> {
+) -> anyhow::Result<(i32, AdmittedBusIdentity)> {
     let thread = crate::store::repo::ensure_thread_workspace_accepts_writes(db, thread_id).await?;
+    // The workspace is PROVEN here, under the lifecycle gate, before anything
+    // is allowed. Returning it is what lets `handle_ask` register the Permission
+    // Bridge mapping without a second read — see that call site for why a second
+    // read was a fail-open.
+    let workspace_id = thread.workspace_id;
     if direction_scope == crate::bus::LEAD {
         if source_session_id.is_some() {
             anyhow::bail!("lead bus identity cannot carry a worker session");
         }
-        return Ok(AdmittedBusIdentity::Lead);
+        return Ok((workspace_id, AdmittedBusIdentity::Lead));
     }
 
     let direction_id = direction_scope
@@ -772,11 +782,14 @@ async fn admit_bus_identity(
         );
     }
 
-    Ok(AdmittedBusIdentity::Worker {
-        direction_id,
-        session_id,
-        repo_id: session.repo_id,
-    })
+    Ok((
+        workspace_id,
+        AdmittedBusIdentity::Worker {
+            direction_id,
+            session_id,
+            repo_id: session.repo_id,
+        },
+    ))
 }
 
 async fn initialize_bus_session(
@@ -856,11 +869,11 @@ async fn dispatch_bus_tool_call(
 ) -> Value {
     let lifecycle_gate = bus.thread_lifecycle_gate(thread_id);
     let _lifecycle = lifecycle_gate.lock().await;
-    let identity = match admit_bus_identity(db, thread_id, direction_scope, source_session_id).await
-    {
-        Ok(identity) => identity,
-        Err(error) => return text_result(format!("error: {error}")),
-    };
+    let identity =
+        match admit_bus_identity(db, thread_id, direction_scope, source_session_id).await {
+            Ok((_workspace_id, identity)) => identity,
+            Err(error) => return text_result(format!("error: {error}")),
+        };
 
     bus.join(thread_id, direction_scope);
     match name {
@@ -2114,6 +2127,63 @@ mod tests {
         assert_eq!(asks.read_only_grants(), crate::ask::ReadOnlyGrants::default());
         assert!(notify_rx.try_recv().is_err());
         assert!(persist_rx.try_recv().is_err());
+    }
+
+    /// A policy `deny_actions` entry must outrank the read-only builtin
+    /// allowlist on the hook route, and it can only do so if the Permission
+    /// Bridge knows which workspace this ask belongs to.
+    ///
+    /// That mapping used to come from a SECOND `get_thread` read, whose failure
+    /// was documented as "the bridge defers to the human flow". It does not, on
+    /// this route: an unmapped thread makes `authority_bridge_decision` return
+    /// `None`, the deny check cannot fire, and the allowlist a few lines later
+    /// auto-approves Read/Grep/Glob with no human at all. The workspace is now
+    /// taken from admission, which already proved it under the lifecycle gate,
+    /// so there is no read left to fail.
+    #[tokio::test]
+    async fn hook_route_denies_a_policy_denied_builtin_before_the_allowlist() {
+        let fixture = bus_identity_fixture().await;
+        let bus = crate::bus::BusRegistry::new();
+        let asks = crate::ask::AskRegistry::new();
+
+        // A policy that denies the very builtin the allowlist would wave through.
+        let rules = crate::authority::PolicyRules {
+            deny_actions: vec!["*".to_string()],
+            ..Default::default()
+        };
+        let rules_json = serde_json::to_string(&rules).unwrap();
+        let row = crate::store::repo::create_authority_policy(
+            &fixture.db,
+            "workspace",
+            fixture.workspace_id,
+            &rules_json,
+            "user",
+        )
+        .await
+        .unwrap();
+        asks.set_authority_snapshot(
+            fixture.workspace_id,
+            Some(crate::authority::snapshot_from_row(
+                row,
+                crate::authority::PolicyScope::Workspace(fixture.workspace_id),
+            )),
+        );
+
+        let (base, _handle) = serve(bus, fixture.db, asks.clone()).await.unwrap();
+        let denied = ask_decision_for_session(
+            &base,
+            fixture.thread_id,
+            crate::bus::LEAD,
+            None,
+            "claude",
+            "TodoWrite",
+            json!({ "todos": [] }),
+        )
+        .await;
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"], "deny",
+            "a read-only builtin the policy denies must not be auto-approved: {denied}"
+        );
     }
 
     #[tokio::test]
