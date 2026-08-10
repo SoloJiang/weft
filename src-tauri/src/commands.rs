@@ -3529,6 +3529,20 @@ async fn resolve_lane_gate_impl(
         let _ = crate::materialize::readjudicate_lane(db, direction_id).await;
         return Err("gate_policy_changed".to_string());
     }
+    // The lifecycle half of the same window. The thread gate above excludes plan
+    // mutations, but not a lane being marked done or deactivated, so the state
+    // checked before this write can be terminal by the time it lands — and the
+    // approval would then materialize a checkout for work that is over.
+    // `is_in_play` rather than `offers_decision`, because recording a decision
+    // deliberately changes what the lane offers (a denial makes it `Denied`,
+    // which offers nothing); only the half a human's own click cannot change is
+    // meaningful to re-read across the write.
+    let settled = crate::lane_state::lane_authority_state(db, direction_id).await.map_err(e)?;
+    if !settled.is_in_play() {
+        let _ = crate::store::repo::clear_gate_decisions(db, direction_id).await;
+        let _ = crate::materialize::readjudicate_lane(db, direction_id).await;
+        return Err(format!("gate_not_actionable:{}", settled.label()));
+    }
     // A DENIAL never enters materialize. Sending it through and relying on
     // adjudication to honor it is fail-open: a loosen landing between the
     // decision and the adjudication makes the override invisible, so the lane

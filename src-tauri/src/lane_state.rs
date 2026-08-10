@@ -100,6 +100,23 @@ impl LaneAuthorityState {
         )
     }
 
+    /// Whether this lane's LIFECYCLE and SCOPE still admit an authority
+    /// decision at all — as opposed to what that decision currently is.
+    ///
+    /// `offers_decision` cannot be re-used to re-validate after a decision is
+    /// recorded, because recording one deliberately changes the answer: a
+    /// denial moves the lane to `Denied`, which offers nothing. This is the
+    /// half that a human's own click must NOT change, so it is the half worth
+    /// re-reading across a write — a lane marked done, deactivated or dropped
+    /// from scope between the check and the write must not go on to
+    /// materialize.
+    pub fn is_in_play(&self) -> bool {
+        !matches!(
+            self,
+            Self::NotApplicable | Self::Finished | Self::Deactivated | Self::OutOfScope
+        )
+    }
+
     /// A stable, low-cardinality name for the arm. Errors and logs want to say
     /// WHICH refusal this was without printing a whole verdict struct (a
     /// `{:?}` of one carries rule text into places nobody reviewed it for).
@@ -371,6 +388,36 @@ mod tests {
                 assert!(state.offers_decision(), "{} must stay resolvable", state.label());
             }
         }
+    }
+
+    /// `is_in_play` is the half a human's own decision cannot change, which is
+    /// what makes it the right thing to re-read across the write that records
+    /// one. Every state that offers a decision is in play; the reverse does
+    /// not hold, and `Denied` is exactly why — recording a denial moves the
+    /// lane there, so re-validating with `offers_decision` would reject the
+    /// very write that had just succeeded.
+    #[test]
+    fn in_play_is_the_half_a_decision_cannot_change() {
+        assert_eq!(
+            labels_where(LaneAuthorityState::is_in_play),
+            vec![
+                "denied",
+                "awaiting_gate",
+                "blocked_upstream",
+                "needs_materialize",
+                "ready_to_start",
+                "running"
+            ]
+        );
+        for state in all_states() {
+            if state.offers_decision() {
+                assert!(state.is_in_play(), "{} offers a decision but is not in play", state.label());
+            }
+        }
+        assert!(
+            LaneAuthorityState::Denied(verdict(LaneDecision::Denied)).is_in_play(),
+            "a denial must not invalidate the write that produced it"
+        );
     }
 
     /// Labels reach error messages and logs, so two arms sharing one would make
