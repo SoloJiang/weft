@@ -3173,30 +3173,28 @@ pub async fn refresh_authority_bridge_snapshot(
     asks: &crate::ask::AskRegistry,
     workspace_id: i32,
 ) {
-    match crate::store::repo::get_active_authority_policy(db, "workspace", workspace_id).await {
-        Ok(Some(row)) => asks.set_authority_snapshot(
-            workspace_id,
-            Some(crate::authority::snapshot_from_row(
-                row,
-                crate::authority::PolicyScope::Workspace(workspace_id),
-            )),
-        ),
-        // A revoke has no ACTIVE row to take a revision from, but the revoked
-        // row still carries one — and the clear has to be ordered against
-        // concurrent installs just as an install is, or a slow revoke read can
-        // erase a policy that landed after it. `None` here means even that read
-        // failed, which applies unconditionally: fail closed when the policy
-        // cannot be determined.
-        Ok(None) => {
-            let observed = crate::store::repo::latest_authority_policy_revision(
-                db,
-                "workspace",
-                workspace_id,
-            )
-            .await
-            .ok()
-            .flatten();
-            asks.apply_authority_refresh(workspace_id, None, observed)
+    // Resolved through the SAME path adjudication uses, so the bridge and the
+    // Lane gate cannot disagree about what is in force.
+    //
+    // Reading the ACTIVE row alone is what let them diverge on a REVOKE. A
+    // revoked scope Gates every lane (`authority::revoked_policy`), but the
+    // bridge cleared its snapshot to a committed absence — a determinate "no
+    // policy" — so `auto_decision` fell through to the standing grants and an
+    // action the policy had denied a moment earlier was auto-allowed again by an
+    // old Full/Always. Revoking is supposed to be able only to tighten.
+    match crate::store::repo::resolve_policy_snapshot(
+        db,
+        crate::authority::PolicyScope::Workspace(workspace_id),
+    )
+    .await
+    {
+        // A never-configured scope resolves to the default at revision "0",
+        // which carries no rules and no `revoked_at` — the bridge keeps
+        // deferring exactly as it did before #172, which is what keeps the
+        // feature inert for an installation that has never set a policy.
+        Ok(snapshot) => {
+            let observed = snapshot.revision.parse::<i64>().ok();
+            asks.apply_authority_refresh(workspace_id, Some(snapshot), observed)
         }
         Err(error) => {
             // Fail CLOSED on a read error: drop whatever was cached so the

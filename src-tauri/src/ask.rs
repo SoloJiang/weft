@@ -2437,8 +2437,20 @@ impl AskRegistry {
                 // Suspended: emptied on purpose while a mutation or a failed
                 // read is in flight. A committed absence is a real answer.
                 None => !entry.tombstone,
-                // Present, but its rules could not be parsed — the same unknown.
-                Some(snapshot) => snapshot.rules_unreadable,
+                Some(snapshot) => {
+                    // Rules that could not be parsed are an unknown, not an
+                    // empty rule set — see this method's own doc.
+                    snapshot.rules_unreadable
+                        // A REVOKED scope is the CLI half of the same rule
+                        // `authority::revoked_policy` applies to lanes: revoking
+                        // may only tighten. Letting it read as a determinate "no
+                        // policy" restored the standing grants, so an action the
+                        // policy denied a moment earlier was auto-allowed again
+                        // by an old Full/Always — revocation LOOSENING, which is
+                        // exactly what it must never do. Lanes Gate; the CLI
+                        // defers to a human. Same answer, both surfaces.
+                        || !snapshot.revoked_at.is_empty()
+                }
             })
     }
 
@@ -2569,16 +2581,28 @@ impl AskRegistry {
         } else {
             ans
         };
-        // Issue #172, DELIBERATELY NOT ENFORCED HERE: a policy tightened while
-        // this card sat open does not bind the answer. Forcing Deny would also
-        // suppress an `Always`/`Full` grant (`granted` below keys off this
-        // value), which is precisely the semantics
-        // `bridge_never_overrides_an_exact_always_or_full_grant` codifies — a
-        // human's explicit standing grant is not something a later policy
-        // silently revokes. Whether that should change is the open product
-        // question tracked in the PR (policy deny vs. standing grants); when it
-        // is settled the answer belongs here AND in `auto_decision`, applied
-        // once, not decided route by route.
+        // A policy tightened while this card sat open DOES bind the answer.
+        //
+        // This was deliberately unenforced while "policy deny vs. standing
+        // grant" was open; that is settled in `auto_decision` — a deny is a
+        // constraint, and one any prior grant can override is not a constraint.
+        // The same reasoning reaches an answer given after the tighten: an Ask
+        // opened before it would otherwise let `Allow` execute the denied action
+        // outright, and `Always`/`Full` mint a standing grant for it — creating
+        // exactly the grant `auto_decision` now refuses to honour.
+        //
+        // Forcing Deny also suppresses the grant, because `granted` below keys
+        // off this value: neither arm matches `Answer::Deny`. That is the point,
+        // not a side effect.
+        //
+        // Only an explicit DENY binds. An indeterminate policy does not force
+        // one — a human is answering right now, so there is nothing to defer to,
+        // and refusing on an unknown would turn a transient read failure into a
+        // refusal of the user's own decision.
+        let ans = match self.authority_bridge_decision(ask.thread, &ask.action_key) {
+            Some(Decision::Deny) => Answer::Deny,
+            Some(Decision::Allow) | None => ans,
+        };
         let key = (ask.thread, ask.dir.clone());
         // Whether this answer added a NEW standing grant (HashSet::insert is true
         // only on first insertion). Drives a single persist write — an idempotent
@@ -6643,8 +6667,11 @@ mod tests {
         let mut rules = crate::authority::PolicyRules::default();
         rules.deny_actions = vec!["Run: git status".to_string()];
         r.set_authority_snapshot(1, Some(bridge_test_policy(rules)));
+        // Granted through an action the policy does NOT deny, so a real Full
+        // grant exists. (Answering the denied action itself is refused outright
+        // — see `answering_a_stale_card_cannot_mint_a_grant_the_policy_now_denies`.)
         r.answer(
-            r.request(1, "10", "bash", "s", "d", RiskLevel::Unknown, "Run: git status").0,
+            r.request(1, "10", "bash", "s", "d", RiskLevel::Unknown, "Run: ls").0,
             Answer::Full,
         );
         assert_eq!(
@@ -6714,6 +6741,58 @@ mod tests {
             r.auto_decision(7, "10", RiskLevel::ReadOnly, "Run: ls"),
             Some(Decision::Allow)
         );
+    }
+
+    /// Revoking may only tighten — for the CLI bridge as well as for lanes.
+    #[test]
+    fn revoking_a_denying_policy_does_not_restore_a_standing_grant() {
+        let r = bridge_registry();
+        let mut rules = crate::authority::PolicyRules::default();
+        rules.deny_actions = vec!["Run: git status".to_string()];
+        r.set_authority_snapshot(1, Some(bridge_test_policy(rules)));
+        r.answer(
+            r.request(1, "10", "bash", "s", "d", RiskLevel::Unknown, "Run: rm -rf x").0,
+            Answer::Full,
+        );
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::Unknown, "Run: git status"),
+            Some(Decision::Deny)
+        );
+
+        // Revoke it. The denied action must NOT come back auto-allowed by the
+        // grant that predates the policy.
+        let mut revoked = bridge_test_policy(crate::authority::PolicyRules::default());
+        revoked.revoked_at = "2026-01-01".to_string();
+        r.set_authority_snapshot(1, Some(revoked));
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::Unknown, "Run: git status"),
+            None,
+            "a revoked scope defers to a human rather than restoring an old grant"
+        );
+    }
+
+    /// An answer given AFTER a tighten is bound by it — including the grant it
+    /// would otherwise mint.
+    #[test]
+    fn answering_a_stale_card_cannot_mint_a_grant_the_policy_now_denies() {
+        let r = bridge_registry();
+        let (id, _rx) =
+            r.request(1, "10", "bash", "s", "d", RiskLevel::Unknown, "Run: git status");
+
+        // The tighten lands while the card is open.
+        let mut rules = crate::authority::PolicyRules::default();
+        rules.deny_actions = vec!["Run: git status".to_string()];
+        r.set_authority_snapshot(1, Some(bridge_test_policy(rules)));
+
+        assert!(r.answer(id, Answer::Full), "the card still resolves");
+        // No Full grant may exist for this task…
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::Unknown, "Run: git status"),
+            Some(Decision::Deny)
+        );
+        // …and the grant was never minted at all, so an UNRELATED action is not
+        // covered either.
+        assert_eq!(r.auto_decision(1, "10", RiskLevel::Unknown, "Run: ls"), None);
     }
 
     /// A policy being re-read must never be spent as "nothing objects".
