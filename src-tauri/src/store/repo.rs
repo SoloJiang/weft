@@ -2621,19 +2621,6 @@ pub async fn get_gate_decision(
 /// `denied`/`unresolved` edge already blocks its own consumer independently
 /// (see `direction_dependency`'s own doc), and re-blocking it here would be
 /// redundant, not additionally correct.
-/// Whether a lane has a checkout that actually exists on disk. A worktree ROW
-/// is not enough: the recreate path deliberately keeps a stale row for a
-/// checkout that was reclaimed or replaced out-of-band, and dispatching a
-/// worker into a directory that is gone fails.
-pub async fn direction_has_live_worktree(db: &Db, direction_id: i32) -> Result<bool> {
-    Ok(worktree::Entity::find()
-        .filter(worktree::Column::DirectionId.eq(direction_id))
-        .all(&db.0)
-        .await?
-        .iter()
-        .any(|w| std::path::Path::new(&w.path).exists()))
-}
-
 /// Every direction `direction_id` names as a RESOLVED upstream — the producers
 /// it must not start before. The mirror of [`downstream_direction_ids`], and
 /// used with it to decide whether clearing one Gate actually unblocks a
@@ -9199,38 +9186,6 @@ mod tests {
         assert_eq!(other.revision, a.revision);
     }
 
-    /// A worktree ROW whose directory is gone is not a live checkout — the
-    /// recreate path deliberately keeps that row, and dispatching a worker into
-    /// a missing directory fails.
-    #[tokio::test]
-    async fn live_worktree_probe_requires_the_directory_to_exist() {
-        let db = mem().await;
-        let dir = tempfile::tempdir().unwrap();
-        let present = dir.path().join("present");
-        std::fs::create_dir_all(&present).unwrap();
-
-        async fn row(db: &Db, direction_id: i32, path: &str) {
-            worktree::ActiveModel {
-                repo_id: Set(1),
-                direction_id: Set(direction_id),
-                branch: Set("b".to_string()),
-                path: Set(path.to_string()),
-                created_at: Set(now()),
-                ..Default::default()
-            }
-            .insert(&db.0)
-            .await
-            .unwrap();
-        }
-
-        assert!(!direction_has_live_worktree(&db, 1).await.unwrap());
-
-        row(&db, 1, present.to_string_lossy().as_ref()).await;
-        assert!(direction_has_live_worktree(&db, 1).await.unwrap());
-
-        row(&db, 2, dir.path().join("gone").to_string_lossy().as_ref()).await;
-        assert!(!direction_has_live_worktree(&db, 2).await.unwrap());
-    }
 
     use super::*;
     use crate::store::Db;

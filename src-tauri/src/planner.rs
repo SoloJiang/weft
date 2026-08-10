@@ -1414,7 +1414,22 @@ async fn confirm_with_manual_tool_with_session_liveness(
             &upstream_lanes_from_resolved(&resolved, &fastpath_proposal),
         )
         .await;
-        matching.retain(|id| !refused_fastpath.contains(id));
+        // Refusing only the lanes whose OWN materialization was refused leaves
+        // their dependents in the dispatch set. A second confirm of the same
+        // plan (two windows, a retry) takes this path with A already gated, so
+        // A drops out and B — which declared A as its producer — is still
+        // returned and started against a producer that has no worktree. Apply
+        // the same transitive filter the initial-confirm path applies.
+        let gated_idx: std::collections::HashSet<usize> = fastpath_proposal
+            .directions
+            .iter()
+            .enumerate()
+            .filter(|(_, pd)| refused_fastpath.contains(&pd.direction_id))
+            .map(|(idx, _)| idx)
+            .collect();
+        let blocked_by_gate =
+            gate_blocked_direction_ids(&resolved, &fastpath_proposal, &gated_idx);
+        matching.retain(|id| !refused_fastpath.contains(id) && !blocked_by_gate.contains(id));
         return Ok(matching);
     }
     let existing_dirs = repo::list_directions(db, thread_id).await?;

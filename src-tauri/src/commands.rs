@@ -3208,19 +3208,17 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
     let directions = crate::store::repo::list_directions(&db, thread_id).await.map_err(e)?;
     let mut out = Vec::new();
     for dir in directions {
-        // A worktree ROW is not a materialized lane: `materialize_direction`
-        // re-adjudicates (and can gate) a lane whose checkout was reclaimed or
-        // replaced out-of-band, and that path deliberately keeps the stale row.
-        // Testing `.is_some()` would hide the Gate raised for the recreation
-        // behind the very row the recreation exists to replace. Presence on
-        // disk is the same predicate the frontend's dispatch filter uses.
-        let live_worktree = crate::store::repo::worktree_for(&db, dir.id, dir.repo_id)
+        // Whether the lane has a checkout a worker could actually run in — the
+        // same predicate materialization uses, not a path-existence probe.
+        // NOT a reason to skip on its own: the reuse fast-path re-adjudicates
+        // and can gate a lane that already HAS a live checkout (a policy that
+        // tightened after confirm), and that lane needs a card more than any
+        // other — it is paused with no other way back. What the verdict says
+        // decides whether a card is shown; this only distinguishes a healthy
+        // lane from a stranded one.
+        let checkout_ok = crate::materialize::lane_has_valid_checkout(&db, dir.id)
             .await
-            .map_err(e)?
-            .is_some_and(|w| std::path::Path::new(&w.path).exists());
-        if live_worktree {
-            continue;
-        }
+            .map_err(e)?;
         let evidence = crate::store::repo::list_evidence(&db, thread_id, Some(dir.id), 20)
             .await
             .map_err(e)?;
@@ -3264,7 +3262,11 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
         // button behind it is the same resolve path, which materializes and
         // returns the lanes to dispatch. `denied` is settled and stays hidden.
         let verdict = parsed.get("decision").and_then(|v| v.as_str()).unwrap_or("");
-        let stranded = verdict == "allowed_by_policy";
+        // `needs_gate` is the ordinary card, shown whether or not a checkout
+        // exists. `allowed_by_policy` with NO usable checkout is the stranded
+        // case. Everything else — an allowed lane that materialized fine, or a
+        // settled denial — has nothing to decide.
+        let stranded = verdict == "allowed_by_policy" && !checkout_ok;
         if verdict != "needs_gate" && !stranded {
             continue;
         }
@@ -3405,7 +3407,7 @@ pub async fn resolve_lane_gate(
 /// The upstream half is what stops a join lane (two producers, one still gated)
 /// from being released by the wrong approval.
 async fn lane_is_runnable(db: &Db, direction_id: i32) -> anyhow::Result<bool> {
-    if !crate::store::repo::direction_has_live_worktree(db, direction_id).await? {
+    if !crate::materialize::lane_has_valid_checkout(db, direction_id).await? {
         return Ok(false);
     }
     let verdict = crate::materialize::readjudicate_lane(db, direction_id).await?;
@@ -3421,7 +3423,7 @@ async fn lane_is_runnable(db: &Db, direction_id: i32) -> anyhow::Result<bool> {
         return Ok(false);
     }
     for upstream in crate::store::repo::upstream_direction_ids(db, direction_id).await? {
-        if !crate::store::repo::direction_has_live_worktree(db, upstream).await? {
+        if !crate::materialize::lane_has_valid_checkout(db, upstream).await? {
             return Ok(false);
         }
     }

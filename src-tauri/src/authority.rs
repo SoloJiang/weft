@@ -278,6 +278,33 @@ fn matches_name(list: &[String], name: &str) -> bool {
     list.iter().any(|entry| entry.eq_ignore_ascii_case(name))
 }
 
+/// The bare branch name behind any spelling git accepts for it:
+/// `refs/remotes/origin/main`, `refs/heads/main`, `origin/main` and `main` all
+/// collapse to `main`.
+///
+/// Protection rules MUST compare on this. `add_worktree_synced` performs the
+/// same collapse before resolving a base, so a lane naming `origin/main`
+/// branches from exactly the ref a `protected_branches: ["main"]` rule means to
+/// gate — while an exact-string comparison sees two different names and lets it
+/// through. The rule side is normalized too, so configuring `refs/heads/main`
+/// protects `main` rather than nothing at all.
+fn bare_branch_name(name: &str) -> &str {
+    let name = name.trim();
+    if let Some(rest) = name.strip_prefix("refs/remotes/") {
+        return rest.strip_prefix("origin/").unwrap_or(rest);
+    }
+    if let Some(rest) = name.strip_prefix("refs/heads/") {
+        return rest;
+    }
+    name.strip_prefix("origin/").unwrap_or(name)
+}
+
+/// `matches_name` over branch spellings — both sides collapsed to the bare name.
+fn matches_branch(list: &[String], name: &str) -> bool {
+    let name = bare_branch_name(name);
+    list.iter().any(|entry| bare_branch_name(entry).eq_ignore_ascii_case(name))
+}
+
 /// A base/ref name is well-formed enough to branch off — a defensive
 /// syntactic check, NOT a git-protocol validator (git itself is the final
 /// authority at `git worktree add` time). Blank is always valid (repo
@@ -379,8 +406,8 @@ pub fn adjudicate_lane(
         None => {}
     }
 
-    let protected_hit =
-        !lane.base_branch.is_empty() && matches_name(&policy.rules.protected_branches, lane.base_branch);
+    let protected_hit = !lane.base_branch.is_empty()
+        && matches_branch(&policy.rules.protected_branches, lane.base_branch);
     if protected_hit {
         return build(
             LaneDecision::NeedsGate,
@@ -490,6 +517,33 @@ pub fn bridge_decision(policy: &PolicySnapshot, action: &PermissionAction<'_>) -
 
 #[cfg(test)]
 mod tests {
+
+    /// A protection rule must survive every spelling git accepts for the same
+    /// branch. `add_worktree_synced` collapses all of these to `main` before
+    /// resolving the base, so an exact-string comparison let a lane branch from
+    /// protected `main` by simply naming it `origin/main`.
+    #[test]
+    fn protected_branches_match_across_ref_spellings() {
+        for spelling in [
+            "main",
+            "origin/main",
+            "refs/heads/main",
+            "refs/remotes/origin/main",
+            "MAIN",
+        ] {
+            assert!(
+                matches_branch(&["main".to_string()], spelling),
+                "{spelling} should match a protected `main`"
+            );
+        }
+        // The configured side is normalized too.
+        assert!(matches_branch(&["refs/heads/main".to_string()], "main"));
+        assert!(matches_branch(&["origin/main".to_string()], "main"));
+        // A genuinely different branch still does not match.
+        assert!(!matches_branch(&["main".to_string()], "release/main-2"));
+        assert!(!matches_branch(&["main".to_string()], "feature"));
+    }
+
     use super::*;
 
     fn base_lane<'a>() -> LaneCandidate<'a> {

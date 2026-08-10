@@ -214,12 +214,21 @@ async fn authorize_materialize(
     };
     let verdict = authority::adjudicate_lane(&policy, &scope_revision, &lane);
     let summary = format!("lane decision: {:?} ({:?})", verdict.decision, verdict.reason);
-    let payload = serde_json::json!({
-        "decision": verdict.decision,
-        "reason": verdict.reason,
-        "hit_rule": verdict.hit_rule,
-    })
-    .to_string();
+    // `hit_rule` is operator-configured text (a repo or branch pattern) copied
+    // verbatim into a durable, backed-up ledger. `append_evidence` deliberately
+    // does NOT sanitize for its callers, so bound and redact here: a
+    // credential-shaped token in a configured value would otherwise land in
+    // audit views, and an oversized one would write a row past the ledger's
+    // budget.
+    let payload = repo::redact_secrets(&repo::truncate_bounded(
+        &serde_json::json!({
+            "decision": verdict.decision,
+            "reason": verdict.reason,
+            "hit_rule": verdict.hit_rule,
+        })
+        .to_string(),
+        repo::EVIDENCE_PAYLOAD_MAX_BYTES,
+    ));
     if let Err(error) = repo::append_evidence(
         db,
         repo::EvidenceWrite {
@@ -243,6 +252,29 @@ async fn authorize_materialize(
         );
     }
     Ok(verdict)
+}
+
+/// Whether a lane's recorded checkout is one a worker can actually be started
+/// in: a git worktree REGISTERED to the lane's repo, on the lane's branch.
+///
+/// Path existence is not that test. `materialize_direction`'s own reuse
+/// fast-path deliberately uses this stronger predicate because a recorded path
+/// replaced out-of-band by a plain directory — or by a checkout for another
+/// repo or branch — still `exists()`, and dispatching a worker into it runs the
+/// task against the wrong tree. Any release path that skips materialization
+/// must apply the same predicate or it re-opens exactly that hole.
+pub async fn lane_has_valid_checkout(db: &Db, direction_id: i32) -> Result<bool> {
+    let Some(repo_ref) = repo::direction_repo_of(db, direction_id).await? else {
+        return Ok(false);
+    };
+    let Some(existing) = repo::worktree_for(db, direction_id, repo_ref.id).await? else {
+        return Ok(false);
+    };
+    Ok(git::is_registered_worktree(
+        std::path::Path::new(&repo_ref.local_git_path),
+        std::path::Path::new(&existing.path),
+        &existing.branch,
+    ))
 }
 
 /// Re-run adjudication for one already-created lane at the CURRENT policy and
