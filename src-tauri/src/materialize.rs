@@ -574,7 +574,21 @@ pub async fn materialize_direction(db: &Db, direction_id: i32) -> Result<Materia
         .map(|row| row.revision)
         .unwrap_or_else(|| "0".to_string());
     if admission_revision != verdict.policy_revision {
-        return Ok(MaterializeOutcome::Gated(verdict));
+        // Do NOT report the stale verdict as a Gate. It carries the OLD
+        // revision and an `AllowedByPolicy` decision, so confirm would commit
+        // the direction as a recoverable Gate — and if the new policy actually
+        // DENIES this lane, the card is then re-adjudicated to denied and
+        // hidden, leaving a confirmed lane with no worktree and no recovery
+        // surface instead of taking the normal denied rollback. Judge the lane
+        // again under the revision that superseded it and answer with what that
+        // says. A verdict that comes back allowed proceeds to the write; the
+        // window narrowed to this second read is the residual documented above.
+        let fresh = authorize_materialize(db, &dir, &repo_ref, thread.workspace_id, &base).await?;
+        match fresh.decision {
+            authority::LaneDecision::AllowedByPolicy => {}
+            authority::LaneDecision::NeedsGate => return Ok(MaterializeOutcome::Gated(fresh)),
+            authority::LaneDecision::Denied => return Ok(MaterializeOutcome::Denied(fresh)),
+        }
     }
     let path = worktree_path(repo_path, &dir.branch);
     git::git_exclude(repo_path, ".worktrees/");

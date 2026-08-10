@@ -76,6 +76,13 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
   // mid-flight) can repaint an already-approved lane as still pending, or show
   // one thread's lanes while another is on screen and approve into the wrong one.
   const requestSeq = useRef(0);
+  // The thread on screen RIGHT NOW. `reload` closes over the threadId it was
+  // built with, so a resolution that finishes after a thread switch would call
+  // the previous thread's reload — bumping the shared sequence, invalidating
+  // the new thread's in-flight fetch, and then storing rows tagged for the old
+  // one, which render as nothing. Completion handlers check this instead.
+  const liveThreadId = useRef(threadId);
+  liveThreadId.current = threadId;
 
   const reload = useCallback(() => {
     if (threadId == null) {
@@ -147,7 +154,7 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
       for (const id of resolution.dispatch_direction_ids) {
         void dispatchDirection(id);
       }
-      reload();
+      if (liveThreadId.current === gate.thread_id) reload();
     } catch (error) {
       // The backend rejects a decision made against a superseded policy
       // revision rather than recording one the adjudicator would ignore. That
@@ -158,7 +165,7 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
         ...prev,
         [gate.direction_id]: stale ? "stale" : failureFor(decision),
       }));
-      if (stale) reload();
+      if (stale && liveThreadId.current === gate.thread_id) reload();
     }
   }
 
