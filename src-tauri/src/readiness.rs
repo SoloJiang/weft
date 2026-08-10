@@ -2966,40 +2966,47 @@ async fn run_bounded_check(
                     },
                 });
             }
-            // A child that exited on a SIGNAL reported nothing about the user's
-            // code, and must not be recorded as if it had.
+            // Reaching HERE means the child ran to completion on its own. A
+            // signal on this path is the user's check crashing — segfault,
+            // abort, OOM kill — which is a real failure of their code, so it
+            // stays `fail` with `-1` as the established "no numeric code"
+            // sentinel and the reason spelled out in the tail.
             //
-            // `status.code()` is `None` exactly then, and folding that into
-            // `code: -1` + `status: "fail"` turned "something killed this
-            // process" into a factual claim that the user's check FAILED. The
-            // killer is often weft itself — the readiness reaper and the
-            // process-group cleanup exist to kill exactly these children — so
-            // the product could tell someone their tests are red because its own
-            // housekeeping got there first. Under load that is also what named a
-            // different readiness test on macOS CI almost every run, in both
-            // directions: a killed check read as `Failing` where `Passed` was
-            // expected.
+            // An earlier revision routed every `status.code() == None` to
+            // `NotProduced`, on the premise that weft's own reaper kills these
+            // children and must not bill that to the user. The premise is
+            // right; the generalization was not. Every path where WEFT does
+            // the killing leaves elsewhere: a timeout exits through
+            // `ReapRequired` above, and the process-group cleanup runs only
+            // after this status has already been observed. So the only thing
+            // that arrives here signalled is the check dying on its own, and
+            // calling that "no verdict" would discard the blocking answer a
+            // crashing suite exists to give.
             //
-            // `NotProduced` is the arm that already means "no verdict was
-            // obtained" — the same answer a timeout gets, and one readiness
-            // treats as not-ready rather than as a failure. An unknown belongs
-            // there, not in a verdict.
-            let Some(code) = status.code() else {
-                let detail = "check process was terminated by a signal before it reported";
-                return Ok(BoundedCheckOutcome::NotProduced {
-                    output_tail: match output_tail.is_empty() {
+            // The observation that motivated the earlier revision — concurrent
+            // reapers killing a probe's child — is a test-harness phenomenon,
+            // fixed in the harness (`proc_registry::real_child_test_lock`).
+            // Production semantics should not be bent to it.
+            let signalled = status.code().is_none();
+            let output_tail = match signalled {
+                true => {
+                    let detail = "check process was terminated by a signal";
+                    match output_tail.is_empty() {
                         true => detail.to_string(),
                         false => format!("{output_tail}\n{detail}"),
-                    },
-                });
+                    }
+                }
+                false => output_tail,
             };
             Ok(BoundedCheckOutcome::Completed(crate::check::CheckResult {
                 name: check.name.clone(),
-                status: match code == 0 {
+                status: match status.success() {
                     true => "pass".to_string(),
                     false => "fail".to_string(),
                 },
-                code,
+                // `-1` is the established sentinel for "no numeric code", kept
+                // so the reason is visible alongside the tail above.
+                code: status.code().unwrap_or(-1),
                 output_tail,
             }))
         }
@@ -4646,18 +4653,17 @@ mod tests {
         }
     }
 
-    /// A check killed by a SIGNAL reported nothing about the user's code, so it
-    /// must not be recorded as a failure of it.
+    /// A check that CRASHES is a failing check.
     ///
-    /// `status.code()` is `None` exactly then, and the old `unwrap_or(-1)` +
-    /// `status.success()` folded that into `code: -1, status: "fail"` — weft
-    /// telling someone their tests are red because a process died. The killer is
-    /// frequently weft itself: the readiness reaper and process-group cleanup
-    /// exist to kill these children. `NotProduced` is the arm that means "no
-    /// verdict was obtained", which is the truth here.
+    /// `status.code()` is `None` when a child dies on a signal, and on THIS
+    /// path — ran to completion, no timeout, no reap — the signal came from
+    /// the check itself: a segfault, an abort, an OOM kill. That is a genuine
+    /// red verdict about the user's code and must survive as one rather than
+    /// being softened into "no verdict was obtained". Weft's own kills never
+    /// arrive here; they leave through `ReapRequired`.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_check_killed_by_a_signal_is_not_produced_rather_than_failing() {
+    async fn a_check_that_crashes_on_a_signal_is_reported_as_failing() {
         let root = tempfile::tempdir().expect("tempdir");
         let outcome = run_bounded_check(
             root.path(),
@@ -4668,14 +4674,20 @@ mod tests {
         .expect("the runner itself does not error");
 
         match outcome {
-            BoundedCheckOutcome::NotProduced { output_tail } => {
+            BoundedCheckOutcome::Completed(result) => {
+                assert_eq!(
+                    result.status, "fail",
+                    "a crashing check is a failing check, not an unknown one"
+                );
                 assert!(
-                    output_tail.contains("terminated by a signal"),
-                    "the reason must say why nothing was produced: {output_tail}"
+                    result.output_tail.contains("terminated by a signal"),
+                    "…and the tail says why it has no exit code: {}",
+                    result.output_tail
                 );
             }
-            BoundedCheckOutcome::Completed(result) => panic!(
-                "a signal-killed check must not become a verdict about the user's code: {result:?}"
+            BoundedCheckOutcome::NotProduced { output_tail } => panic!(
+                "a crash on the normal completed path is a real failure of the \
+                 user's code, not a missing verdict: {output_tail}"
             ),
         }
     }
