@@ -1822,6 +1822,17 @@ impl Inner {
 struct AuthorityBridgeEntry {
     applied_revision: Option<i64>,
     snapshot: Option<crate::authority::PolicySnapshot>,
+    /// True only for a COMMITTED absence — the database says this scope has no
+    /// active policy. That is what must dominate a snapshot arriving at the
+    /// same revision, because a revoke stamps the very row it revokes.
+    ///
+    /// A SUSPENSION (a failed read, or the window around a mutation) is not a
+    /// tombstone: nothing was decided, the entry is empty only so the bridge
+    /// stops answering meanwhile. Treating the two alike is what left a failed
+    /// mutation permanently suspended — its recovery refresh reinstalls the
+    /// still-active revision N over a suspension at N, and equal-revision
+    /// dominance rejected exactly that.
+    tombstone: bool,
 }
 
 /// Cloneable handle to all pending Asks.
@@ -2296,7 +2307,10 @@ impl AskRegistry {
     pub fn suspend_authority_snapshot(&self, workspace_id: i32) {
         let mut g = self.authority.write().unwrap_or_else(|e| e.into_inner());
         let applied_revision = g.get(&workspace_id).and_then(|entry| entry.applied_revision);
-        g.insert(workspace_id, AuthorityBridgeEntry { applied_revision, snapshot: None });
+        g.insert(
+            workspace_id,
+            AuthorityBridgeEntry { applied_revision, snapshot: None, tombstone: false },
+        );
     }
 
     pub fn apply_authority_refresh(
@@ -2317,15 +2331,18 @@ impl AskRegistry {
         // reinstall over a clear already applied at N — equality has to favour
         // the clear, or the revoked rules come back and keep auto-approving CLI
         // asks that the database and materialize both consider revoked.
-        let cleared_at_same_revision = g
-            .get(&workspace_id)
-            .is_some_and(|entry| entry.snapshot.is_none() && entry.applied_revision == incoming);
+        // Only a COMMITTED absence dominates an equal revision. A suspension at
+        // the same revision must yield, or the recovery refresh after a failed
+        // mutation can never reinstall the policy that is still active.
+        let tombstoned_at_same_revision = g.get(&workspace_id).is_some_and(|entry| {
+            entry.tombstone && entry.snapshot.is_none() && entry.applied_revision == incoming
+        });
         let is_stale = match (cached, incoming) {
             (Some(cached), Some(incoming)) => incoming < cached,
             // Either side missing carries no ordering — take the write rather
             // than pin the cache on a value nothing can supersede.
             _ => false,
-        } || (snapshot.is_some() && cleared_at_same_revision);
+        } || (snapshot.is_some() && tombstoned_at_same_revision);
         if is_stale {
             return;
         }
@@ -2334,7 +2351,14 @@ impl AskRegistry {
         // bridge defers to the human flow exactly as it did pre-#172, but the
         // revision it was applied at is remembered so a later stale read cannot
         // undo it.
-        g.insert(workspace_id, AuthorityBridgeEntry { applied_revision: incoming, snapshot });
+        // A refresh that resolved to "no active policy" IS the committed absence;
+        // anything with a snapshot is a live install. Either way this entry now
+        // reflects a database read, never a suspension.
+        let tombstone = snapshot.is_none();
+        g.insert(
+            workspace_id,
+            AuthorityBridgeEntry { applied_revision: incoming, snapshot, tombstone },
+        );
     }
 
     /// The cached AuthorityPolicy snapshot for one workspace, if any — exposed
@@ -3021,6 +3045,41 @@ mod tests {
         // A refresh at or beyond the watermark restores service.
         asks.set_authority_snapshot(11, Some(snapshot("6")));
         assert_eq!(asks.authority_snapshot(11).map(|s| s.revision), Some("6".to_string()));
+    }
+
+    /// A failed policy mutation suspends the cache and then reinstalls whatever
+    /// is STILL active — at the same revision it suspended. That restore must
+    /// succeed: equal-revision dominance exists to stop a delayed set
+    /// resurrecting a REVOKED policy, not to pin the cache empty after a write
+    /// that never landed.
+    #[test]
+    fn a_suspension_yields_to_a_restore_at_the_same_revision() {
+        fn snapshot(revision: &str) -> crate::authority::PolicySnapshot {
+            crate::authority::PolicySnapshot {
+                id: 1,
+                scope: crate::authority::PolicyScope::Workspace(21),
+                revision: revision.to_string(),
+                rules: Default::default(),
+                source: "test".to_string(),
+                created_at: String::new(),
+                revoked_at: String::new(),
+                rules_unreadable: false,
+            }
+        }
+        let asks = AskRegistry::new();
+        asks.set_authority_snapshot(21, Some(snapshot("8")));
+
+        // The mutation suspends, then fails, then reinstalls revision 8.
+        asks.suspend_authority_snapshot(21);
+        assert!(asks.authority_snapshot(21).is_none());
+        asks.set_authority_snapshot(21, Some(snapshot("8")));
+        assert_eq!(asks.authority_snapshot(21).map(|s| s.revision), Some("8".to_string()));
+
+        // A committed REVOKE at that revision still dominates a delayed set.
+        asks.apply_authority_refresh(21, None, Some(8));
+        assert!(asks.authority_snapshot(21).is_none());
+        asks.set_authority_snapshot(21, Some(snapshot("8")));
+        assert!(asks.authority_snapshot(21).is_none());
     }
 
     /// A revoke stamps the SAME row it revokes, so a clear and the set it

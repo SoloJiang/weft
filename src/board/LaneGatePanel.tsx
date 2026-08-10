@@ -151,9 +151,17 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
       // lane gains a worktree (so it also drops off this list), and the
       // dependents never had a Gate of their own. The backend returns exactly
       // the set the clearance released — start all of it.
-      for (const id of resolution.dispatch_direction_ids) {
-        void dispatchDirection(id);
-      }
+      // AWAITED before the reload. `list_lane_gates` decides "stranded" partly
+      // on whether a live session exists, and `dispatchDirection` fetches
+      // worktrees before opening one — so a reload racing those calls can see
+      // the lane still sessionless and rebuild the very Resume card the
+      // approval just cleared. Nothing re-runs this effect when the session
+      // later appears, so that stale card would sit there indefinitely.
+      // Failures inside dispatchDirection are already handled there; settling
+      // is all this needs.
+      await Promise.allSettled(
+        resolution.dispatch_direction_ids.map((id) => dispatchDirection(id)),
+      );
       if (liveThreadId.current === gate.thread_id) reload();
     } catch (error) {
       // The backend rejects a decision made against a superseded policy
