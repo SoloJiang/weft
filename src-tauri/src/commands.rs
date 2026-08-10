@@ -3541,7 +3541,16 @@ async fn lane_is_runnable(db: &Db, direction_id: i32) -> anyhow::Result<bool> {
 /// gated producer is left alone — and is not walked past, since nothing behind
 /// it can be runnable either.
 async fn released_by_gate(db: &Db, direction_id: i32) -> anyhow::Result<Vec<i32>> {
-    let mut released = vec![direction_id];
+    // The resolved lane is a candidate, not automatically a member: approving a
+    // gated lane B whose producer A is ALSO still gated makes B's own
+    // materialization return Ready, and seeding it unconditionally would start B
+    // before A exists. It goes through the same runnability check as every
+    // descendant. It still anchors the walk either way — a lane held back by its
+    // own upstream cannot release anything behind it.
+    let mut released = Vec::new();
+    if lane_is_runnable(db, direction_id).await? {
+        released.push(direction_id);
+    }
     let mut seen: std::collections::HashSet<i32> = [direction_id].into_iter().collect();
     let mut frontier = vec![direction_id];
     while let Some(current) = frontier.pop() {

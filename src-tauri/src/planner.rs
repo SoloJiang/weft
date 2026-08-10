@@ -1808,9 +1808,27 @@ async fn confirm_with_manual_tool_with_session_liveness(
     // own snapshot (now carrying each lane's recorded `direction_id`). See
     // `insert_plan_revision`'s own doc on why a failure here is logged, not
     // propagated: the confirm itself already committed above.
-    if let Err(error) =
-        repo::insert_plan_revision(db, thread_id, &start_plan.created_at, &new_json, "user").await
-    {
+    // Retried, because this snapshot is no longer only history: `list_lane_gates`
+    // reads it to decide whether a lane was ever planner-owned, and a lane
+    // missing from it is misread as a standalone task — so a later re-propose
+    // that drops the lane leaves its obsolete Gate actionable. The confirm CAS
+    // has already committed by here and cannot be undone, so a failure cannot
+    // fail the confirm; retrying is what is available. This SHRINKS the window,
+    // it does not close it — the durable fix is provenance on the direction row
+    // itself rather than inferred from plan history.
+    let mut snapshot_error = None;
+    for _ in 0..3 {
+        match repo::insert_plan_revision(db, thread_id, &start_plan.created_at, &new_json, "user")
+            .await
+        {
+            Ok(_) => {
+                snapshot_error = None;
+                break;
+            }
+            Err(error) => snapshot_error = Some(error),
+        }
+    }
+    if let Some(error) = snapshot_error {
         eprintln!("[weft][plan_revision] confirm snapshot for thread {thread_id}: {error}");
     }
     for (direction_id, route) in committed_route_markers {

@@ -9090,10 +9090,19 @@ pub async fn latest_lane_decisions(db: &Db, thread_id: i32) -> Result<HashMap<i3
     // `None` means the workspace or its policy could not be read at all, which
     // carries no revision to compare: filtering on that would silently blank
     // every lane, so the rows are taken as-is.
+    // A REVOKED (or never-configured) policy is not "no revision to compare" —
+    // the hard-coded conservative default is revision "0", which is exactly what
+    // adjudication stamps on verdicts it produces. Conflating that with an
+    // unreadable workspace would keep feeding readiness evidence from the
+    // revoked revision, so an old allow stays green or an old Gate stays
+    // blocking. Only a thread we cannot read at all yields `None`.
     let active_revision = match get_thread(db, thread_id).await? {
-        Some(thread) => get_active_authority_policy(db, "workspace", thread.workspace_id)
-            .await?
-            .map(|row| row.revision),
+        Some(thread) => Some(
+            get_active_authority_policy(db, "workspace", thread.workspace_id)
+                .await?
+                .map(|row| row.revision)
+                .unwrap_or_else(|| "0".to_string()),
+        ),
         None => None,
     };
     let rows = evidence::Entity::find()

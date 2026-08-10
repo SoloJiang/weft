@@ -438,6 +438,13 @@ pub async fn materialize_direction(db: &Db, direction_id: i32) -> Result<Materia
         // valid, already-registered worktree here would strand a dispatched
         // worker mid-flight on a later policy tighten (the issue's own "已
         // materialize 后策略被收紧时,停止新的写入" — new writes, not existing ones).
+        // Same serialization the first-time create path takes: this branch also
+        // adjudicates and then writes, so without the lock a tighten committed
+        // in between recreates a checkout under rules that are no longer active.
+        // This branch always RETURNS before reaching the create path below, so
+        // the two acquisitions can never nest.
+        let workspace_lock = workspace_write_lock(thread.workspace_id).await;
+        let workspace_write_guard = workspace_lock.lock().await;
         let verdict =
             authorize_materialize(db, &dir, &repo_ref, thread.workspace_id, &effective_base_branch(&repo_ref, &dir))
                 .await?;
@@ -571,6 +578,9 @@ pub async fn materialize_direction(db: &Db, direction_id: i32) -> Result<Materia
         }
         if changed {
             if let Some(updated) = repo::worktree_for(db, direction_id, repo_ref.id).await? {
+                // Released before the deps install, for the reason given on
+                // `workspace_write_lock`.
+                drop(workspace_write_guard);
                 bootstrap_worktree_deps(&updated.path).await;
                 return Ok(MaterializeOutcome::Ready(vec![updated]));
             }
