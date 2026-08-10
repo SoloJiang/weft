@@ -2402,6 +2402,41 @@ impl AskRegistry {
         );
     }
 
+    /// Where a snapshot's revision sits in the ORDER, which is not the same
+    /// question as which revision it is.
+    ///
+    /// A revoked snapshot's revision is `"{N}:revoked"` — deliberately
+    /// distinct from `N` so a Gate card rendered before the revoke cannot be
+    /// approved after it (see `authority::revoked_policy`). But it still
+    /// *orders* at `N`, because the revoke stamps `revoked_at` on that same
+    /// row rather than allocating a new revision.
+    ///
+    /// Parsing the whole string as an integer therefore yielded `None` for
+    /// every revoke, which cleared the numeric watermark and left the entry
+    /// unordered. A seed that read the active revision `N` and was descheduled
+    /// across the revoke could then reinstall its rules over the clear without
+    /// ever being judged stale — bringing back the `allow_actions` of a policy
+    /// the database considers revoked.
+    fn authority_revision_ordinal(revision: &str) -> Option<i64> {
+        revision.split(':').next()?.parse::<i64>().ok()
+    }
+
+    /// Whether a refresh carries a committed absence of policy: the database
+    /// says no rules are in force.
+    ///
+    /// Two shapes mean this. No snapshot at all is the original one. A snapshot
+    /// carrying a `revoked_at` stamp is the second, and it is a snapshot only
+    /// so the revoke can own a revision that invalidates pre-revoke Gate cards
+    /// — its rules are the inert default either way. A SUSPENSION also has no
+    /// snapshot but is not a database read at all, which is why it is tracked
+    /// by its own flag rather than inferred here.
+    fn is_committed_absence(snapshot: Option<&crate::authority::PolicySnapshot>) -> bool {
+        match snapshot {
+            None => true,
+            Some(snapshot) => !snapshot.revoked_at.is_empty(),
+        }
+    }
+
     pub fn apply_authority_refresh(
         &self,
         workspace_id: i32,
@@ -2410,7 +2445,7 @@ impl AskRegistry {
     ) {
         let mut g = self.authority.write().unwrap_or_else(|e| e.into_inner());
         let incoming = match &snapshot {
-            Some(snapshot) => snapshot.revision.parse::<i64>().ok(),
+            Some(snapshot) => Self::authority_revision_ordinal(&snapshot.revision),
             None => observed_revision,
         };
         let cached = g.get(&workspace_id).and_then(|entry| entry.applied_revision);
@@ -2420,30 +2455,38 @@ impl AskRegistry {
         // reinstall over a clear already applied at N — equality has to favour
         // the clear, or the revoked rules come back and keep auto-approving CLI
         // asks that the database and materialize both consider revoked.
-        // Only a COMMITTED absence dominates an equal revision. A suspension at
-        // the same revision must yield, or the recovery refresh after a failed
-        // mutation can never reinstall the policy that is still active.
-        let tombstoned_at_same_revision = g.get(&workspace_id).is_some_and(|entry| {
-            entry.tombstone && entry.snapshot.is_none() && entry.applied_revision == incoming
-        });
+        //
+        // Only a COMMITTED absence dominates an equal revision, and `tombstone`
+        // is exactly that flag: a suspension leaves it false, so the recovery
+        // refresh after a failed mutation can still reinstall the policy that
+        // is still active. It used to also require `entry.snapshot.is_none()`,
+        // which was a second way of saying the same thing back when the only
+        // committed absence had no snapshot at all — and it silently stopped
+        // being true once a revoke started arriving AS a snapshot.
+        let absence_committed_at_same_revision = g
+            .get(&workspace_id)
+            .is_some_and(|entry| entry.tombstone && entry.applied_revision == incoming);
+        let incoming_is_committed_absence = Self::is_committed_absence(snapshot.as_ref());
         let is_stale = match (cached, incoming) {
             (Some(cached), Some(incoming)) => incoming < cached,
             // Either side missing carries no ordering — take the write rather
             // than pin the cache on a value nothing can supersede.
             _ => false,
-        } || (snapshot.is_some() && tombstoned_at_same_revision);
+        } || (!incoming_is_committed_absence && absence_committed_at_same_revision);
         if is_stale {
             return;
         }
-        // A revoked/absent policy stores an entry with NO snapshot rather than
-        // dropping the key: the hard-coded conservative default applies and the
-        // bridge defers to the human flow exactly as it did pre-#172, but the
-        // revision it was applied at is remembered so a later stale read cannot
-        // undo it.
-        // A refresh that resolved to "no active policy" IS the committed absence;
-        // anything with a snapshot is a live install. Either way this entry now
-        // reflects a database read, never a suspension.
-        let tombstone = snapshot.is_none();
+        // A revoked/absent policy stores an entry whose rules are inert rather
+        // than dropping the key: the hard-coded conservative default applies
+        // and the bridge defers to the human flow exactly as it did pre-#172,
+        // but the revision it was applied at is remembered so a later stale
+        // read cannot undo it.
+        //
+        // A refresh that resolved to "no rules in force" IS the committed
+        // absence, whether it arrived as no snapshot or as a revoked one.
+        // Either way this entry now reflects a database read, never a
+        // suspension.
+        let tombstone = incoming_is_committed_absence;
         g.insert(
             workspace_id,
             AuthorityBridgeEntry { applied_revision: incoming, snapshot, tombstone },
@@ -3371,6 +3414,66 @@ mod tests {
         assert!(asks.authority_snapshot(21).is_none());
         asks.set_authority_snapshot(21, Some(snapshot("8")));
         assert!(asks.authority_snapshot(21).is_none());
+    }
+
+    /// A revoke that arrives AS a snapshot still has to order and still has to
+    /// win.
+    ///
+    /// `resolve_policy_snapshot` reports a revoked scope as a real snapshot
+    /// whose revision is `"{N}:revoked"` — distinct from `N` on purpose, so a
+    /// Gate card rendered before the revoke cannot be approved after it. But
+    /// the whole-string integer parse read that as "no revision at all",
+    /// clearing the watermark and leaving the entry unordered, and `tombstone`
+    /// was keyed off "no snapshot" so a revoke-as-snapshot did not set it
+    /// either. A seed that read active revision N and was descheduled across
+    /// the revoke could then walk back in and reinstall the revoked rules,
+    /// restoring the `allow_actions` that revocation exists to withdraw.
+    #[test]
+    fn a_revoked_snapshot_still_orders_and_still_dominates_a_delayed_seed() {
+        fn active(revision: &str) -> crate::authority::PolicySnapshot {
+            crate::authority::PolicySnapshot {
+                id: 1,
+                scope: crate::authority::PolicyScope::Workspace(31),
+                revision: revision.to_string(),
+                rules: Default::default(),
+                source: "test".to_string(),
+                created_at: String::new(),
+                revoked_at: String::new(),
+                rules_unreadable: false,
+            }
+        }
+        let asks = AskRegistry::new();
+
+        // The seed reads active revision 5 and is descheduled here.
+        // Meanwhile the revoke lands, exactly as `resolve_policy_snapshot`
+        // reports it.
+        let revoked = crate::authority::revoked_policy(
+            crate::authority::PolicyScope::Workspace(31),
+            "5".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+        );
+        assert_eq!(revoked.revision, "5:revoked", "the premise of this test");
+        asks.apply_authority_refresh(31, Some(revoked), None);
+
+        // The delayed seed now arrives carrying the pre-revoke policy.
+        asks.set_authority_snapshot(31, Some(active("5")));
+        assert_eq!(
+            asks.authority_snapshot(31).map(|s| s.revision),
+            Some("5:revoked".to_string()),
+            "a seed that predates the revoke must not reinstall the rules it withdrew"
+        );
+        assert!(
+            asks.authority_snapshot(31).is_some_and(|s| !s.revoked_at.is_empty()),
+            "and the entry still reads as revoked, not as a permissive default"
+        );
+
+        // A genuinely NEWER policy is not blocked by the revoke.
+        asks.set_authority_snapshot(31, Some(active("6")));
+        assert_eq!(
+            asks.authority_snapshot(31).map(|s| s.revision),
+            Some("6".to_string()),
+            "re-configuring the scope after a revoke must still take effect"
+        );
     }
 
     /// A revoke stamps the SAME row it revokes, so a clear and the set it
