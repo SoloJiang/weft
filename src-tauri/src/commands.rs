@@ -6231,6 +6231,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A confirmed batch dispatches producer and consumer concurrently. Until
+    /// the producer's session registers it is `ReadyToStart`, and treating that
+    /// as a blocker rejected the consumer's admission purely on request
+    /// ordering — with no recovery, since the dispatch is not retried and
+    /// `list_lane_gates` shows no card for `BlockedUpstream`.
+    ///
+    /// Walking THROUGH a ready producer keeps the case the rule was written
+    /// for: when confirm withholds a gated lane's dependents, the producer is
+    /// ready only because something further up is gated, and the walk still
+    /// reaches that gate.
+    #[tokio::test]
+    async fn a_ready_producer_does_not_block_its_consumer_but_a_gated_ancestor_does() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-batch-order-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r =
+            repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+                .await
+                .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let producer =
+            repo::create_direction(&db, t.id, "a", "claude", r.id, "why", "plan+impl", "")
+                .await
+                .unwrap();
+        let consumer =
+            repo::create_direction(&db, t.id, "b", "claude", r.id, "why", "plan+impl", "")
+                .await
+                .unwrap();
+        repo::set_direction_upstream(&db, consumer.id, producer.id).await.unwrap();
+        crate::materialize::materialize_direction(&db, producer.id).await.unwrap();
+        crate::materialize::materialize_direction(&db, consumer.id).await.unwrap();
+
+        // Both allowed, neither started — exactly the instant after confirm
+        // hands both to the frontend.
+        assert_eq!(
+            crate::lane_state::lane_authority_state(&db, producer.id).await.unwrap().label(),
+            "ready_to_start"
+        );
+        let waiting = crate::lane_state::lane_authority_state(&db, consumer.id).await.unwrap();
+        assert!(
+            waiting.admits_worker(),
+            "a consumer must not lose admission to its sibling's start ordering, got {}",
+            waiting.label()
+        );
+
+        // A THIRD lane behind the consumer, so the walk has to pass THROUGH a
+        // ready producer to reach a refusal further up. Denying the head of the
+        // chain must still block the tail.
+        let tail = repo::create_direction(&db, t.id, "c", "claude", r.id, "why", "plan+impl", "")
+            .await
+            .unwrap();
+        repo::set_direction_upstream(&db, tail.id, consumer.id).await.unwrap();
+        crate::materialize::materialize_direction(&db, tail.id).await.unwrap();
+        assert!(
+            crate::lane_state::lane_authority_state(&db, tail.id).await.unwrap().admits_worker(),
+            "a chain of ready lanes is a batch starting together, not a blockage"
+        );
+
+        // Deny the head. No policy is configured, so the in-force revision is
+        // the default's "0" and an override recorded there is honored.
+        let revision = current_gate_policy_revision(&db, producer.id).await.unwrap();
+        repo::record_gate_decision(&db, producer.id, &revision, "denied", "no").await.unwrap();
+        assert_eq!(
+            crate::lane_state::lane_authority_state(&db, producer.id).await.unwrap().label(),
+            "denied"
+        );
+        let blocked = crate::lane_state::lane_authority_state(&db, tail.id).await.unwrap();
+        assert_eq!(
+            blocked.label(),
+            "blocked_upstream",
+            "the walk must reach a denied ancestor through a ready one"
+        );
+        assert!(!blocked.admits_worker());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
     #[test]
     fn waiting_dingtalk_bridge_retries_after_copy_was_already_initialized() {
         assert!(dingtalk_copy_should_start_bridge(

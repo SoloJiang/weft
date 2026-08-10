@@ -1621,6 +1621,24 @@ pub(crate) async fn chat_open_worker_impl(
             authority_state.label()
         );
     }
+    // …and judge the repo this worker will ACTUALLY write, which is not always
+    // the direction's primary. `ensure_worker_parent_chain` deliberately allows
+    // a session's repo to differ within the workspace, and the frontend
+    // dispatches every stored worktree for a direction — so the lane state
+    // above, which resolves the policy against `direction_repo_of`, would let a
+    // multi-repo direction with an allowed primary start a worker in a
+    // secondary repo the policy names in `denied_repos`.
+    //
+    // `None` means the repo is not registered to this direction's workspace,
+    // which is a refusal rather than "nothing to judge".
+    match crate::materialize::judge_lane_for_repo(db, direction_id, repo_id).await? {
+        Some(verdict) if matches!(verdict.decision, crate::authority::LaneDecision::AllowedByPolicy) => {}
+        Some(verdict) => anyhow::bail!(
+            "the workspace policy does not allow this task to write that repository ({:?})",
+            verdict.reason
+        ),
+        None => anyhow::bail!("that repository is not registered to this workspace"),
+    }
     let mut dir = engine::ensure_worker_parent_chain(db, direction_id, repo_id).await?;
 
     // An unpinned direction that has not yet established a native conversation

@@ -201,6 +201,45 @@ pub async fn judge_lane(db: &Db, direction_id: i32) -> Result<Option<authority::
     ))
 }
 
+/// Judge one lane against a SPECIFIC repo, rather than the direction's primary.
+///
+/// `judge_lane` resolves the repo from the direction, which is the right answer
+/// for materialize — that is the repo it creates a checkout in. It is the wrong
+/// answer for worker admission: `ensure_worker_parent_chain` deliberately allows
+/// a session's repo to differ from the direction's within the workspace, and the
+/// frontend dispatches every stored worktree for a direction. A multi-repo
+/// direction whose PRIMARY repo is allowed could therefore start a worker in a
+/// secondary repo the policy names in `denied_repos`, because nothing judged the
+/// repo the worker was actually about to write.
+///
+/// `Ok(None)` when the repo is not registered to this direction's workspace —
+/// the caller must treat that as a refusal, not as "nothing to judge".
+pub async fn judge_lane_for_repo(
+    db: &Db,
+    direction_id: i32,
+    repo_id: i32,
+) -> Result<Option<authority::LaneVerdict>> {
+    use sea_orm::EntityTrait;
+    let dir = entities::direction::Entity::find_by_id(direction_id)
+        .one(&db.0)
+        .await?
+        .context("task not found")?;
+    let thread = entities::thread::Entity::find_by_id(dir.thread_id)
+        .one(&db.0)
+        .await?
+        .context("thread not found")?;
+    let Some(repo_ref) = repo::get_repo(db, repo_id).await? else {
+        return Ok(None);
+    };
+    if repo_ref.workspace_id != thread.workspace_id {
+        return Ok(None);
+    }
+    let base = effective_base_branch(&repo_ref, &dir);
+    Ok(Some(
+        judge_materialize(db, &dir, &repo_ref, thread.workspace_id, &base).await?,
+    ))
+}
+
 async fn authorize_materialize(
     db: &Db,
     dir: &entities::direction::Model,

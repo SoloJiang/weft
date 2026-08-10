@@ -286,19 +286,33 @@ async fn lane_authority_state_cached(
                 continue;
             }
             let state = local_state(db, upstream, scopes).await?;
-            // A producer is satisfactory only once it is FINISHED or RUNNING.
-            // Anything else blocks: gated and denied obviously, but also
-            // `ReadyToStart` — a producer that has not run yet is exactly the
-            // case confirm creates when it materializes a gated lane's
-            // dependents and withholds their dispatch.
-            //
-            // A satisfactory producer ends the walk down that edge rather than
+            // A settled producer ends the walk down that edge rather than
             // continuing into ITS producers: whether the thing C waits for has
             // run is the whole question, and if B is finished or live, what B
-            // once waited for is settled. That is why the frontier only grows
-            // through unsatisfactory edges, which is also what bounds it.
+            // once waited for is settled.
+            //
+            // `ReadyToStart` is the interesting one, and it must NOT block.
+            // Confirm hands the frontend a producer and its consumer in one
+            // dispatch set and they start concurrently, so a producer sitting in
+            // `ReadyToStart` usually means only that its session has not
+            // registered YET — a race, not a permission fact. Blocking on it
+            // rejected the consumer's admission purely on request ordering, and
+            // nothing recovered from that: the dispatch is not retried and
+            // `list_lane_gates` shows no card for `BlockedUpstream`, so the
+            // consumer was stranded invisibly.
+            //
+            // Walking THROUGH it instead keeps the case that rule was written
+            // for. When confirm withholds a gated lane's dependents, the
+            // producer is `ReadyToStart` because something further up is gated —
+            // and the walk now reaches that gate and blocks on it by name. A
+            // producer with no gated ancestor is simply a sibling starting
+            // alongside us, which is exactly what a confirmed batch is.
             match state {
                 LaneAuthorityState::Finished | LaneAuthorityState::Running => continue,
+                LaneAuthorityState::ReadyToStart(_) => {
+                    frontier.push(upstream);
+                    continue;
+                }
                 _ => return Ok(LaneAuthorityState::BlockedUpstream { blocker: upstream }),
             }
         }

@@ -2966,10 +2966,40 @@ async fn run_bounded_check(
                     },
                 });
             }
+            // A child that exited on a SIGNAL reported nothing about the user's
+            // code, and must not be recorded as if it had.
+            //
+            // `status.code()` is `None` exactly then, and folding that into
+            // `code: -1` + `status: "fail"` turned "something killed this
+            // process" into a factual claim that the user's check FAILED. The
+            // killer is often weft itself — the readiness reaper and the
+            // process-group cleanup exist to kill exactly these children — so
+            // the product could tell someone their tests are red because its own
+            // housekeeping got there first. Under load that is also what named a
+            // different readiness test on macOS CI almost every run, in both
+            // directions: a killed check read as `Failing` where `Passed` was
+            // expected.
+            //
+            // `NotProduced` is the arm that already means "no verdict was
+            // obtained" — the same answer a timeout gets, and one readiness
+            // treats as not-ready rather than as a failure. An unknown belongs
+            // there, not in a verdict.
+            let Some(code) = status.code() else {
+                let detail = "check process was terminated by a signal before it reported";
+                return Ok(BoundedCheckOutcome::NotProduced {
+                    output_tail: match output_tail.is_empty() {
+                        true => detail.to_string(),
+                        false => format!("{output_tail}\n{detail}"),
+                    },
+                });
+            };
             Ok(BoundedCheckOutcome::Completed(crate::check::CheckResult {
                 name: check.name.clone(),
-                status: if status.success() { "pass" } else { "fail" }.to_string(),
-                code: status.code().unwrap_or(-1),
+                status: match code == 0 {
+                    true => "pass".to_string(),
+                    false => "fail".to_string(),
+                },
+                code,
                 output_tail,
             }))
         }
@@ -4613,6 +4643,40 @@ mod tests {
             branch: signature.branch,
             head_sha: signature.head_sha,
             dirty: signature.dirty,
+        }
+    }
+
+    /// A check killed by a SIGNAL reported nothing about the user's code, so it
+    /// must not be recorded as a failure of it.
+    ///
+    /// `status.code()` is `None` exactly then, and the old `unwrap_or(-1)` +
+    /// `status.success()` folded that into `code: -1, status: "fail"` — weft
+    /// telling someone their tests are red because a process died. The killer is
+    /// frequently weft itself: the readiness reaper and process-group cleanup
+    /// exist to kill these children. `NotProduced` is the arm that means "no
+    /// verdict was obtained", which is the truth here.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_check_killed_by_a_signal_is_not_produced_rather_than_failing() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let outcome = run_bounded_check(
+            root.path(),
+            &shell_check("self-terminated", "kill -TERM $$; sleep 5"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("the runner itself does not error");
+
+        match outcome {
+            BoundedCheckOutcome::NotProduced { output_tail } => {
+                assert!(
+                    output_tail.contains("terminated by a signal"),
+                    "the reason must say why nothing was produced: {output_tail}"
+                );
+            }
+            BoundedCheckOutcome::Completed(result) => panic!(
+                "a signal-killed check must not become a verdict about the user's code: {result:?}"
+            ),
         }
     }
 
