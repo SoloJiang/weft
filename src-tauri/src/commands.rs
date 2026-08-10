@@ -3867,7 +3867,19 @@ pub async fn create_direction(
         None => Ok(dir),
         Some(verdict) => {
             if matches!(verdict.decision, crate::authority::LaneDecision::Denied) {
-                let _ = repo::delete_direction(&db, dir.id).await;
+                // NOT best-effort. Discarding this error still reported only
+                // `lane_denied_by_policy`, so the frontend's failure path
+                // reloaded the thread and showed the very row the command
+                // claimed to have torn down — durably `Denied`, so it has no
+                // worktree, no worker and no Gate action, and every retry adds
+                // another dead row. The caller has to learn that the cleanup is
+                // what failed, because that is the part worth retrying.
+                if let Err(error) = repo::delete_direction(&db, dir.id).await {
+                    return Err(format!(
+                        "lane_denied_by_policy_cleanup_failed:{:?}:{error}",
+                        verdict.reason
+                    ));
+                }
                 return Err(format!("lane_denied_by_policy:{:?}", verdict.reason));
             }
             Err(format!("lane_needs_gate:{:?}", verdict.reason))

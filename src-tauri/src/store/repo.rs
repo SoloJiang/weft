@@ -2474,6 +2474,24 @@ pub async fn create_authority_policy(
     if scope == "workspace" {
         ensure_workspace_accepts_writes(db, scope_id).await?;
     }
+    // The same refusal `revoke_authority_policy` and `resolve_policy_snapshot`
+    // make, on the third path that had been bypassing it. `unwrap_or(0)` below
+    // reads an unorderable revision as zero, so a malformed newest row would
+    // restart allocation at 1 and the retry loop would climb to the next free
+    // number — `set_authority_policy` reporting success and seeding the CLI
+    // bridge with that row, while `resolve_policy_snapshot` still resolves the
+    // scope as unreadable. Lane enforcement and permission asks would then be
+    // running under two different policies, which is worse than either.
+    if list_authority_policy_revisions(db, scope, scope_id)
+        .await?
+        .iter()
+        .any(|row| row.revision.parse::<i64>().is_err())
+    {
+        anyhow::bail!(
+            "cannot configure {scope} {scope_id}: its policy history has a revision that cannot \
+             be ordered, so the next revision cannot be allocated"
+        );
+    }
     let mut next_revision = previous
         .and_then(|p| p.revision.parse::<i64>().ok())
         .unwrap_or(0)
@@ -18584,6 +18602,44 @@ mod tests {
         assert!(
             err.to_string().contains("approved") || err.to_string().contains("denied"),
             "an unrecognized decision value must be rejected outright: {err}"
+        );
+    }
+
+    /// Allocating the NEXT revision ranks the existing ones too, and reading an
+    /// unorderable revision as zero restarts allocation from 1. The retry loop
+    /// then climbs to the next free number and reports success — seeding the
+    /// CLI bridge with that row while `resolve_policy_snapshot` still resolves
+    /// the scope as unreadable. Lane enforcement and permission asks would be
+    /// running under two different policies, which is worse than either.
+    #[tokio::test]
+    async fn configuring_a_scope_whose_history_cannot_be_ordered_fails_instead_of_reallocating() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let rules = serde_json::to_string(&crate::authority::PolicyRules::default()).unwrap();
+        create_authority_policy(&db, "workspace", ws.id, &rules, "user").await.unwrap();
+
+        let malformed = authority_policy::ActiveModel {
+            scope: Set("workspace".to_string()),
+            scope_id: Set(ws.id),
+            revision: Set("not-a-number".to_string()),
+            rules: Set(rules.clone()),
+            source: Set("user".to_string()),
+            created_at: Set(now()),
+            revoked_at: Set(String::new()),
+            ..Default::default()
+        };
+        malformed.insert(&db.0).await.unwrap();
+        let before = list_authority_policy_revisions(&db, "workspace", ws.id).await.unwrap().len();
+
+        let refused = create_authority_policy(&db, "workspace", ws.id, &rules, "user").await;
+        assert!(
+            refused.is_err(),
+            "allocating a revision on top of an unorderable history must not guess"
+        );
+        assert_eq!(
+            list_authority_policy_revisions(&db, "workspace", ws.id).await.unwrap().len(),
+            before,
+            "and it must not have written a row on the way out"
         );
     }
 
