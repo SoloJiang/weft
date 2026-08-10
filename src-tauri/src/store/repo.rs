@@ -2355,6 +2355,15 @@ pub async fn insert_plan_revision(
     proposal: &str,
     source: &str,
 ) -> Result<plan_revision::Model> {
+    // A plan revision carries the issue's FULL proposal JSON. This insert has no
+    // foreign key, so a deletion committing between the caller's plan write and
+    // this row would cascade away the thread and its history first and then let
+    // this row land — recreating deleted scope content as an orphan that
+    // survives into backups. The write fence is the same one every other
+    // thread-owned write takes, and it is re-checked after the insert because
+    // the two are not one transaction: a deletion that raced us is undone by
+    // removing the row we just wrote.
+    ensure_thread_workspace_accepts_writes(db, thread_id).await?;
     let inserted = plan_revision::Entity::insert(plan_revision::ActiveModel {
         id: NotSet,
         thread_id: Set(thread_id),
@@ -2365,6 +2374,12 @@ pub async fn insert_plan_revision(
     })
     .exec(&db.0)
     .await?;
+    if let Err(error) = ensure_thread_workspace_accepts_writes(db, thread_id).await {
+        let _ = plan_revision::Entity::delete_by_id(inserted.last_insert_id)
+            .exec(&db.0)
+            .await;
+        return Err(error);
+    }
     plan_revision::Entity::find_by_id(inserted.last_insert_id)
         .one(&db.0)
         .await?

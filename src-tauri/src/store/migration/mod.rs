@@ -2700,6 +2700,39 @@ impl MigrationTrait for M0056AuthorityPolicy {
             )
             .await?;
 
+        // Backfill scope history for plans that already exist. Gate scoping asks
+        // "has the planner ever owned this lane?" by searching plan_revision, so
+        // an upgraded database — where every confirmed plan predates this table
+        // — would classify every legacy lane as a standalone task. A later
+        // re-proposal that drops one of them would then leave its stale Gate
+        // actionable outside the reviewed scope. One snapshot per existing plan
+        // gives those lanes the provenance they would have had.
+        // Guarded twice. `plan` may not exist yet — this migration is also run
+        // standalone against a bare connection — and a RERUN of `up` (every
+        // migration here tolerates one) must not duplicate the snapshots. An
+        // already-populated history means the backfill has happened or real
+        // revisions exist; either way there is nothing to reconstruct.
+        let history_empty = plan_revision::Entity::find()
+            .one(manager.get_connection())
+            .await?
+            .is_none();
+        let plans = match manager.has_table("plan").await? && history_empty {
+            true => plan::Entity::find().all(manager.get_connection()).await?,
+            false => Vec::new(),
+        };
+        for row in plans {
+            plan_revision::Entity::insert(plan_revision::ActiveModel {
+                id: sea_orm::NotSet,
+                thread_id: sea_orm::Set(row.thread_id),
+                version: sea_orm::Set(row.created_at.clone()),
+                proposal: sea_orm::Set(row.proposal.clone()),
+                source: sea_orm::Set("migration".to_string()),
+                created_at: sea_orm::Set(row.created_at.clone()),
+            })
+            .exec(manager.get_connection())
+            .await?;
+        }
+
         let mut authority_policy_stmt = schema.create_table_from_entity(authority_policy::Entity);
         authority_policy_stmt.if_not_exists();
         manager.create_table(authority_policy_stmt).await?;
@@ -3884,6 +3917,47 @@ mod tests {
             edges_for(&db, 4).await.len(),
             1,
             "a rerun must not duplicate the already-lifted denied edge"
+        );
+    }
+
+    /// M0056 UPGRADE path: a database that already holds confirmed plans gets
+    /// one scope-history snapshot per plan. Gate scoping asks "has the planner
+    /// ever owned this lane?" by searching `plan_revision`, so without the
+    /// backfill every pre-existing lane reads as a standalone task — and a
+    /// later re-proposal that drops one leaves its stale Gate actionable
+    /// outside the reviewed scope.
+    #[tokio::test]
+    async fn m0056_backfills_scope_history_for_existing_plans() {
+        use crate::store::repo;
+        use crate::store::Db;
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let thread = repo::create_thread(&db, ws.id, "t", "issue", "claude")
+            .await
+            .unwrap();
+        let proposal = r#"{"rationale":"r","directions":[{"name":"a","direction_id":7}]}"#;
+        repo::upsert_plan(&db, thread.id, proposal, "confirmed", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
+
+        // Simulate the pre-M0056 world: the plan exists, its history does not.
+        <crate::store::entities::plan_revision::Entity as sea_orm::EntityTrait>::delete_many()
+            .exec(&db.0)
+            .await
+            .unwrap();
+        assert!(repo::all_plan_revision_proposals(&db, thread.id).await.unwrap().is_empty());
+
+        let manager = SchemaManager::new(&db.0);
+        M0056AuthorityPolicy.up(&manager).await.unwrap();
+
+        let history = repo::all_plan_revision_proposals(&db, thread.id).await.unwrap();
+        assert_eq!(history.len(), 1, "each existing plan is snapshotted once");
+        assert!(
+            history[0].contains("\"direction_id\":7"),
+            "the snapshot carries the plan's recorded lane ids: {}",
+            history[0]
         );
     }
 

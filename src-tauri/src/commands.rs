@@ -3484,6 +3484,15 @@ pub async fn resolve_lane_gate(
     if policy_revision != current {
         return Err("gate_policy_changed".to_string());
     }
+    // The policy revision alone does not prove the card is still meaningful: a
+    // re-proposal can drop this lane without touching the policy at all, and
+    // the card open on screen stays clickable. Approving it would materialize
+    // and dispatch work the user has removed from the reviewed scope.
+    if let Some(dir) = crate::store::repo::get_direction(&db, direction_id).await.map_err(e)? {
+        if !lane_is_in_current_scope(&db, dir.thread_id, direction_id).await.map_err(e)? {
+            return Err("gate_out_of_scope".to_string());
+        }
+    }
     crate::store::repo::record_gate_decision(
         &db,
         direction_id,
@@ -3528,6 +3537,45 @@ pub async fn resolve_lane_gate(
         }
         crate::materialize::MaterializeOutcome::Gated(_) => Err("gate_still_pending".to_string()),
     }
+}
+
+/// Whether this lane still belongs to the thread's CURRENT reviewed scope.
+///
+/// A lane the planner owns but the current proposal no longer names is
+/// obsolete; a standalone lane (`create_direction`, never referenced by any
+/// plan revision) is always in scope. `list_lane_gates` hides obsolete cards,
+/// but hiding is not enforcement: a card already on screen when the lead
+/// re-proposes stays clickable, and the policy revision it carries can be
+/// unchanged, so nothing else would stop the approval from materializing and
+/// dispatching work the user removed.
+async fn lane_is_in_current_scope(db: &Db, thread_id: i32, direction_id: i32) -> anyhow::Result<bool> {
+    let current_lanes: Option<Vec<serde_json::Value>> = crate::store::repo::get_plan(db, thread_id)
+        .await?
+        .and_then(|plan| serde_json::from_str::<serde_json::Value>(&plan.proposal).ok())
+        .and_then(|value| value.get("directions").cloned())
+        .and_then(|dirs| dirs.as_array().cloned());
+    // No plan at all: nothing to be out of scope against.
+    let Some(current_lanes) = current_lanes else {
+        return Ok(true);
+    };
+    let in_scope: std::collections::HashSet<i32> = current_lanes
+        .iter()
+        .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
+        .map(|id| id as i32)
+        .filter(|id| *id != 0)
+        .collect();
+    if in_scope.contains(&direction_id) {
+        return Ok(true);
+    }
+    let planner_owned = crate::store::repo::all_plan_revision_proposals(db, thread_id)
+        .await?
+        .iter()
+        .filter_map(|proposal| serde_json::from_str::<serde_json::Value>(proposal).ok())
+        .filter_map(|value| value.get("directions").and_then(|d| d.as_array()).cloned())
+        .flatten()
+        .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
+        .any(|id| id as i32 == direction_id);
+    Ok(!planner_owned)
 }
 
 /// Whether any producer this lane declared is itself refused — denied, or

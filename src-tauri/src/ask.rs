@@ -2451,6 +2451,16 @@ impl AskRegistry {
         } else {
             ans
         };
+        // Issue #172, DELIBERATELY NOT ENFORCED HERE: a policy tightened while
+        // this card sat open does not bind the answer. Forcing Deny would also
+        // suppress an `Always`/`Full` grant (`granted` below keys off this
+        // value), which is precisely the semantics
+        // `bridge_never_overrides_an_exact_always_or_full_grant` codifies — a
+        // human's explicit standing grant is not something a later policy
+        // silently revokes. Whether that should change is the open product
+        // question tracked in the PR (policy deny vs. standing grants); when it
+        // is settled the answer belongs here AND in `auto_decision`, applied
+        // once, not decided route by route.
         let key = (ask.thread, ask.dir.clone());
         // Whether this answer added a NEW standing grant (HashSet::insert is true
         // only on first insertion). Drives a single persist write — an idempotent

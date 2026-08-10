@@ -479,6 +479,32 @@ pub async fn materialize_direction(db: &Db, direction_id: i32) -> Result<Materia
             }
             // Still try deps in case a prior reclaim left the checkout without
             // node_modules. No-op when ready.
+            //
+            // Re-checked immediately before it, under the workspace lock: a
+            // dependency install WRITES into the checkout and runs package
+            // lifecycle scripts, so it must not start for a lane a tighten has
+            // refused since the verdict above. The lock is taken for the check
+            // and released before the install itself — holding it across a
+            // `pnpm install` would park every policy edit in the workspace
+            // behind a download, which is the phase `workspace_write_lock`
+            // documents excluding.
+            let admitted = {
+                let workspace_lock = workspace_write_lock(thread.workspace_id).await;
+                let _guard = workspace_lock.lock().await;
+                let recheck = authorize_materialize(
+                    db,
+                    &dir,
+                    &repo_ref,
+                    thread.workspace_id,
+                    &effective_base_branch(&repo_ref, &dir),
+                )
+                .await?;
+                matches!(recheck.decision, authority::LaneDecision::AllowedByPolicy)
+            };
+            if !admitted {
+                // The checkout itself is left alone — only the new write stops.
+                return Ok(MaterializeOutcome::Ready(vec![existing]));
+            }
             bootstrap_worktree_deps(&existing.path).await;
             return Ok(MaterializeOutcome::Ready(vec![existing]));
         }
