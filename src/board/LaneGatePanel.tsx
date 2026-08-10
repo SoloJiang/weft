@@ -81,7 +81,8 @@ type GateFetchState = "idle" | "loading" | "resolved" | "rejected";
  */
 export function LaneGatePanel({ threadId }: { threadId: number | null }) {
   const { t } = useTranslation();
-  const { dispatchDirection, directionsByThread, proposal, loadThreadChildren } = useStore();
+  const { dispatchDirection, directionsByThread, proposal, loadThreadChildren, sessions } =
+    useStore();
   // Rows are stored WITH the thread they were fetched for. Keeping a bare array
   // left the previous thread's rows on screen for the whole duration of the new
   // thread's fetch — actionable approve/deny buttons that resolve the OLD lane,
@@ -134,10 +135,25 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
     ? ""
     : (directionsByThread[threadId] ?? []).map((d) => d.id).join(",");
   const proposalSignature = proposal ? `${proposal.status}:${proposal.created_at}` : "";
+  // Which of this thread's lanes have a live session RIGHT NOW.
+  //
+  // A confirm reloads directions and clears the proposal BEFORE it starts the
+  // returned workers, so this effect runs while every materialized lane is
+  // still `ReadyToStart` — which the backend deliberately reports as a
+  // stranded-lane card. Once dispatch registers the sessions, neither of the
+  // other two signals changes: the lane ids are identical and the proposal is
+  // already cleared. Without this the recovery cards stayed on screen
+  // indefinitely while the workers were happily running.
+  const liveSessionSignature = threadId == null
+    ? ""
+    : (directionsByThread[threadId] ?? [])
+        .filter((d) => sessions[d.id] !== undefined)
+        .map((d) => d.id)
+        .join(",");
 
   useEffect(() => {
     reload();
-  }, [reload, laneSignature, proposalSignature]);
+  }, [reload, laneSignature, proposalSignature, liveSessionSignature]);
 
   async function resolve(gate: LaneGate, decision: "approved" | "denied") {
     setActionState((prev) => ({ ...prev, [gate.direction_id]: "resolving" }));

@@ -2757,6 +2757,17 @@ impl AskRegistry {
             .cloned()
             .collect();
 
+        // The three-state policy answer applies here too. The clicked ask always
+        // resolves — a human is answering it — but a SIBLING swept in by `Full`
+        // whose policy is indeterminate stays open, exactly as `auto_decision`
+        // and the backlog sweeps leave it. Collapsing the bridge's `None` into
+        // the target's `Allow` executed sibling operations while the workspace
+        // constraint was unknown.
+        let verdicts = self.sweep_verdicts(&covered);
+        let covered: Vec<Ask> = covered
+            .into_iter()
+            .filter(|a| a.id == id || !verdicts.deferred.contains(&a.id))
+            .collect();
         let covered_ids: HashSet<u64> = covered.iter().map(|a| a.id).collect();
         g.open.retain(|a| !covered_ids.contains(&a.id));
         for c in covered {
@@ -2766,9 +2777,9 @@ impl AskRegistry {
             // rechecking only `ask.action_key` let a sibling the policy denies
             // ride out on the target's `Allow`. The sweep is a convenience for
             // the human, never a way around a constraint.
-            let verdict = match self.authority_bridge_decision(c.thread, &c.action_key) {
-                Some(Decision::Deny) => Decision::Deny,
-                Some(Decision::Allow) | None => decision,
+            let verdict = match verdicts.denied.contains(&c.id) {
+                true => Decision::Deny,
+                false => decision,
             };
             if let Some(tx) = g.waiters.remove(&c.id) {
                 let _ = tx.send(verdict);
