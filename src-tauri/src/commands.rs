@@ -3354,12 +3354,13 @@ async fn list_lane_gates_impl(db: &Db, thread_id: i32) -> R<Vec<LaneGateDto>> {
             }
             // Everything else has no decision to offer. Denied is settled;
             // Finished and Running have nothing to ask; Deactivated was switched
-            // off on purpose; OutOfScope is not the user's current scope;
+            // off on purpose; AwaitingReview already claimed completion; OutOfScope is not the user's current scope;
             // BlockedUpstream's real blocker is the producer, which carries its
             // own card; NotApplicable binds no repo.
             LaneAuthorityState::Denied(_)
             | LaneAuthorityState::Finished
             | LaneAuthorityState::Deactivated
+            | LaneAuthorityState::AwaitingReview
             | LaneAuthorityState::OutOfScope
             | LaneAuthorityState::BlockedUpstream { .. }
             | LaneAuthorityState::Running
@@ -6073,6 +6074,131 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// A lane whose worker finished and left it in `review` must not be offered
+    /// a Resume card, and must not admit a second worker.
+    #[tokio::test]
+    async fn a_review_ready_lane_is_not_offered_recovery_dispatch() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-review-lane-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r =
+            repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+                .await
+                .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "why", "plan+impl", "")
+            .await
+            .unwrap();
+
+        let wts = crate::materialize::materialize_direction(&db, dir.id)
+            .await
+            .unwrap()
+            .into_worktrees();
+        assert_eq!(wts.len(), 1);
+
+        // The worker ran and exited, leaving the lane claiming completion. By
+        // checkout and session alone this is indistinguishable from a lane that
+        // never started — which is exactly why it used to draw a Resume card.
+        let worker = repo::create_session(&db, dir.id, r.id, "claude", &wts[0].path).await.unwrap();
+        repo::set_session_status(&db, worker.id, "exited").await.unwrap();
+        repo::set_direction_status(&db, dir.id, "review").await.unwrap();
+
+        let state = crate::lane_state::lane_authority_state(&db, dir.id).await.unwrap();
+        assert_eq!(state.label(), "awaiting_review");
+        assert!(!state.is_dispatchable(), "review work is not dispatched again");
+        assert!(!state.admits_worker(), "a second worker must not be admitted");
+        assert!(
+            list_lane_gates_impl(&db, t.id).await.unwrap().is_empty(),
+            "a review-ready lane is not a stranded lane"
+        );
+
+        // A live worker on a review lane still reconnects — the check sits after
+        // the liveness test on purpose.
+        repo::set_session_status(&db, worker.id, "running").await.unwrap();
+        let live = crate::lane_state::lane_authority_state(&db, dir.id).await.unwrap();
+        assert_eq!(live.label(), "running");
+        assert!(live.admits_worker(), "an attached worker must still reconnect");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// An unreadable NEWEST decision row must not let an older one answer.
+    ///
+    /// Falling through to history is the permissive direction: if the unreadable
+    /// row was a Gate or a denial and an older row says `allowed_by_policy`, the
+    /// stale allow becomes authoritative and readiness reports the lane — and
+    /// the whole issue — as ready.
+    #[tokio::test]
+    async fn an_unreadable_newest_decision_row_never_falls_back_to_an_older_allow() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-unreadable-decision-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r =
+            repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+                .await
+                .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "why", "plan+impl", "")
+            .await
+            .unwrap();
+
+        let write = |payload: &'static str, source_ref: &'static str| {
+            repo::append_evidence(
+                &db,
+                repo::EvidenceWrite {
+                    thread_id: t.id,
+                    direction_id: dir.id,
+                    kind: repo::EVIDENCE_KIND_DECISION,
+                    source: "authority_policy",
+                    source_ref,
+                    revision: "",
+                    policy_revision: "0",
+                    summary: "decision",
+                    payload,
+                    collection_state: repo::EVIDENCE_COLLECTION_OK,
+                },
+            )
+        };
+        // An older, readable ALLOW, then a newer unreadable row on top of it.
+        write(r#"{"decision":"allowed_by_policy"}"#, "older").await.unwrap();
+        write("{not json", "newer").await.unwrap();
+
+        let (decisions, superseded) = repo::latest_lane_decisions(&db, t.id).await.unwrap();
+        assert!(
+            !decisions.contains_key(&dir.id),
+            "an unreadable newest verdict must not resolve to the older allow, got {decisions:?}"
+        );
+        assert!(
+            superseded.contains(&dir.id),
+            "the lane is marked unresolved so readiness gates it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

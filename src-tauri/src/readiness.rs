@@ -832,7 +832,10 @@ pub(crate) fn direction_is_active(direction: &direction::Model) -> bool {
     !matches!(direction.status.as_str(), "inactive" | "cancelled")
 }
 
-fn direction_claimed_completion(status: &str) -> bool {
+/// Whether the worker has declared this lane's work done — `review` (awaiting
+/// human review) or `done`. The ONE definition; `lane_state` resolves its
+/// `AwaitingReview` arm from it rather than keeping a second copy.
+pub(crate) fn direction_claimed_completion(status: &str) -> bool {
     matches!(status, "review" | "done")
 }
 
@@ -1700,6 +1703,20 @@ impl GitSignatureProbe {
     }
 
     async fn sample(&self, path: &Path) -> Result<GitWorktreeSignature> {
+        // Under `cargo test` this probe's Git children share one process-global
+        // `proc_registry` with every other test in a ~2200-test binary —
+        // including the tests that exercise the reaper itself. Those already
+        // serialized against each other; nothing serialized them against THIS,
+        // so a sweep there killed a probe child here. The child exits on a
+        // signal, `.ok()` turns the error into `None`, and readiness reads
+        // "signature unknown" as "the worktree changed": an empty `repo_checks`
+        // and a different readiness test named on macOS CI every run.
+        //
+        // Held across the whole signature — all three commands and the ownership
+        // sweep — because the child is registered for that entire span, not just
+        // during one command. No effect on what ships.
+        #[cfg(test)]
+        let _registry_guard = crate::proc_registry::real_child_test_lock().lock().await;
         // Board cards and multi-lane collection may sample concurrently. Keep
         // the process fan-out globally bounded across every issue rather than
         // multiplying one Git child per card, lane, and worktree.
@@ -2828,6 +2845,11 @@ async fn run_bounded_check(
     check: &crate::check::Check,
     timeout: Duration,
 ) -> Result<BoundedCheckOutcome> {
+    // Deliberately NOT serialized on `real_child_test_lock`, unlike the probe
+    // path. A check runner is what the timeout tests hang on purpose, so a
+    // guard held here is held for the whole deliberate timeout — starving every
+    // other test that needs the registry and breaking the permit/timing
+    // assertions those tests exist for. Tried, measured, reverted.
     let mut command = tokio::process::Command::new(&check.program);
     command
         .args(&check.args)

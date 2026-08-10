@@ -9245,12 +9245,31 @@ pub async fn latest_lane_decisions(
                 continue;
             }
         }
-        let parsed: serde_json::Value = serde_json::from_str(&row.payload).unwrap_or_default();
-        // A row whose payload carries no `decision` key is not a verdict this
-        // map can speak for — skip it rather than inventing one, and let the
-        // next (older) row for the lane answer.
-        if let Some(decision) = parsed.get("decision").and_then(|v| v.as_str()) {
-            out.insert(row.direction_id, decision.to_string());
+        // An UNREADABLE newest row settles the lane, exactly as a superseded one
+        // does. It used to fall through to the next (older) row, which is the
+        // permissive direction and the dangerous one: if the unreadable row was
+        // a Gate or a denial and an older row says `allowed_by_policy`, the
+        // older verdict becomes authoritative and readiness presents the lane —
+        // and the whole issue — as ready. Legacy rows written by the earlier
+        // truncating payload path are exactly this shape.
+        //
+        // `unwrap_or_default()` is what made it silent: a malformed payload
+        // parses to `Value::Null`, whose `decision` lookup is indistinguishable
+        // from a well-formed row that simply lacks the key. Both are now
+        // "this lane's newest verdict cannot be read", which fails closed to a
+        // Gate rather than to history.
+        let decision = serde_json::from_str::<serde_json::Value>(&row.payload)
+            .ok()
+            .as_ref()
+            .and_then(|parsed| parsed.get("decision").and_then(|v| v.as_str()).map(str::to_string));
+        match decision {
+            Some(decision) => {
+                out.insert(row.direction_id, decision);
+            }
+            None => {
+                seen_without_verdict.insert(row.direction_id);
+                superseded.insert(row.direction_id);
+            }
         }
     }
     Ok((out, superseded))

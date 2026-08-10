@@ -36,6 +36,15 @@ pub enum LaneAuthorityState {
     /// change can re-adjudicate completed work, and acting on that would start
     /// a second worker on a finished task.
     Finished,
+    /// The worker claimed completion and the lane is waiting on review
+    /// (`readiness::direction_claimed_completion`), with nothing live on it.
+    ///
+    /// Distinct from `ReadyToStart`, which it otherwise looks exactly like — a
+    /// valid checkout and no live session. The difference is that its work is
+    /// DONE pending review, so a Resume card here invites a second worker onto
+    /// finished work. Distinct from `Finished` too: `done` is settled, this is
+    /// still open, so it does not release a consumer waiting on it.
+    AwaitingReview,
     /// Switched OFF by a human (`inactive` / `cancelled`, the statuses
     /// `readiness::direction_is_active` excludes).
     ///
@@ -113,7 +122,11 @@ impl LaneAuthorityState {
     pub fn is_in_play(&self) -> bool {
         !matches!(
             self,
-            Self::NotApplicable | Self::Finished | Self::Deactivated | Self::OutOfScope
+            Self::NotApplicable
+                | Self::Finished
+                | Self::Deactivated
+                | Self::AwaitingReview
+                | Self::OutOfScope
         )
     }
 
@@ -125,6 +138,7 @@ impl LaneAuthorityState {
             Self::NotApplicable => "not_applicable",
             Self::Finished => "finished",
             Self::Deactivated => "deactivated",
+            Self::AwaitingReview => "awaiting_review",
             Self::OutOfScope => "out_of_scope",
             Self::Denied(_) => "denied",
             Self::AwaitingGate(_) => "awaiting_gate",
@@ -146,6 +160,7 @@ impl LaneAuthorityState {
             Self::NotApplicable
             | Self::Finished
             | Self::Deactivated
+            | Self::AwaitingReview
             | Self::OutOfScope
             | Self::BlockedUpstream { .. }
             | Self::Running => None,
@@ -199,10 +214,22 @@ async fn local_state(db: &Db, direction_id: i32) -> Result<LaneAuthorityState> {
         .await?
         .iter()
         .any(|session| matches!(session.status.as_str(), "running" | "idle" | "starting"));
-    match live {
-        true => Ok(LaneAuthorityState::Running),
-        false => Ok(LaneAuthorityState::ReadyToStart(Box::new(verdict))),
+    if live {
+        return Ok(LaneAuthorityState::Running);
     }
+    // Checked HERE, after the liveness test rather than alongside `done` at the
+    // top, so a lane whose worker is still attached keeps reconnecting. Only a
+    // `review` lane with nothing live is the one at issue: it has a valid
+    // checkout and no session, which is indistinguishable from `ReadyToStart`
+    // by those inputs alone — so it drew a stranded-lane Resume card and an
+    // approval could dispatch a SECOND worker onto work that already claimed
+    // completion. `readiness::direction_claimed_completion` has always treated
+    // `review` as complete; this is the same judgement, in the one place lane
+    // state is derived.
+    if crate::readiness::direction_claimed_completion(&dir.status) {
+        return Ok(LaneAuthorityState::AwaitingReview);
+    }
+    Ok(LaneAuthorityState::ReadyToStart(Box::new(verdict)))
 }
 
 /// The full state of one lane, including its prerequisite chain.
@@ -327,6 +354,7 @@ mod tests {
             LaneAuthorityState::NotApplicable,
             LaneAuthorityState::Finished,
             LaneAuthorityState::Deactivated,
+            LaneAuthorityState::AwaitingReview,
             LaneAuthorityState::OutOfScope,
             LaneAuthorityState::Denied(verdict(LaneDecision::Denied)),
             LaneAuthorityState::AwaitingGate(verdict(LaneDecision::NeedsGate)),
@@ -388,6 +416,22 @@ mod tests {
                 assert!(state.offers_decision(), "{} must stay resolvable", state.label());
             }
         }
+    }
+
+    /// A lane awaiting review is not a lane to recover. It looks exactly like
+    /// `ReadyToStart` by checkout and session alone — which is how it drew a
+    /// stranded-lane Resume card whose approval could start a SECOND worker on
+    /// work that already claimed completion.
+    #[test]
+    fn a_lane_awaiting_review_is_not_recoverable_and_not_startable() {
+        let reviewing = LaneAuthorityState::AwaitingReview;
+        assert!(!reviewing.is_dispatchable());
+        assert!(!reviewing.admits_worker());
+        assert!(!reviewing.offers_decision());
+        assert!(reviewing.verdict().is_none());
+        // Not `Finished` either: `done` is settled and releases a consumer,
+        // review is still open and must not.
+        assert!(!matches!(reviewing, LaneAuthorityState::Finished));
     }
 
     /// `is_in_play` is the half a human's own decision cannot change, which is
