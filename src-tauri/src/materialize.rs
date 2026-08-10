@@ -320,8 +320,25 @@ pub async fn materialize_direction(db: &Db, direction_id: i32) -> Result<Materia
                 &git::local_branch_ref(&existing.branch),
             );
         if git::is_registered_worktree(repo_path, wt_path, &existing.branch) && !base_mismatch {
-            // Already materialized and registered — still try deps in case a prior
-            // reclaim left the checkout without node_modules. No-op when ready.
+            // Already materialized and registered. The EXISTING checkout is left
+            // alone whatever the policy now says — tearing down a tree a worker
+            // may be mid-flight in is not what "停止新的写入" asks for. But this
+            // return is also the confirmed fast path's re-dispatch answer, and
+            // `bootstrap_worktree_deps` below writes into the checkout (a deps
+            // install), so a lane the policy has since gated or denied must not
+            // reach either. Adjudicating here stops the NEW work without
+            // touching the old: a refusal returns no worktrees, so the caller
+            // does not re-dispatch, and nothing is deleted.
+            let verdict =
+                authorize_materialize(db, &dir, &repo_ref, thread.workspace_id, &effective_base_branch(&repo_ref, &dir))
+                    .await?;
+            match verdict.decision {
+                authority::LaneDecision::AllowedByPolicy => {}
+                authority::LaneDecision::NeedsGate => return Ok(MaterializeOutcome::Gated(verdict)),
+                authority::LaneDecision::Denied => return Ok(MaterializeOutcome::Denied(verdict)),
+            }
+            // Still try deps in case a prior reclaim left the checkout without
+            // node_modules. No-op when ready.
             bootstrap_worktree_deps(&existing.path).await;
             return Ok(MaterializeOutcome::Ready(vec![existing]));
         }
@@ -504,6 +521,22 @@ pub async fn materialize_direction(db: &Db, direction_id: i32) -> Result<Materia
         authority::LaneDecision::AllowedByPolicy => {}
         authority::LaneDecision::NeedsGate => return Ok(MaterializeOutcome::Gated(verdict)),
         authority::LaneDecision::Denied => return Ok(MaterializeOutcome::Denied(verdict)),
+    }
+    // Write admission re-check (issue #172): `set_authority_policy` shares no
+    // transaction or lock with this path, so a tighten/revoke can land between
+    // the verdict above and the writes below. Re-reading the active revision
+    // immediately before the first write and bailing on a change narrows that
+    // window to the read itself instead of spanning the whole git operation. It
+    // does not eliminate it — a policy landing inside this last gap still wins
+    // the race — but closing it fully needs a shared per-workspace lock across
+    // policy mutation and materialization, which is a bigger change than this
+    // PR should carry.
+    let admission_revision = repo::get_active_authority_policy(db, "workspace", thread.workspace_id)
+        .await?
+        .map(|row| row.revision)
+        .unwrap_or_else(|| "0".to_string());
+    if admission_revision != verdict.policy_revision {
+        return Ok(MaterializeOutcome::Gated(verdict));
     }
     let path = worktree_path(repo_path, &dir.branch);
     git::git_exclude(repo_path, ".worktrees/");
