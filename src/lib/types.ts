@@ -384,7 +384,13 @@ export interface AuthorityPolicyRules {
   deny_actions: string[];
 }
 
-/** One AuthorityPolicy revision — mirrors Rust `commands::AuthorityPolicyDto`. */
+/** One AuthorityPolicy revision — mirrors Rust `commands::AuthorityPolicyDto`.
+ *
+ *  From `getAuthorityPolicy`, `revoked_at` is the discriminant between the two
+ *  states a non-null answer can mean: EMPTY = this policy is active; NON-EMPTY =
+ *  it was revoked and the workspace now Gates every lane. A `null` answer means
+ *  never configured, where the conservative default applies and the feature is
+ *  inert. Do not read "not active" as "no policy in force". */
 export interface AuthorityPolicyRevision {
   id: number;
   scope: string;

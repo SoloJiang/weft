@@ -174,7 +174,11 @@ impl LaneAuthorityState {
 /// without recursing: an ancestor's LOCAL state is all a consumer needs, and
 /// the walk covers the chain. That also makes a cyclic edge set terminate by
 /// construction rather than by a depth guard.
-async fn local_state(db: &Db, direction_id: i32) -> Result<LaneAuthorityState> {
+async fn local_state(
+    db: &Db,
+    direction_id: i32,
+    scopes: &mut ScopeCache,
+) -> Result<LaneAuthorityState> {
     let Some(dir) = crate::store::repo::get_direction(db, direction_id).await? else {
         return Ok(LaneAuthorityState::NotApplicable);
     };
@@ -187,7 +191,7 @@ async fn local_state(db: &Db, direction_id: i32) -> Result<LaneAuthorityState> {
     if !crate::readiness::direction_is_active(&dir) {
         return Ok(LaneAuthorityState::Deactivated);
     }
-    if !lane_is_in_current_scope(db, dir.thread_id, direction_id).await? {
+    if !scopes.admits(db, dir.thread_id, direction_id).await? {
         return Ok(LaneAuthorityState::OutOfScope);
     }
     // Judged FRESH every time rather than read from the newest evidence row and
@@ -234,7 +238,35 @@ async fn local_state(db: &Db, direction_id: i32) -> Result<LaneAuthorityState> {
 
 /// The full state of one lane, including its prerequisite chain.
 pub async fn lane_authority_state(db: &Db, direction_id: i32) -> Result<LaneAuthorityState> {
-    let own = local_state(db, direction_id).await?;
+    let mut scopes = ScopeCache::default();
+    lane_authority_state_cached(db, direction_id, &mut scopes).await
+}
+
+/// Resolve MANY lanes sharing one scope read.
+///
+/// `list_lane_gates` resolves every direction on a thread; resolving them one
+/// at a time re-read and re-parsed the thread's whole plan history per lane,
+/// which is quadratic in (directions x revisions) on the path that paints the
+/// board. Same answers, one scope load per thread.
+pub async fn lane_authority_states(
+    db: &Db,
+    direction_ids: &[i32],
+) -> Result<Vec<(i32, LaneAuthorityState)>> {
+    let mut scopes = ScopeCache::default();
+    let mut out = Vec::with_capacity(direction_ids.len());
+    for &direction_id in direction_ids {
+        let state = lane_authority_state_cached(db, direction_id, &mut scopes).await?;
+        out.push((direction_id, state));
+    }
+    Ok(out)
+}
+
+async fn lane_authority_state_cached(
+    db: &Db,
+    direction_id: i32,
+    scopes: &mut ScopeCache,
+) -> Result<LaneAuthorityState> {
+    let own = local_state(db, direction_id, scopes).await?;
     // Only a lane that is otherwise ready can be held back by a producer.
     // A gated, denied, finished or out-of-scope lane already has its answer.
     if !matches!(
@@ -253,7 +285,7 @@ pub async fn lane_authority_state(db: &Db, direction_id: i32) -> Result<LaneAuth
             if !seen.insert(upstream) {
                 continue;
             }
-            let state = local_state(db, upstream).await?;
+            let state = local_state(db, upstream, scopes).await?;
             // A producer is satisfactory only once it is FINISHED or RUNNING.
             // Anything else blocks: gated and denied obviously, but also
             // `ReadyToStart` — a producer that has not run yet is exactly the
@@ -274,60 +306,104 @@ pub async fn lane_authority_state(db: &Db, direction_id: i32) -> Result<LaneAuth
     Ok(own)
 }
 
-/// Whether this lane still belongs to the thread's CURRENT reviewed scope.
+/// One thread's reviewed scope, read ONCE.
 ///
-/// A lane the planner owns but the current proposal no longer names is
-/// obsolete. A standalone lane (`create_direction`, never referenced by any
-/// plan revision) is always in scope. An unparseable stored plan is an ERROR,
-/// never "no plan": reading it as absent switches the check off, which is the
-/// permissive direction.
-async fn lane_is_in_current_scope(db: &Db, thread_id: i32, direction_id: i32) -> Result<bool> {
-    let Some(plan) = crate::store::repo::get_plan(db, thread_id).await? else {
-        return Ok(true);
-    };
-    let parsed: serde_json::Value = serde_json::from_str(&plan.proposal)
-        .map_err(|error| anyhow::anyhow!("stored proposal is unreadable: {error}"))?;
-    let current_lanes = parsed
-        .get("directions")
-        .and_then(|dirs| dirs.as_array())
-        .ok_or_else(|| anyhow::anyhow!("stored proposal has no directions array"))?;
-    let in_scope = current_lanes
-        .iter()
-        .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
-        .any(|id| id as i32 == direction_id);
-    if in_scope {
-        return Ok(true);
+/// `list_lane_gates` resolves every direction on a thread, and each resolve used
+/// to re-query and re-parse the thread's entire plan history — quadratic in
+/// (directions x revisions), both of which grow with every re-proposal, on the
+/// path that paints the board. The answer is identical for every lane on the
+/// thread, so it is computed once and consulted per lane.
+struct ThreadScope {
+    /// `None` when the thread has no stored plan at all: nothing to filter
+    /// against, so every lane is in scope.
+    current: Option<std::collections::HashSet<i32>>,
+    /// Every direction id any plan revision has ever named.
+    planner_owned: std::collections::HashSet<i32>,
+}
+
+impl ThreadScope {
+    /// An unreadable plan is an ERROR, never "no plan": reading it as absent
+    /// switches the check off, which is the permissive direction.
+    ///
+    /// That applies to HISTORICAL revisions too. Skipping one (`.ok()`) answers
+    /// "this revision named no lanes", which can only push `planner_owned`
+    /// toward false — and false means standalone, which switches the check off
+    /// for exactly the obsolete cards it exists to catch. Every revision is
+    /// parsed, unpaged: a page bound would reclassify a lane referenced only by
+    /// an older proposal as standalone, and short-circuiting on the first hit
+    /// would make whether a corrupt row is reached depend on iteration order.
+    async fn load(db: &Db, thread_id: i32) -> Result<Self> {
+        let current = match crate::store::repo::get_plan(db, thread_id).await? {
+            None => None,
+            Some(plan) => {
+                let parsed: serde_json::Value = serde_json::from_str(&plan.proposal)
+                    .map_err(|error| anyhow::anyhow!("stored proposal is unreadable: {error}"))?;
+                Some(direction_ids_in(&parsed).ok_or_else(|| {
+                    anyhow::anyhow!("stored proposal has no directions array")
+                })?)
+            }
+        };
+        let mut planner_owned = std::collections::HashSet::new();
+        for proposal in crate::store::repo::all_plan_revision_proposals(db, thread_id).await? {
+            let value: serde_json::Value = serde_json::from_str(&proposal).map_err(|error| {
+                anyhow::anyhow!("a stored scope revision is unreadable: {error}")
+            })?;
+            let ids = direction_ids_in(&value).ok_or_else(|| {
+                anyhow::anyhow!("a stored scope revision has no directions array")
+            })?;
+            planner_owned.extend(ids);
+        }
+        Ok(Self { current, planner_owned })
     }
-    // Every revision, unpaged: a page bound reclassifies a lane referenced only
-    // by an older proposal as standalone, switching the check off for exactly
-    // the obsolete cards it exists to catch.
-    //
-    // An unreadable HISTORICAL revision is an error for the same reason an
-    // unreadable current plan is. Skipping it (`.ok()`) answers "this revision
-    // named no lanes", which can only ever push `planner_owned` toward false —
-    // and false means standalone, which switches the scope check off. A lane
-    // dropped from the current plan would then keep an approvable card outside
-    // the reviewed scope, which is exactly what this function exists to prevent.
-    // One rule for the whole module: an unreadable plan is never "no plan".
-    // Every revision is parsed before any is consulted, rather than stopping at
-    // the first hit: short-circuiting would make whether a malformed revision is
-    // reached depend on iteration order, so the same corrupt row would surface
-    // for one lane and not another.
-    let mut planner_owned = false;
-    for proposal in crate::store::repo::all_plan_revision_proposals(db, thread_id).await? {
-        let value: serde_json::Value = serde_json::from_str(&proposal)
-            .map_err(|error| anyhow::anyhow!("a stored scope revision is unreadable: {error}"))?;
-        let lanes = value
-            .get("directions")
-            .and_then(|dirs| dirs.as_array())
-            .ok_or_else(|| anyhow::anyhow!("a stored scope revision has no directions array"))?;
-        planner_owned |= lanes
+
+    /// Whether this lane still belongs to the thread's CURRENT reviewed scope.
+    ///
+    /// A lane the planner owns but the current proposal no longer names is
+    /// obsolete. A standalone lane (`create_direction`, never referenced by any
+    /// plan revision) is always in scope.
+    fn admits(&self, direction_id: i32) -> bool {
+        let Some(current) = &self.current else {
+            return true;
+        };
+        current.contains(&direction_id) || !self.planner_owned.contains(&direction_id)
+    }
+}
+
+fn direction_ids_in(proposal: &serde_json::Value) -> Option<std::collections::HashSet<i32>> {
+    Some(
+        proposal
+            .get("directions")?
+            .as_array()?
             .iter()
             .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
-            .any(|id| id as i32 == direction_id);
-    }
-    Ok(!planner_owned)
+            .map(|id| id as i32)
+            .collect(),
+    )
 }
+
+/// Thread scopes loaded so far in one resolution.
+///
+/// Keyed by thread rather than held as a single snapshot because the upstream
+/// walk can cross threads, and answering a lane against another thread's scope
+/// would be a correctness bug, not just a miss.
+#[derive(Default)]
+pub struct ScopeCache {
+    by_thread: std::collections::HashMap<i32, ThreadScope>,
+}
+
+impl ScopeCache {
+    async fn admits(&mut self, db: &Db, thread_id: i32, direction_id: i32) -> Result<bool> {
+        if !self.by_thread.contains_key(&thread_id) {
+            let scope = ThreadScope::load(db, thread_id).await?;
+            self.by_thread.insert(thread_id, scope);
+        }
+        Ok(self
+            .by_thread
+            .get(&thread_id)
+            .is_some_and(|scope| scope.admits(direction_id)))
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

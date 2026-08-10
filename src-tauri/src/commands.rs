@@ -3026,15 +3026,37 @@ fn authority_policy_dto(row: crate::store::entities::authority_policy::Model) ->
     }
 }
 
-/// The active AuthorityPolicy for a workspace, or `None` when no policy has
-/// ever been configured (the hard-coded conservative default is in effect —
-/// see `authority::default_policy`).
+/// The AuthorityPolicy in force for a workspace, in the same THREE states
+/// enforcement distinguishes (`store::repo::resolve_policy_snapshot`):
+///
+/// - `None` — never configured. The hard-coded conservative default applies and
+///   the feature is inert (see `authority::default_policy`).
+/// - `Some(dto)` with an EMPTY `revoked_at` — this policy is active.
+/// - `Some(dto)` with a NON-EMPTY `revoked_at` — this policy was revoked, and
+///   the scope now Gates every lane (see `authority::revoked_policy`).
+///
+/// The revoked row is returned rather than `None` because those two states are
+/// materially different and used to be indistinguishable here: this endpoint
+/// reported "no policy, default in effect" while the backend was gating every
+/// lane in the workspace. `revoked_at` is already on the DTO, so the caller has
+/// the discriminant without a second shape to keep in sync.
 #[tauri::command]
 pub async fn get_authority_policy(db: State<'_, Db>, workspace_id: i32) -> R<Option<AuthorityPolicyDto>> {
-    crate::store::repo::get_active_authority_policy(&db, "workspace", workspace_id)
+    if let Some(active) =
+        crate::store::repo::get_active_authority_policy(&db, "workspace", workspace_id)
+            .await
+            .map_err(e)?
+    {
+        return Ok(Some(authority_policy_dto(active)));
+    }
+    // Newest-first, so this is the revision that was revoked — or nothing at
+    // all, which is the never-configured case.
+    Ok(crate::store::repo::list_authority_policy_revisions(&db, "workspace", workspace_id)
         .await
-        .map(|row| row.map(authority_policy_dto))
-        .map_err(e)
+        .map_err(e)?
+        .into_iter()
+        .next()
+        .map(authority_policy_dto))
 }
 
 /// Newest-first full revision history for a workspace's AuthorityPolicy —
@@ -3311,6 +3333,14 @@ async fn list_lane_gates_impl(db: &Db, thread_id: i32) -> R<Vec<LaneGateDto>> {
     use crate::lane_state::LaneAuthorityState;
 
     let directions = crate::store::repo::list_directions(db, thread_id).await.map_err(e)?;
+    // ONE scope read for the whole thread. Resolving lane by lane re-queried and
+    // re-parsed every stored plan revision per direction — quadratic in
+    // (directions x revisions), both of which grow with each re-proposal, on the
+    // path that paints the board.
+    let lane_ids: Vec<i32> = directions.iter().map(|dir| dir.id).collect();
+    let resolved = crate::lane_state::lane_authority_states(db, &lane_ids).await.map_err(e)?;
+    let mut states: std::collections::HashMap<i32, crate::lane_state::LaneAuthorityState> =
+        resolved.into_iter().collect();
     let mut out = Vec::new();
     for dir in directions {
         // ONE resolved state per lane, mapped exhaustively. Every predicate this
@@ -3318,9 +3348,9 @@ async fn list_lane_gates_impl(db: &Db, thread_id: i32) -> R<Vec<LaneGateDto>> {
         // checkout validity, session liveness, upstream blockers, terminal
         // lifecycle — now lives in `lane_state` and is the same answer every
         // other surface sees.
-        let state = crate::lane_state::lane_authority_state(db, dir.id)
-            .await
-            .map_err(e)?;
+        let Some(state) = states.remove(&dir.id) else {
+            continue;
+        };
         let (verdict, reason) = match &state {
             // A rule flagged it: the ordinary approve/deny card.
             LaneAuthorityState::AwaitingGate(verdict) => {

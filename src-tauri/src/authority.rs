@@ -350,24 +350,47 @@ fn matches_branch(list: &[String], name: &str) -> bool {
     list.iter().any(|entry| bare_branch_name(entry).eq_ignore_ascii_case(name))
 }
 
-/// A base/ref name is well-formed enough to branch off — a defensive
-/// syntactic check, NOT a git-protocol validator (git itself is the final
-/// authority at `git worktree add` time). Blank is always valid (repo
-/// default). Rejects shapes that are never a real ref name: leading `-`
-/// (could be parsed as a flag by a naive shell-out), any control/whitespace
-/// character, and the `..` two-dot sequence (git's own range/parent syntax,
-/// never valid inside a single ref path component).
+/// A base/ref name is a plain BRANCH NAME, not a git revision expression.
+///
+/// This is a permission boundary, not merely hygiene. `protected_branches` is
+/// matched by NAME (`bare_branch_name` collapses `origin/` and `refs/…`
+/// spellings), while git resolves a revision EXPRESSION to a commit — so an
+/// untrusted proposal naming `main~0`, `main^0` or `main@{0}` used to pass this
+/// check, miss a `protected_branches: ["main"]` rule because the literals
+/// differ, and materialize onto the protected branch's own commit with no Gate.
+/// Resolving the expression here is not an option: `adjudicate_lane` is pure by
+/// design and reaches neither git nor the store. Refusing the expression is,
+/// and it fails CLOSED — a rejected base is `Denied(InvalidBase)`, never a
+/// silent allow.
+///
+/// So the accepted shape is git's own `check-ref-format` for a branch name,
+/// which excludes exactly the revision-expression metacharacters: `~` and `^`
+/// (ancestry), `:` (path/range), `@{` (reflog), plus `?`, `*`, `[`, `\` and the
+/// control/whitespace and `..` cases this already refused. Blank stays valid
+/// (the repo default). `/` stays valid, so `origin/main` and `refs/heads/main`
+/// still work, as does a raw commit SHA.
 pub fn looks_like_valid_ref(base_branch: &str) -> bool {
     if base_branch.is_empty() {
         return true;
     }
-    if base_branch.starts_with('-') {
+    if base_branch.starts_with('-') || base_branch.starts_with('/') {
         return false;
     }
-    if base_branch.contains("..") {
+    if base_branch.ends_with('/') || base_branch.ends_with('.') || base_branch.ends_with(".lock") {
         return false;
     }
-    !base_branch.chars().any(|c| c.is_whitespace() || c.is_control())
+    if base_branch.contains("..") || base_branch.contains("//") || base_branch.contains("@{") {
+        return false;
+    }
+    // A lone `@` is not a ref name in git either.
+    if base_branch == "@" {
+        return false;
+    }
+    !base_branch.chars().any(|c| {
+        c.is_whitespace()
+            || c.is_control()
+            || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+    })
 }
 
 /// The single AuthorityPolicy judgment for one candidate Lane (issue #172).
@@ -793,6 +816,50 @@ mod tests {
         assert!(!looks_like_valid_ref("a..b"));
         assert!(!looks_like_valid_ref("a b"));
         assert!(!looks_like_valid_ref("a\nb"));
+        // Spellings git resolves to the SAME commit as `main`. Accepting these
+        // let a lane dodge `protected_branches: ["main"]`, which is matched by
+        // name and cannot see through a revision expression.
+        for dodge in [
+            "main~0", "main^0", "main^", "main~1", "main@{0}", "main^{}", "main^{commit}",
+            "HEAD^", "main:path", "ma?in", "ma*in", "ma[in", "ma\\in", "@",
+        ] {
+            assert!(!looks_like_valid_ref(dodge), "{dodge:?} must not pass as a branch name");
+        }
+        // …while ordinary branch spellings and a raw SHA still do.
+        assert!(looks_like_valid_ref("origin/main"));
+        assert!(looks_like_valid_ref("refs/heads/main"));
+        assert!(looks_like_valid_ref("release/2.0"));
+        assert!(looks_like_valid_ref("9fddf70ced1a2b3c4d5e6f70819a2b3c4d5e6f70"));
+        assert!(!looks_like_valid_ref("main.lock"));
+        assert!(!looks_like_valid_ref("main/"));
+        assert!(!looks_like_valid_ref("/main"));
+    }
+
+    /// The bypass end-to-end: a protected `main` must still Gate a lane whose
+    /// base is a revision expression pointing at it.
+    #[test]
+    fn a_revision_expression_cannot_dodge_a_protected_branch() {
+        let mut policy = default_policy(PolicyScope::Workspace(1));
+        policy.rules.protected_branches = vec!["main".to_string()];
+        for base in ["main", "origin/main", "refs/heads/main", "main~0", "main^0"] {
+            let lane = LaneCandidate {
+                lane_id: "l1",
+                repo_known: true,
+                repo_name: "repo",
+                reason: "why",
+                base_branch: base,
+                human_authorized: true,
+                human_denied: false,
+                duplicate_lane_id: false,
+                gate_override: None,
+            };
+            let verdict = adjudicate_lane(&policy, "1", &lane);
+            assert_ne!(
+                verdict.decision,
+                LaneDecision::AllowedByPolicy,
+                "{base:?} must not materialize without a Gate, got {verdict:?}"
+            );
+        }
     }
 
     #[test]
