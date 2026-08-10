@@ -8954,6 +8954,37 @@ pub async fn append_evidence(db: &Db, write: EvidenceWrite<'_>) -> Result<eviden
 /// Tolerates a `direction_id` that no longer names a live Lane (deleted
 /// direction): evidence survives Lane removal by design, so this never joins
 /// against `direction` and can never fail on a dangling reference.
+/// The NEWEST `decision` verdict per lane for one issue, as the raw
+/// `payload["decision"]` string (issue #172: `allowed_by_policy` | `needs_gate`
+/// | `denied`). Lanes with no decision row are absent from the map.
+///
+/// One query for the whole issue: readiness renders every lane of an issue at
+/// once, and asking per lane would be an N+1 on a path that already runs on a
+/// poll. Rows arrive newest-first, so the FIRST row seen for a direction is its
+/// current verdict and later (older) rows are skipped.
+pub async fn latest_lane_decisions(db: &Db, thread_id: i32) -> Result<HashMap<i32, String>> {
+    let rows = evidence::Entity::find()
+        .filter(evidence::Column::ThreadId.eq(thread_id))
+        .filter(evidence::Column::Kind.eq(EVIDENCE_KIND_DECISION))
+        .order_by_desc(evidence::Column::Id)
+        .all(&db.0)
+        .await?;
+    let mut out: HashMap<i32, String> = HashMap::new();
+    for row in rows {
+        if row.direction_id == 0 || out.contains_key(&row.direction_id) {
+            continue;
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&row.payload).unwrap_or_default();
+        // A row whose payload carries no `decision` key is not a verdict this
+        // map can speak for — skip it rather than inventing one, and let the
+        // next (older) row for the lane answer.
+        if let Some(decision) = parsed.get("decision").and_then(|v| v.as_str()) {
+            out.insert(row.direction_id, decision.to_string());
+        }
+    }
+    Ok(out)
+}
+
 pub async fn list_evidence(
     db: &Db,
     thread_id: i32,

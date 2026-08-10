@@ -871,6 +871,33 @@ fn proposal_lane_policy(
     }
 }
 
+/// The policy a lane is ACTUALLY under: the proposal-shape reading tightened by
+/// the verdict `authority::adjudicate_lane` last recorded for it.
+///
+/// The shape alone cannot see a policy decision at all — a confirmed lane with
+/// no per-lane decision reads `AllowedByPolicy` purely because it is confirmed
+/// and has a direction id. That was true before issue #172, when confirm could
+/// not produce anything else; now a lane can be confirmed and still be gated or
+/// denied, and reporting it as allowed hides the only signal that its worktree
+/// was never created. Combining through `stricter_materialized_policy` means
+/// the recorded verdict can only ever TIGHTEN what the shape claims.
+fn effective_lane_policy(
+    phase: ProposalPolicyPhase,
+    proposed_lane: &crate::planner::ProposedDirection,
+    recorded: &HashMap<i32, String>,
+) -> PolicyDecision {
+    let shape = proposal_lane_policy(phase, proposed_lane);
+    let Some(verdict) = recorded.get(&proposed_lane.direction_id) else {
+        return shape;
+    };
+    let recorded_decision = match verdict.as_str() {
+        "needs_gate" => PolicyDecision::NeedsGate,
+        "denied" => PolicyDecision::Denied,
+        _ => PolicyDecision::AllowedByPolicy,
+    };
+    stricter_materialized_policy(shape, recorded_decision)
+}
+
 fn stricter_materialized_policy(
     current: PolicyDecision,
     candidate: PolicyDecision,
@@ -3594,12 +3621,18 @@ pub async fn collect_with_check_execution(
                 .iter()
                 .filter_map(|lane| (lane.direction_id != 0).then_some(lane.direction_id))
                 .collect();
+            // Issue #172: the verdict actually recorded for each lane, so a
+            // confirmed-but-gated (or denied) lane is not reported as allowed
+            // just because the proposal shape says confirmed. Best-effort — a
+            // read failure leaves the pre-#172 shape-only reading.
+            let recorded_lane_decisions =
+                repo::latest_lane_decisions(db, thread_id).await.unwrap_or_default();
             let mut materialized_policies = HashMap::new();
             for proposed_lane in &proposal_lanes {
                 if proposed_lane.direction_id == 0 {
                     continue;
                 }
-                let policy = proposal_lane_policy(phase, proposed_lane);
+                let policy = effective_lane_policy(phase, proposed_lane, &recorded_lane_decisions);
                 materialized_policies
                     .entry(proposed_lane.direction_id)
                     .and_modify(|current| {
@@ -3614,7 +3647,7 @@ pub async fn collect_with_check_execution(
             let mut handled_direction_ids = HashSet::new();
 
             for proposed_lane in proposal_lanes {
-                let policy = proposal_lane_policy(phase, &proposed_lane);
+                let policy = effective_lane_policy(phase, &proposed_lane, &recorded_lane_decisions);
                 if proposed_lane.direction_id == 0 {
                     if policy == PolicyDecision::Denied {
                         continue;
