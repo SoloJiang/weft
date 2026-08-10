@@ -14,6 +14,7 @@ import { Button } from "../components/ui/Button";
  *  generic "awaiting_gate_decision" copy rather than showing nothing. */
 type GateReasonKey =
   | "protected_branch"
+  | "unresolvable_base"
   | "unreadable_policy"
   | "awaiting_gate_decision"
   | "gate_approved_override"
@@ -42,6 +43,7 @@ function resolveFailure(error: unknown): "stale" | "obsolete" | "retry" {
 function gateReasonKey(reason: string): GateReasonKey {
   switch (reason) {
     case "protected_branch":
+    case "unresolvable_base":
     case "unreadable_policy":
     case "revoked_policy":
     case "gate_approved_override":

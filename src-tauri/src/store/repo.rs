@@ -9320,11 +9320,16 @@ pub async fn latest_lane_decisions(
         // planner `denied` still lands as `Denied` — which is right, since a
         // human denial is not something a policy revision should expire.
         let carries_authority_revision = row.source == EVIDENCE_SOURCE_AUTHORITY;
+        // No `is_empty()` exemption for an authority row. `authorize_materialize`
+        // always stamps the verdict's revision, and a verdict always has one —
+        // `"0"` for the default, `"N:revoked"` for a revoked scope — so an EMPTY
+        // one means the row cannot be placed in the revision order at all.
+        // Skipping the comparison for it accepted its payload as current, and a
+        // stale `allowed_by_policy` written that way kept a lane green under a
+        // policy that had since tightened. An unplaceable row is exactly what
+        // `superseded` means, and the mismatch below produces that for free.
         if let Some(active) = active_revision.as_deref() {
-            if carries_authority_revision
-                && !row.policy_revision.is_empty()
-                && row.policy_revision != active
-            {
+            if carries_authority_revision && row.policy_revision != active {
                 // The NEWEST decision for this lane was computed under a
                 // superseded revision, so the lane is undecided under the
                 // policy now in force. Mark it settled rather than continuing:
@@ -18687,6 +18692,56 @@ mod tests {
         assert!(
             untouched.revoked_at.is_empty(),
             "the wrong row must not have been stamped"
+        );
+    }
+
+    /// An `authority` row with an EMPTY `policy_revision` cannot be placed in
+    /// the revision order, and skipping the comparison for it accepted its
+    /// payload as current. A stale `allowed_by_policy` written that way kept a
+    /// lane green under a policy that had since tightened.
+    ///
+    /// `authorize_materialize` always stamps the verdict's revision and a
+    /// verdict always has one, so an empty value means the row is unreadable
+    /// rather than revision-independent.
+    #[tokio::test]
+    async fn an_authority_row_with_no_revision_is_superseded_not_timeless() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let r = add_repo_ref(&db, ws.id, "svc", "/tmp/svc-no-rev", "main", "", true).await.unwrap();
+        let t = create_thread(&db, ws.id, "t", "issue", "claude").await.unwrap();
+        let lane = create_direction(&db, t.id, "lane", "claude", r.id, "r", "plan+impl", "")
+            .await
+            .unwrap();
+
+        let rules = serde_json::to_string(&crate::authority::PolicyRules::default()).unwrap();
+        create_authority_policy(&db, "workspace", ws.id, &rules, "user").await.unwrap();
+
+        append_evidence(
+            &db,
+            EvidenceWrite {
+                thread_id: t.id,
+                direction_id: lane.id,
+                kind: EVIDENCE_KIND_DECISION,
+                source: EVIDENCE_SOURCE_AUTHORITY,
+                source_ref: "materialize_direction:1",
+                revision: "",
+                policy_revision: "",
+                summary: "lane decision: allowed_by_policy",
+                payload: r#"{"decision":"allowed_by_policy"}"#,
+                collection_state: EVIDENCE_COLLECTION_OK,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (decisions, superseded) = latest_lane_decisions(&db, t.id).await.unwrap();
+        assert!(
+            superseded.contains(&lane.id),
+            "a row that cannot be placed in the revision order is not a current verdict"
+        );
+        assert!(
+            !decisions.contains_key(&lane.id),
+            "and it must not answer for its lane"
         );
     }
 

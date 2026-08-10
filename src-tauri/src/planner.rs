@@ -1748,8 +1748,22 @@ async fn confirm_with_manual_tool_with_session_liveness(
         // human has a Gate to resolve, and neither is dispatched.
         match &outcome {
             materialize::MaterializeOutcome::Denied(verdict) => {
-                let _ = repo::delete_direction(db, dir.id).await;
+                // NOT best-effort, for the same reason as `create_direction`'s
+                // denied-lane cleanup. This row is never recorded on the
+                // proposal, so a surviving one is absent from planner scope
+                // history and reads as standalone — durably `Denied`, hence no
+                // worktree, no worker and no Gate action, with every retry
+                // adding another. Reporting only the denial would hide that the
+                // teardown is the part that failed, which is the part worth
+                // retrying.
+                let cleanup = repo::delete_direction(db, dir.id).await;
                 rollback_attempt(db, &created_now, &recreated_reused).await;
+                if let Err(error) = cleanup {
+                    anyhow::bail!(
+                        "lane_denied_by_policy_cleanup_failed:{:?}:{error}",
+                        verdict.reason
+                    );
+                }
                 anyhow::bail!("lane_denied_by_policy:{:?}", verdict.reason);
             }
             materialize::MaterializeOutcome::Gated(_) => {
