@@ -2577,6 +2577,27 @@ pub async fn get_active_authority_policy(
 /// configuration", not "retire one row while an earlier one keeps governing".
 /// A revoked scope adjudicates every Lane to a human Gate instead.
 pub async fn revoke_authority_policy(db: &Db, scope: &str, scope_id: i32) -> Result<()> {
+    // "Which row is active" is decided by ranking revisions, and a revision
+    // that will not parse ranks as zero — so a malformed NEWEST row loses to an
+    // older numeric one and the revoke would stamp `revoked_at` on the wrong
+    // row while reporting success. The scope would stay exactly as it was, with
+    // `resolve_policy_snapshot` still reading the malformed row as unreadable
+    // and still gating every lane, and the human told their revoke landed.
+    //
+    // `resolve_policy_snapshot` already refuses to rank what cannot be ordered;
+    // this is the MUTATION side of the same rule, which had been bypassing it.
+    // Failing is the honest answer: a revoke that cannot identify its target
+    // has not happened, and saying so is what lets it be fixed.
+    if list_authority_policy_revisions(db, scope, scope_id)
+        .await?
+        .iter()
+        .any(|row| row.revision.parse::<i64>().is_err())
+    {
+        anyhow::bail!(
+            "cannot revoke {scope} {scope_id}: its policy history has a revision that cannot be \
+             ordered, so the row to revoke cannot be identified"
+        );
+    }
     let Some(active) = get_active_authority_policy(db, scope, scope_id).await? else {
         return Ok(());
     };
@@ -18563,6 +18584,53 @@ mod tests {
         assert!(
             err.to_string().contains("approved") || err.to_string().contains("denied"),
             "an unrecognized decision value must be rejected outright: {err}"
+        );
+    }
+
+    /// "Which row is active" is decided by ranking revisions, and one that will
+    /// not parse ranks as zero — so a malformed NEWEST row loses to an older
+    /// numeric one. Revoking would then stamp the wrong row and report success,
+    /// leaving the scope exactly as it was: still unreadable, still gating every
+    /// lane, with the human told their revoke landed.
+    #[tokio::test]
+    async fn revoking_a_scope_whose_history_cannot_be_ordered_fails_instead_of_guessing() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let rules = serde_json::to_string(&crate::authority::PolicyRules::default()).unwrap();
+        let ordered = create_authority_policy(&db, "workspace", ws.id, &rules, "user")
+            .await
+            .unwrap();
+
+        // A newer row whose revision cannot be ordered — the shape
+        // `resolve_policy_snapshot` already refuses to rank.
+        let malformed = authority_policy::ActiveModel {
+            scope: Set("workspace".to_string()),
+            scope_id: Set(ws.id),
+            revision: Set("not-a-number".to_string()),
+            rules: Set(rules.clone()),
+            source: Set("user".to_string()),
+            created_at: Set(now()),
+            revoked_at: Set(String::new()),
+            ..Default::default()
+        };
+        malformed.insert(&db.0).await.unwrap();
+
+        let refused = revoke_authority_policy(&db, "workspace", ws.id).await;
+        assert!(
+            refused.is_err(),
+            "a revoke that cannot identify its target has not happened, and must say so"
+        );
+
+        // …and it left the orderable row alone rather than revoking it blindly.
+        let untouched = list_authority_policy_revisions(&db, "workspace", ws.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.revision == ordered.revision)
+            .expect("the numeric row is still there");
+        assert!(
+            untouched.revoked_at.is_empty(),
+            "the wrong row must not have been stamped"
         );
     }
 
