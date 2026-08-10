@@ -177,8 +177,37 @@ pub(crate) fn effective_base_branch(
         return explicit.to_string();
     }
     let repo_path = std::path::Path::new(&repo_ref.local_git_path);
-    git::live_default_branch(repo_path)
-        .unwrap_or_else(|| git::recorded_base_or_default(repo_path, &repo_ref.base_ref, repo_ref.base_ref_is_default))
+    if let Some(live) = git::live_default_branch(repo_path) {
+        return live;
+    }
+    git::recorded_base_or_default(repo_path, &repo_ref.base_ref, repo_ref.base_ref_is_default)
+}
+
+/// Whether the base a lane would materialize from is a branch that actually
+/// EXISTS, as opposed to a name the default chain invented.
+///
+/// The chain's last resort is the literal string `"main"` whether or not the
+/// repository has one, and `add_worktree_synced` — handed that same value —
+/// tries it, misses, and falls through its own chain to `HEAD`. So a detached
+/// checkout with no `origin/HEAD`, no `main`/`master` and no usable recorded
+/// base was judged as `main`, matched no `protected_branches` rule, and was
+/// then created from whatever `HEAD` pointed at, which can be the tip of
+/// exactly the branch such a rule protects.
+///
+/// A lane with an EXPLICIT base is not this case: `add_worktree_synced` still
+/// resolves it, but the user named a branch and that name is what a by-name
+/// rule is written against.
+fn base_branch_is_named(repo_ref: &entities::repo_ref::Model, dir: &entities::direction::Model) -> bool {
+    if !dir.base_branch.trim().is_empty() {
+        return true;
+    }
+    let repo_path = std::path::Path::new(&repo_ref.local_git_path);
+    if git::live_default_branch(repo_path).is_some() {
+        return true;
+    }
+    let named =
+        git::recorded_base_or_default(repo_path, &repo_ref.base_ref, repo_ref.base_ref_is_default);
+    git::resolved_base_branch_name(repo_path, &named).is_some()
 }
 
 /// Judge a lane at the CURRENT policy without recording anything.
@@ -292,6 +321,7 @@ async fn judge_materialize(
         repo_name: &repo_ref.name,
         reason: &dir.reason,
         base_branch: effective_base,
+        base_is_named: base_branch_is_named(repo_ref, dir),
         human_authorized: true,
         human_denied: false,
         duplicate_lane_id: false,

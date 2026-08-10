@@ -246,6 +246,19 @@ pub struct LaneCandidate<'a> {
     pub repo_name: &'a str,
     pub reason: &'a str,
     pub base_branch: &'a str,
+    /// Whether `base_branch` is a branch that actually EXISTS, as opposed to a
+    /// name the caller's default chain invented for a repository that has none.
+    ///
+    /// `protected_branches` is matched by NAME, so a start point with no real
+    /// name matches no rule — while worktree creation goes on to branch from
+    /// whatever `HEAD` points at, which can be the tip of exactly the branch
+    /// the rule protects. This is the fact that lets adjudication tell "the
+    /// base is `main`" from "the base is whatever this detached checkout is
+    /// sitting on, and we called it `main`".
+    ///
+    /// `true` for an explicit base: the user named a branch, and that name is
+    /// what a by-name rule is written against.
+    pub base_is_named: bool,
     /// True once a human has already authorized this EXACT Lane's creation.
     /// Every `direction` row that reaches `materialize::materialize_direction`
     /// exists only because a human already called confirm/approve on it (both
@@ -294,6 +307,10 @@ pub enum VerdictReason {
     RepoDeniedByPolicy,
     RepoOutsideProjectScope,
     ProtectedBranch,
+    /// The lane takes a base that resolves to no NAMED branch, and the policy
+    /// protects branches by name — so nothing can prove this start point is not
+    /// one of them.
+    UnresolvableBase,
     UnreadablePolicy,
     HumanDenied,
     GateApprovedOverride,
@@ -596,6 +613,27 @@ pub fn adjudicate_lane(
         None => {}
     }
 
+    // A start point with no branch NAME cannot be cleared against a by-name
+    // rule. `matches_branch` would find nothing and let it through, while
+    // worktree creation branches from whatever `HEAD` points at — possibly the
+    // tip of the very branch the rule protects.
+    //
+    // Conditioned on the policy actually protecting something, and that
+    // condition is load-bearing rather than an optimization: a detached
+    // repository with no named default is a configuration weft deliberately
+    // supports, and gating it under an EMPTY protected list would refuse a flow
+    // where no rule could be dodged in the first place.
+    //
+    // Gate rather than deny: "nobody can say what this would branch from" is a
+    // question for a human, not a refusal — the same posture `UnreadablePolicy`
+    // takes just above.
+    if !policy.rules.protected_branches.is_empty() && !lane.base_is_named {
+        return build(
+            LaneDecision::NeedsGate,
+            VerdictReason::UnresolvableBase,
+            Some(lane.base_branch.to_string()),
+        );
+    }
     let protected_hit = !lane.base_branch.is_empty()
         && matches_branch(&policy.rules.protected_branches, lane.base_branch);
     if protected_hit {
@@ -743,6 +781,7 @@ mod tests {
             repo_name: "svc",
             reason: "fix the bug",
             base_branch: "",
+            base_is_named: true,
             human_authorized: true,
             human_denied: false,
             duplicate_lane_id: false,
@@ -910,6 +949,53 @@ mod tests {
         assert_eq!(after.policy_revision, "2");
     }
 
+    /// `protected_branches` is matched by NAME, so a start point that has no
+    /// name clears every rule by default — while worktree creation branches
+    /// from whatever `HEAD` points at, which can be the tip of exactly the
+    /// branch being protected.
+    ///
+    /// Conditioned on the policy actually protecting something. A detached
+    /// repository with no named default is a configuration weft deliberately
+    /// supports (`materialize_recreates_detached_head_lane_from_stored_target_commit`),
+    /// and gating it where no by-name rule exists would refuse a flow in which
+    /// nothing could be dodged.
+    #[test]
+    fn an_unnameable_base_gates_only_where_branches_are_protected() {
+        let mut lane = base_lane();
+        // What the default chain hands over for a repository with no real
+        // `main`: a plausible name for a branch that does not exist.
+        lane.base_branch = "main";
+        lane.base_is_named = false;
+
+        let mut protecting = default_policy(PolicyScope::Workspace(1));
+        protecting.rules.protected_branches = vec!["release".to_string()];
+        let verdict = adjudicate_lane(&protecting, "rev-1", &lane);
+        assert_eq!(
+            verdict.decision,
+            LaneDecision::NeedsGate,
+            "a base nothing can name must not clear a by-name rule"
+        );
+        assert_eq!(verdict.reason, VerdictReason::UnresolvableBase);
+
+        // No by-name rule exists, so there is nothing to dodge and the
+        // supported detached flow is untouched.
+        let inert = default_policy(PolicyScope::Workspace(1));
+        assert_eq!(
+            adjudicate_lane(&inert, "rev-1", &lane).decision,
+            LaneDecision::AllowedByPolicy,
+            "an empty protected list must not gate a detached repository"
+        );
+
+        // And a base that IS a real branch still goes through the ordinary
+        // name comparison rather than this arm.
+        let mut named = base_lane();
+        named.base_branch = "release";
+        named.base_is_named = true;
+        let verdict = adjudicate_lane(&protecting, "rev-1", &named);
+        assert_eq!(verdict.decision, LaneDecision::NeedsGate);
+        assert_eq!(verdict.reason, VerdictReason::ProtectedBranch);
+    }
+
     /// An allowlist may only authorize the repository it NAMED, and a denylist
     /// may not be dodged by spelling.
     ///
@@ -1050,6 +1136,7 @@ mod tests {
                 repo_name: "repo",
                 reason: "why",
                 base_branch: base,
+                base_is_named: true,
                 human_authorized: true,
                 human_denied: false,
                 duplicate_lane_id: false,

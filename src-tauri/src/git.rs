@@ -112,6 +112,27 @@ pub fn normalize_target(target: &str) -> String {
 /// FULLY-QUALIFIED (refs/heads/<name> | refs/remotes/origin/<name>) so it's an
 /// unambiguous `worktree add` start-point; `normalize_target` collapses it back to the
 /// bare name for the recorded `branched_from` / `base_branch` (see materialize.rs).
+/// The bare BRANCH NAME `add_worktree_synced` would actually start from, or
+/// `None` when the start point is not a named branch at all.
+///
+/// Adjudication needs this rather than a plausible-looking default.
+/// `protected_branches` is matched by NAME, so a start point with no name
+/// matches no rule and sails through — while worktree creation goes on to
+/// branch from whatever `HEAD` points at, which can be the tip of exactly the
+/// branch the rule protects. `default_base_branch_vetted`'s tier-4 last resort
+/// is the literal string `"main"` regardless of whether the repository has a
+/// `main`, so a detached checkout with no `origin/HEAD`, no `main`/`master` and
+/// no usable recorded base was judged as `main` and created from `HEAD`.
+///
+/// `None` is the honest answer there, and the caller fails closed on it.
+pub(crate) fn resolved_base_branch_name(repo: &Path, recorded: &str) -> Option<String> {
+    let resolved = resolve_base_ref(repo, recorded);
+    if resolved == "HEAD" {
+        return None;
+    }
+    Some(normalize_target(&resolved))
+}
+
 fn resolve_base_ref(repo: &Path, recorded: &str) -> String {
     // The recorded base_ref may be bare (`develop`), short-remote (`origin/develop`), or
     // already qualified. Resolve it BRANCH-FIRST in both namespaces so a same-named TAG
@@ -1267,6 +1288,44 @@ mod tests {
         let p = std::env::temp_dir().join(format!("weft-git-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&p);
         p
+    }
+
+    /// The name adjudication judges has to be a branch that EXISTS, because the
+    /// default chain's last resort is the literal string "main" whether or not
+    /// the repository has one. A repo with a non-standard default and no
+    /// `origin/HEAD` would otherwise be judged as `main` — matching no
+    /// `protected_branches` rule — and then created from `HEAD`, which here is
+    /// the tip of the branch such a rule would protect.
+    #[test]
+    fn resolved_base_branch_name_is_none_when_the_start_point_has_no_branch() {
+        let repo = tmp("resolved-base");
+        init_repo(&repo).expect("fixture repo");
+        // Rename the only branch to something that is neither main nor master,
+        // so nothing in the default chain resolves.
+        let current = current_branch(&repo).expect("fixture branch");
+        git(&repo, &["branch", "-m", &current, "release"]).expect("rename");
+
+        assert_eq!(
+            resolved_base_branch_name(&repo, "release").as_deref(),
+            Some("release"),
+            "a recorded base that resolves names itself"
+        );
+        assert_eq!(
+            resolved_base_branch_name(&repo, "main"),
+            None,
+            "the last-resort \"main\" is fiction here, and must not be reported as a branch"
+        );
+        assert_eq!(
+            resolved_base_branch_name(&repo, ""),
+            None,
+            "nor may a blank recorded base invent one"
+        );
+
+        // …and once a real `main` exists, the same call names it.
+        git(&repo, &["branch", "main"]).expect("create main");
+        assert_eq!(resolved_base_branch_name(&repo, "main").as_deref(), Some("main"));
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]

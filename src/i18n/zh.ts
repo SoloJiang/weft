@@ -317,6 +317,7 @@ export const zh = {
       retry: "重试",
       reason: {
         protected_branch: "目标是受保护分支",
+        unresolvable_base: "无法确定起始分支，因此无法检查分支保护",
         unreadable_policy: "已保存的策略无法解析，因此不做任何假定",
         revoked_policy: "工作区策略已被撤销，因此不做任何假定",
         awaiting_gate_decision: "尚无策略覆盖此任务",

@@ -326,6 +326,7 @@ export const en = {
       retry: "Try again",
       reason: {
         protected_branch: "targets a protected branch",
+        unresolvable_base: "its starting branch can't be identified, so protection can't be checked",
         unreadable_policy: "the saved policy can't be read, so nothing is assumed",
         revoked_policy: "the workspace policy was revoked, so nothing is assumed",
         awaiting_gate_decision: "no policy covers this yet",
