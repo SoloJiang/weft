@@ -217,7 +217,8 @@ async fn fixture_for_repo(temp: TempDir, repo_path: PathBuf, plan_status: Option
     .expect("direction");
     let worktrees = materialize_direction(&db, direction.id)
         .await
-        .expect("materialized worktree");
+        .expect("materialized worktree")
+        .into_worktrees();
     assert_eq!(worktrees.len(), 1, "fixture has one worktree");
     repo::set_direction_status(&db, direction.id, "review")
         .await

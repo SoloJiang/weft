@@ -73,8 +73,8 @@ async fn m2_acceptance() {
     )
     .await
     .unwrap();
-    let w1 = materialize_direction(&db, d1.id).await.unwrap();
-    let w2 = materialize_direction(&db, d2.id).await.unwrap();
+    let w1 = materialize_direction(&db, d1.id).await.unwrap().into_worktrees();
+    let w2 = materialize_direction(&db, d2.id).await.unwrap().into_worktrees();
     assert_eq!(w1.len(), 1);
     assert_eq!(w2.len(), 1);
     assert!(Path::new(&w1[0].path).exists());
@@ -97,7 +97,7 @@ async fn m2_acceptance() {
     )
     .await
     .unwrap();
-    let w3 = materialize_direction(&db, d3.id).await.unwrap();
+    let w3 = materialize_direction(&db, d3.id).await.unwrap().into_worktrees();
     assert_ne!(
         w3[0].path, w1[0].path,
         "same repo, different thread -> different path"

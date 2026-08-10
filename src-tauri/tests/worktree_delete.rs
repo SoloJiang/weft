@@ -70,7 +70,7 @@ async fn delete_worktree_keeps_branch_and_task() {
         .await
         .unwrap();
 
-    let w = materialize_direction(&db, d1.id).await.unwrap();
+    let w = materialize_direction(&db, d1.id).await.unwrap().into_worktrees();
     assert_eq!(w.len(), 1);
     let (wt_id, path, branch) = (w[0].id, w[0].path.clone(), w[0].branch.clone());
     assert!(Path::new(&path).exists(), "worktree materialized on disk");
