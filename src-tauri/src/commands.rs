@@ -3489,11 +3489,19 @@ async fn resolve_lane_gate_impl(
         Some(dir) => {
             let gate = crate::planner::thread_gate(dir.thread_id);
             let held = gate.clone().lock_owned().await;
-            if matches!(
-                crate::lane_state::lane_authority_state(db, direction_id).await.map_err(e)?,
-                crate::lane_state::LaneAuthorityState::OutOfScope
-            ) {
-                return Err("gate_out_of_scope".to_string());
+            // Every non-actionable state, not just `OutOfScope`. A lane can
+            // reach `done` / `inactive` / `cancelled` while its card sits open,
+            // and nothing removes that card — the panel reloads on the thread's
+            // direction ids, which a status change does not alter. Rejecting one
+            // arm by name let the stale click through, and the recorded override
+            // is one `materialize_direction` honors: a fresh checkout for
+            // terminal work, created before anything downstream suppresses the
+            // dispatch. `offers_decision` is the same predicate that decides
+            // whether a card exists at all, so the two cannot drift apart again.
+            let state =
+                crate::lane_state::lane_authority_state(db, direction_id).await.map_err(e)?;
+            if !state.offers_decision() {
+                return Err(format!("gate_not_actionable:{}", state.label()));
             }
             Some(held)
         }
@@ -5823,6 +5831,164 @@ mod tests {
         .unwrap();
         assert_eq!(snapshot.revision, "0");
         assert!(snapshot.revoked_at.is_empty(), "never-configured is not revoked");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// A card left open on a lane that has since reached a terminal state must
+    /// not be resolvable.
+    ///
+    /// Nothing removes that card on its own: the panel reloads on the thread's
+    /// direction ids, which a status change does not alter. Before
+    /// `offers_decision`, the resolver rejected `OutOfScope` by name and let
+    /// everything else through, so approving the stale card recorded an override
+    /// `materialize_direction` honors — a fresh checkout for finished work.
+    #[tokio::test]
+    async fn a_gate_card_left_open_on_a_terminal_lane_cannot_be_resolved() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-gate-terminal-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r =
+            repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+                .await
+                .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+
+        // Gate the lane, so a real card exists and a revision is in force.
+        let rules = crate::authority::PolicyRules {
+            protected_branches: vec![main.clone()],
+            ..Default::default()
+        };
+        let rules_json = serde_json::to_string(&rules).unwrap();
+        repo::create_authority_policy(&db, "workspace", ws.id, &rules_json, "user")
+            .await
+            .unwrap();
+
+        // Every terminal status, each on its own lane: the bug was rejecting one
+        // arm by name, so one example would not have caught the others.
+        for status in ["done", "inactive", "cancelled"] {
+            let dir =
+                repo::create_direction(&db, t.id, status, "claude", r.id, "why", "plan+impl", "")
+                    .await
+                    .unwrap();
+            crate::materialize::materialize_direction(&db, dir.id).await.unwrap();
+            let revision = current_gate_policy_revision(&db, dir.id).await.unwrap();
+            assert_eq!(
+                list_lane_gates_impl(&db, t.id)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|card| card.direction_id == dir.id)
+                    .count(),
+                1,
+                "{status}: a gated lane starts with a card"
+            );
+
+            // …and the lane reaches its terminal state with that card still up.
+            repo::set_direction_status(&db, dir.id, status).await.unwrap();
+
+            let refused = resolve_lane_gate_impl(&db, dir.id, &revision, "approved", None).await;
+            let message = refused.expect_err(&format!("{status}: must refuse"));
+            assert!(
+                message.starts_with("gate_not_actionable:"),
+                "{status}: refused for the wrong reason: {message}"
+            );
+            assert!(
+                repo::worktree_for(&db, dir.id, r.id).await.unwrap().is_none(),
+                "{status}: no checkout may be created for terminal work"
+            );
+            assert!(
+                !list_lane_gates_impl(&db, t.id)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|card| card.direction_id == dir.id),
+                "{status}: the card is gone once the lane is terminal"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// An unreadable HISTORICAL scope revision must not read as "this revision
+    /// named no lanes".
+    ///
+    /// That answer can only push `planner_owned` toward false, and false means
+    /// standalone — which switches the scope check off for exactly the lane it
+    /// exists to catch. The current-plan parse already fails closed; the history
+    /// scan silently skipped `.ok()` failures.
+    #[tokio::test]
+    async fn an_unreadable_historical_scope_revision_never_reads_as_standalone() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-scope-history-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r =
+            repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+                .await
+                .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dropped =
+            repo::create_direction(&db, t.id, "dropped", "claude", r.id, "why", "plan+impl", "")
+                .await
+                .unwrap();
+
+        // The CURRENT plan parses and no longer names the lane…
+        repo::upsert_plan(&db, t.id, r#"{"directions":[]}"#, "confirmed", "1").await.unwrap();
+        // …and the revision that would prove it was planner-owned is corrupt.
+        repo::insert_plan_revision(&db, t.id, "1", "{not json", "confirm").await.unwrap();
+
+        let resolved = crate::lane_state::lane_authority_state(&db, dropped.id).await;
+        assert!(
+            resolved.is_err(),
+            "an unreadable scope revision must fail closed, got {:?}",
+            resolved.map(|state| state.label().to_string())
+        );
+        assert!(list_lane_gates_impl(&db, t.id).await.is_err(), "the panel surfaces it too");
+
+        // A readable history that simply never names the lane still means
+        // standalone — the fail-closed rule must not swallow that case.
+        repo::insert_plan_revision(&db, t.id, "2", r#"{"directions":[]}"#, "confirm")
+            .await
+            .unwrap();
+        let other = repo::create_thread(&db, ws.id, "t2", "feature", "claude").await.unwrap();
+        let standalone =
+            repo::create_direction(&db, other.id, "solo", "claude", r.id, "why", "plan+impl", "")
+                .await
+                .unwrap();
+        repo::upsert_plan(&db, other.id, r#"{"directions":[]}"#, "confirmed", "1").await.unwrap();
+        repo::insert_plan_revision(&db, other.id, "1", r#"{"directions":[]}"#, "confirm")
+            .await
+            .unwrap();
+        let state = crate::lane_state::lane_authority_state(&db, standalone.id).await.unwrap();
+        assert_ne!(state.label(), "out_of_scope", "a standalone lane is never out of scope");
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);

@@ -80,6 +80,26 @@ impl LaneAuthorityState {
         matches!(self, Self::ReadyToStart(_) | Self::Running)
     }
 
+    /// Whether there is a decision here for a human to make — i.e. whether this
+    /// state produces a Gate card, and therefore whether a Gate resolution may
+    /// be recorded against it.
+    ///
+    /// ONE predicate for both, deliberately. Rendering the card and accepting
+    /// the click were separate judgements, and they drifted: the resolver
+    /// rejected only `OutOfScope`, so a lane that reached `done`, `inactive` or
+    /// `cancelled` while its card sat open could still be approved — and since
+    /// the panel's reload signature is just the thread's direction ids, a
+    /// status change never removes the stale card. The approval then recorded an
+    /// override that `materialize_direction` honors, creating a checkout for
+    /// terminal work. A card that can be shown and a card that can be resolved
+    /// are now the same set by construction.
+    pub fn offers_decision(&self) -> bool {
+        matches!(
+            self,
+            Self::AwaitingGate(_) | Self::NeedsMaterialize(_) | Self::ReadyToStart(_)
+        )
+    }
+
     /// A stable, low-cardinality name for the arm. Errors and logs want to say
     /// WHICH refusal this was without printing a whole verdict struct (a
     /// `{:?}` of one carries rule text into places nobody reviewed it for).
@@ -237,14 +257,31 @@ async fn lane_is_in_current_scope(db: &Db, thread_id: i32, direction_id: i32) ->
     // Every revision, unpaged: a page bound reclassifies a lane referenced only
     // by an older proposal as standalone, switching the check off for exactly
     // the obsolete cards it exists to catch.
-    let planner_owned = crate::store::repo::all_plan_revision_proposals(db, thread_id)
-        .await?
-        .iter()
-        .filter_map(|proposal| serde_json::from_str::<serde_json::Value>(proposal).ok())
-        .filter_map(|value| value.get("directions").and_then(|d| d.as_array()).cloned())
-        .flatten()
-        .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
-        .any(|id| id as i32 == direction_id);
+    //
+    // An unreadable HISTORICAL revision is an error for the same reason an
+    // unreadable current plan is. Skipping it (`.ok()`) answers "this revision
+    // named no lanes", which can only ever push `planner_owned` toward false —
+    // and false means standalone, which switches the scope check off. A lane
+    // dropped from the current plan would then keep an approvable card outside
+    // the reviewed scope, which is exactly what this function exists to prevent.
+    // One rule for the whole module: an unreadable plan is never "no plan".
+    // Every revision is parsed before any is consulted, rather than stopping at
+    // the first hit: short-circuiting would make whether a malformed revision is
+    // reached depend on iteration order, so the same corrupt row would surface
+    // for one lane and not another.
+    let mut planner_owned = false;
+    for proposal in crate::store::repo::all_plan_revision_proposals(db, thread_id).await? {
+        let value: serde_json::Value = serde_json::from_str(&proposal)
+            .map_err(|error| anyhow::anyhow!("a stored scope revision is unreadable: {error}"))?;
+        let lanes = value
+            .get("directions")
+            .and_then(|dirs| dirs.as_array())
+            .ok_or_else(|| anyhow::anyhow!("a stored scope revision has no directions array"))?;
+        planner_owned |= lanes
+            .iter()
+            .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
+            .any(|id| id as i32 == direction_id);
+    }
     Ok(!planner_owned)
 }
 
@@ -314,6 +351,26 @@ mod tests {
             labels_where(LaneAuthorityState::admits_worker),
             vec!["ready_to_start", "running"]
         );
+    }
+
+    /// The states a human may resolve are exactly the states that show a card.
+    ///
+    /// These were two separate judgements and they drifted: the panel rendered a
+    /// card for three states while the resolver refused only `OutOfScope`, so a
+    /// lane that reached `done`/`inactive`/`cancelled` with its card open could
+    /// still be approved into a fresh checkout. Anything dispatchable is also
+    /// resolvable — that is the stranded-lane recovery path.
+    #[test]
+    fn resolvable_states_are_exactly_the_states_that_show_a_card() {
+        assert_eq!(
+            labels_where(LaneAuthorityState::offers_decision),
+            vec!["awaiting_gate", "needs_materialize", "ready_to_start"]
+        );
+        for state in all_states() {
+            if state.is_dispatchable() {
+                assert!(state.offers_decision(), "{} must stay resolvable", state.label());
+            }
+        }
     }
 
     /// Labels reach error messages and logs, so two arms sharing one would make
