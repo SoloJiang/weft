@@ -2289,7 +2289,7 @@ impl AskRegistry {
     /// the canonical `ask::action_key` encoding every ask-creation call site
     /// builds (see that function's own doc); this method never re-derives or
     /// loosens it.
-    fn authority_bridge_decision(&self, thread: i32, action_key: &str) -> Option<Decision> {
+    pub fn authority_bridge_decision(&self, thread: i32, action_key: &str) -> Option<Decision> {
         let workspace_id = *self
             .thread_workspace
             .read()

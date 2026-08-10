@@ -10,6 +10,7 @@ import type {
   DefaultToolInfo,
   Direction,
   EnabledSkill,
+  GateResolution,
   EvidenceRow,
   FileTree,
   GrantSnapshot,
@@ -313,7 +314,7 @@ export const api = {
     decision: "approved" | "denied",
     reason?: string,
   ) =>
-    invoke<Worktree[]>("resolve_lane_gate", {
+    invoke<GateResolution>("resolve_lane_gate", {
       directionId,
       policyRevision,
       decision,

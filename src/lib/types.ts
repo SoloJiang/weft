@@ -400,6 +400,15 @@ export interface AuthorityPolicyRevision {
   rules_unreadable: boolean;
 }
 
+/** What resolving a Gate produced — mirrors Rust `commands::GateResolutionDto`.
+ *  `dispatch_direction_ids` is the resolved lane PLUS every dependent the
+ *  clearance released, which the caller must start: confirm dropped that whole
+ *  set from its own dispatch ids, and those lanes carry no Gate of their own. */
+export interface GateResolution {
+  worktrees: Worktree[];
+  dispatch_direction_ids: number[];
+}
+
 /** A Lane currently blocked on a Gate — mirrors Rust `commands::LaneGateDto`. */
 export interface LaneGate {
   direction_id: number;

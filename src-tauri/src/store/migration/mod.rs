@@ -2715,6 +2715,27 @@ impl MigrationTrait for M0056AuthorityPolicy {
                     .to_owned(),
             )
             .await?;
+        // A revision must identify exactly ONE policy for a scope. Allocation is
+        // a read-max/insert with no transaction, so two overlapping tightens
+        // could each read the same previous row and mint the same next revision
+        // — after which `get_active_authority_policy` picks arbitrarily between
+        // them (a tighten reports success while other rules stay live) and a
+        // Gate decision keyed by that revision is valid for both policies. This
+        // UNIQUE index makes the loser's insert fail so it can retry against the
+        // winner's revision instead of silently tying.
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .unique()
+                    .name("uq_authority_policy_scope_revision")
+                    .table(Alias::new("authority_policy"))
+                    .col(Alias::new("scope"))
+                    .col(Alias::new("scope_id"))
+                    .col(Alias::new("revision"))
+                    .to_owned(),
+            )
+            .await?;
 
         let mut lane_gate_decision_stmt = schema.create_table_from_entity(lane_gate_decision::Entity);
         lane_gate_decision_stmt.if_not_exists();

@@ -2418,26 +2418,57 @@ pub async fn create_authority_policy(
         .order_by_desc(authority_policy::Column::Id)
         .one(&db.0)
         .await?;
-    let next_revision = previous
+    let mut next_revision = previous
         .and_then(|p| p.revision.parse::<i64>().ok())
         .unwrap_or(0)
         + 1;
-    let inserted = authority_policy::Entity::insert(authority_policy::ActiveModel {
-        id: NotSet,
-        scope: Set(scope.to_string()),
-        scope_id: Set(scope_id),
-        revision: Set(next_revision.to_string()),
-        rules: Set(rules.to_string()),
-        source: Set(source.to_string()),
-        created_at: Set(now()),
-        revoked_at: Set(String::new()),
-    })
-    .exec(&db.0)
-    .await?;
-    authority_policy::Entity::find_by_id(inserted.last_insert_id)
-        .one(&db.0)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("authority_policy row disappeared after insert"))
+    // Retry against the UNIQUE (scope, scope_id, revision) index rather than
+    // wrapping the read in a transaction: the read-max/insert pair is not
+    // atomic, so two concurrent tightens for one workspace can compute the SAME
+    // next revision. Tied revisions are the damaging outcome — the active-policy
+    // read then picks between them arbitrarily, so one tighten reports success
+    // while the other's rules stay live, and a Gate decision keyed by that
+    // revision is valid for both. The index turns that tie into a failed insert;
+    // re-reading the max and trying again gives the loser the next free number.
+    // Bounded so a genuinely broken index can never spin forever.
+    for _ in 0..8 {
+        let attempt = authority_policy::Entity::insert(authority_policy::ActiveModel {
+            id: NotSet,
+            scope: Set(scope.to_string()),
+            scope_id: Set(scope_id),
+            revision: Set(next_revision.to_string()),
+            rules: Set(rules.to_string()),
+            source: Set(source.to_string()),
+            created_at: Set(now()),
+            revoked_at: Set(String::new()),
+        })
+        .exec(&db.0)
+        .await;
+        match attempt {
+            Ok(inserted) => {
+                return authority_policy::Entity::find_by_id(inserted.last_insert_id)
+                    .one(&db.0)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("authority_policy row disappeared after insert")
+                    });
+            }
+            Err(_) => {
+                let current = authority_policy::Entity::find()
+                    .filter(authority_policy::Column::Scope.eq(scope))
+                    .filter(authority_policy::Column::ScopeId.eq(scope_id))
+                    .order_by_desc(authority_policy::Column::Id)
+                    .one(&db.0)
+                    .await?
+                    .and_then(|p| p.revision.parse::<i64>().ok())
+                    .unwrap_or(0);
+                next_revision = current.max(next_revision) + 1;
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "could not allocate an authority_policy revision for {scope}:{scope_id}"
+    ))
 }
 
 /// The active AuthorityPolicy for a scope: the row at the HIGHEST `revision`
@@ -2590,6 +2621,37 @@ pub async fn get_gate_decision(
 /// `denied`/`unresolved` edge already blocks its own consumer independently
 /// (see `direction_dependency`'s own doc), and re-blocking it here would be
 /// redundant, not additionally correct.
+/// Whether a lane has a checkout that actually exists on disk. A worktree ROW
+/// is not enough: the recreate path deliberately keeps a stale row for a
+/// checkout that was reclaimed or replaced out-of-band, and dispatching a
+/// worker into a directory that is gone fails.
+pub async fn direction_has_live_worktree(db: &Db, direction_id: i32) -> Result<bool> {
+    Ok(worktree::Entity::find()
+        .filter(worktree::Column::DirectionId.eq(direction_id))
+        .all(&db.0)
+        .await?
+        .iter()
+        .any(|w| std::path::Path::new(&w.path).exists()))
+}
+
+/// Every direction `direction_id` names as a RESOLVED upstream — the producers
+/// it must not start before. The mirror of [`downstream_direction_ids`], and
+/// used with it to decide whether clearing one Gate actually unblocks a
+/// consumer: a lane with two producers is still blocked while the OTHER one is
+/// gated. `denied`/`unresolved` edges are excluded for the same reason they are
+/// there — they block their consumer through their own path, not this one.
+pub async fn upstream_direction_ids(db: &Db, direction_id: i32) -> Result<Vec<i32>> {
+    Ok(direction_dependency::Entity::find()
+        .filter(direction_dependency::Column::DirectionId.eq(direction_id))
+        .filter(direction_dependency::Column::State.eq("resolved"))
+        .all(&db.0)
+        .await?
+        .into_iter()
+        .map(|edge| edge.upstream_direction_id)
+        .filter(|id| *id != 0)
+        .collect())
+}
+
 pub async fn downstream_direction_ids(db: &Db, direction_id: i32) -> Result<Vec<i32>> {
     Ok(direction_dependency::Entity::find()
         .filter(direction_dependency::Column::UpstreamDirectionId.eq(direction_id))
@@ -9117,6 +9179,59 @@ pub fn evidence_freshness(
 
 #[cfg(test)]
 mod tests {
+
+    /// Two overlapping tightens for one workspace must never end up sharing a
+    /// revision: the active-policy read would then pick between them
+    /// arbitrarily, so one tighten reports success while the other's rules stay
+    /// live, and a Gate decision keyed by that revision is valid for both.
+    #[tokio::test]
+    async fn concurrent_policy_writes_get_distinct_revisions() {
+        let db = mem().await;
+        let a = create_authority_policy(&db, "workspace", 1, "{}", "test").await.unwrap();
+        let b = create_authority_policy(&db, "workspace", 1, "{}", "test").await.unwrap();
+        let c = create_authority_policy(&db, "workspace", 1, "{}", "test").await.unwrap();
+        assert_ne!(a.revision, b.revision);
+        assert_ne!(b.revision, c.revision);
+        assert_ne!(a.revision, c.revision);
+
+        // A different scope_id keeps its own independent sequence.
+        let other = create_authority_policy(&db, "workspace", 2, "{}", "test").await.unwrap();
+        assert_eq!(other.revision, a.revision);
+    }
+
+    /// A worktree ROW whose directory is gone is not a live checkout — the
+    /// recreate path deliberately keeps that row, and dispatching a worker into
+    /// a missing directory fails.
+    #[tokio::test]
+    async fn live_worktree_probe_requires_the_directory_to_exist() {
+        let db = mem().await;
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("present");
+        std::fs::create_dir_all(&present).unwrap();
+
+        async fn row(db: &Db, direction_id: i32, path: &str) {
+            worktree::ActiveModel {
+                repo_id: Set(1),
+                direction_id: Set(direction_id),
+                branch: Set("b".to_string()),
+                path: Set(path.to_string()),
+                created_at: Set(now()),
+                ..Default::default()
+            }
+            .insert(&db.0)
+            .await
+            .unwrap();
+        }
+
+        assert!(!direction_has_live_worktree(&db, 1).await.unwrap());
+
+        row(&db, 1, present.to_string_lossy().as_ref()).await;
+        assert!(direction_has_live_worktree(&db, 1).await.unwrap());
+
+        row(&db, 2, dir.path().join("gone").to_string_lossy().as_ref()).await;
+        assert!(!direction_has_live_worktree(&db, 2).await.unwrap());
+    }
+
     use super::*;
     use crate::store::Db;
 

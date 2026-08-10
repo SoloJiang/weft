@@ -3149,6 +3149,45 @@ pub async fn seed_authority_bridge(db: &Db, asks: &crate::ask::AskRegistry) {
 /// most recent `decision` Evidence row recorded `needs_gate`. Minimal view for
 /// the ScopeReview Gate card — enough to explain WHY without the frontend
 /// re-deriving policy logic itself.
+/// What resolving a Gate produced: the worktrees it materialized, and every
+/// lane the caller should now dispatch — this one plus the dependents the
+/// clearance released (see `released_by_gate`). A denial reports both empty.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct GateResolutionDto {
+    pub worktrees: Vec<crate::store::entities::worktree::Model>,
+    pub dispatch_direction_ids: Vec<i32>,
+}
+
+/// Holds a lane's Gate resolution for the duration of one `resolve_lane_gate`
+/// call, releasing it on drop (including on the early-return error paths).
+struct GateResolutionGuard(i32);
+
+static GATE_RESOLUTIONS_IN_FLIGHT: std::sync::Mutex<Option<std::collections::HashSet<i32>>> =
+    std::sync::Mutex::new(None);
+
+impl GateResolutionGuard {
+    fn acquire(direction_id: i32) -> Option<Self> {
+        let mut g = GATE_RESOLUTIONS_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if g.get_or_insert_with(Default::default).insert(direction_id) {
+            return Some(Self(direction_id));
+        }
+        None
+    }
+}
+
+impl Drop for GateResolutionGuard {
+    fn drop(&mut self) {
+        let mut g = GATE_RESOLUTIONS_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(set) = g.as_mut() {
+            set.remove(&self.0);
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct LaneGateDto {
     pub direction_id: i32,
@@ -3215,7 +3254,18 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
             latest_decision = fresh;
         }
         let parsed: serde_json::Value = serde_json::from_str(&latest_decision.payload).unwrap_or_default();
-        if parsed.get("decision").and_then(|v| v.as_str()) != Some("needs_gate") {
+        // `needs_gate` is the ordinary card. `allowed_by_policy` on a lane with
+        // NO checkout is the recoverable-stranding case, and it must be shown
+        // too: the policy was loosened while the Gate was pending (or the git
+        // write failed after an approval), so the lane is permitted and yet
+        // nothing materialized it — hiding it because "it is allowed now" is
+        // exactly what left it with neither a card nor a worker. It carries its
+        // own reason so the copy asks to RESUME rather than to approve; the
+        // button behind it is the same resolve path, which materializes and
+        // returns the lanes to dispatch. `denied` is settled and stays hidden.
+        let verdict = parsed.get("decision").and_then(|v| v.as_str()).unwrap_or("");
+        let stranded = verdict == "allowed_by_policy";
+        if verdict != "needs_gate" && !stranded {
             continue;
         }
         out.push(LaneGateDto {
@@ -3225,11 +3275,14 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
             reason: dir.reason,
             base_branch: dir.base_branch,
             policy_revision: latest_decision.policy_revision,
-            verdict_reason: parsed
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
+            verdict_reason: match stranded {
+                true => "unmaterialized_lane".to_string(),
+                false => parsed
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            },
             hit_rule: parsed.get("hit_rule").and_then(|v| v.as_str()).map(str::to_string),
             observed_at: latest_decision.observed_at,
         });
@@ -3279,7 +3332,16 @@ pub async fn resolve_lane_gate(
     policy_revision: String,
     decision: String,
     reason: Option<String>,
-) -> R<Vec<crate::store::entities::worktree::Model>> {
+) -> R<GateResolutionDto> {
+    // One resolution per lane at a time. Two windows (or a double-click) can
+    // both pass the revision check below and append conflicting decisions; in
+    // an approve/deny race the approval can create the worktree before the
+    // denial is recorded, leaving the denial as the standing verdict over a
+    // checkout it never removes while the approving client dispatches a worker
+    // into it. Refusing the second caller outright is the honest answer — it is
+    // a race between two humans, not something to silently pick a winner for.
+    let _guard = GateResolutionGuard::acquire(direction_id)
+        .ok_or_else(|| "gate_resolution_in_flight".to_string())?;
     let current = current_gate_policy_revision(&db, direction_id).await.map_err(e)?;
     if policy_revision != current {
         return Err("gate_policy_changed".to_string());
@@ -3314,10 +3376,59 @@ pub async fn resolve_lane_gate(
     // (or a policy change that raced this call) refused it, and returning an
     // empty list would read as "materialized nothing" — surface it instead.
     match outcome {
-        crate::materialize::MaterializeOutcome::Ready(rows) => Ok(rows),
-        crate::materialize::MaterializeOutcome::Denied(_) => Ok(Vec::new()),
+        crate::materialize::MaterializeOutcome::Ready(rows) => {
+            // Clearing this Gate can unblock lanes BEYOND it. Confirm removed
+            // the whole transitive dependent set from its dispatch ids, and
+            // those lanes materialized fine, so they carry no Gate of their own
+            // and nothing else will ever start them. Hand the caller every lane
+            // the approval actually released, this one included.
+            let dispatch_direction_ids = released_by_gate(&db, direction_id).await.map_err(e)?;
+            Ok(GateResolutionDto { worktrees: rows, dispatch_direction_ids })
+        }
+        crate::materialize::MaterializeOutcome::Denied(_) => {
+            Ok(GateResolutionDto { worktrees: Vec::new(), dispatch_direction_ids: Vec::new() })
+        }
         crate::materialize::MaterializeOutcome::Gated(_) => Err("gate_still_pending".to_string()),
     }
+}
+
+/// Whether one lane can run now: its own checkout exists, and every producer it
+/// declared has one too. The second half is what stops a join lane (two
+/// upstreams, one still gated) from being released by the wrong approval.
+async fn lane_is_runnable(db: &Db, direction_id: i32) -> anyhow::Result<bool> {
+    if !crate::store::repo::direction_has_live_worktree(db, direction_id).await? {
+        return Ok(false);
+    }
+    for upstream in crate::store::repo::upstream_direction_ids(db, direction_id).await? {
+        if !crate::store::repo::direction_has_live_worktree(db, upstream).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The lane whose Gate just cleared, plus every transitive dependent the
+/// clearance actually released. Walks downstream breadth-first and keeps only
+/// lanes that are runnable now, so a dependent still waiting on a DIFFERENT
+/// gated producer is left alone — and is not walked past, since nothing behind
+/// it can be runnable either.
+async fn released_by_gate(db: &Db, direction_id: i32) -> anyhow::Result<Vec<i32>> {
+    let mut released = vec![direction_id];
+    let mut seen: std::collections::HashSet<i32> = [direction_id].into_iter().collect();
+    let mut frontier = vec![direction_id];
+    while let Some(current) = frontier.pop() {
+        for downstream in crate::store::repo::downstream_direction_ids(db, current).await? {
+            if !seen.insert(downstream) {
+                continue;
+            }
+            if !lane_is_runnable(db, downstream).await? {
+                continue;
+            }
+            released.push(downstream);
+            frontier.push(downstream);
+        }
+    }
+    Ok(released)
 }
 
 /// Newest-first scope revision history for a thread (issue #172's versioned

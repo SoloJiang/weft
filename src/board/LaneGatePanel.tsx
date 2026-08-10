@@ -17,7 +17,8 @@ type GateReasonKey =
   | "unreadable_policy"
   | "awaiting_gate_decision"
   | "gate_approved_override"
-  | "gate_denied_override";
+  | "gate_denied_override"
+  | "unmaterialized_lane";
 
 /** Which failure arm a click maps to — derived once from the action the user
  *  actually took, not re-guessed at render time. */
@@ -32,6 +33,7 @@ function gateReasonKey(reason: string): GateReasonKey {
     case "unreadable_policy":
     case "gate_approved_override":
     case "gate_denied_override":
+    case "unmaterialized_lane":
       return reason;
     default:
       return "awaiting_gate_decision";
@@ -109,18 +111,23 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
   async function resolve(gate: LaneGate, decision: "approved" | "denied") {
     setActionState((prev) => ({ ...prev, [gate.direction_id]: "resolving" }));
     try {
-      const worktrees = await api.resolveLaneGate(gate.direction_id, gate.policy_revision, decision);
+      const resolution = await api.resolveLaneGate(
+        gate.direction_id,
+        gate.policy_revision,
+        decision,
+      );
       setActionState((prev) => {
         const next = { ...prev };
         delete next[gate.direction_id];
         return next;
       });
-      // Confirm deliberately left this lane out of its dispatch set (it had no
-      // worktree then), and nothing else will pick it up: approving created the
-      // worktree, which also drops the lane from `list_lane_gates`, so without
-      // this it would vanish from the UI and sit idle forever.
-      if (decision === "approved" && worktrees.length > 0) {
-        void dispatchDirection(gate.direction_id);
+      // Confirm deliberately left this lane AND its whole transitive dependent
+      // set out of its dispatch ids, and nothing else will pick them up: this
+      // lane gains a worktree (so it also drops off this list), and the
+      // dependents never had a Gate of their own. The backend returns exactly
+      // the set the clearance released — start all of it.
+      for (const id of resolution.dispatch_direction_ids) {
+        void dispatchDirection(id);
       }
       reload();
     } catch (error) {
@@ -184,6 +191,7 @@ function LaneGateRow({
 }) {
   const { t } = useTranslation();
   const busy = state === "resolving";
+  const reasonKey = gateReasonKey(gate.verdict_reason);
   return (
     <div className="flex flex-col gap-1.5 rounded-[var(--radius-md)] border border-border bg-surface px-3 py-2">
       <div className="flex items-center justify-between gap-2">
@@ -191,7 +199,9 @@ function LaneGateRow({
         <div className="flex shrink-0 items-center gap-1.5">
           <Button size="sm" variant="ghost" onClick={onApprove} disabled={busy}>
             <Check size={12} />
-            {t("scope.gate.approve")}
+            {/* A stranded lane is already permitted — the action is to finish
+                setting it up, not to grant something. Same command behind it. */}
+            {t(reasonKey === "unmaterialized_lane" ? "scope.gate.resume" : "scope.gate.approve")}
           </Button>
           <Button size="sm" variant="ghost" onClick={onDeny} disabled={busy}>
             <X size={12} />
@@ -201,7 +211,7 @@ function LaneGateRow({
       </div>
       <div className="text-[10.5px] text-ink-faint">
         {t("scope.gate.reasonLine", {
-          reason: t(`scope.gate.reason.${gateReasonKey(gate.verdict_reason)}`),
+          reason: t(`scope.gate.reason.${reasonKey}`),
         })}
       </div>
       {gate.hit_rule ? (

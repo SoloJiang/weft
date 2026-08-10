@@ -200,6 +200,25 @@ async fn handle_ask(
 
         let (summary, detail, risk, action_key) = summarize(tool_name, req.get("tool_input"));
 
+        // Issue #172: tell the SYNC Permission Bridge which workspace this ask
+        // belongs to, so it consults THIS workspace's policy and never another's.
+        // A read failure simply leaves the mapping unset and the bridge defers to
+        // the human flow — the same conservative answer as having no policy.
+        if let Ok(Some(row)) = crate::store::repo::get_thread(&db, thread).await {
+            asks.note_thread_workspace(thread, row.workspace_id);
+        }
+        // …and consult an explicit policy DENY before the convenience allowlist
+        // below. `deny_actions` naming a safe builtin (Claude's Read/Grep/Glob)
+        // would otherwise never be evaluated on this route: the builtin branch
+        // returns `allow` first, so the same workspace policy would deny the
+        // action through the ACP and Codex routes and auto-allow it through the
+        // hook. Only Deny is decisive here — a policy ALLOW must still fall
+        // through to the allowlist and the human flow below, so this cannot
+        // widen anything.
+        if matches!(asks.authority_bridge_decision(thread, &action_key), Some(Decision::Deny)) {
+            return hook_decision("deny", "Denied by the workspace policy");
+        }
+
         // A read-only BUILTIN of the engine itself (claude's Read/Grep/Glob, …)
         // is waved through, so a turn that reads twenty files doesn't cost
         // twenty human clicks. Identity and deletion markers have already been
@@ -222,13 +241,6 @@ async fn handle_ask(
         // A standing rule (full access / always-allow / issue #103's read-only
         // batch-or-issue grant) decides without surfacing. Matches on the exact
         // action key, but only after the exact live identity proof above.
-        // Issue #172: tell the SYNC Permission Bridge which workspace this ask
-        // belongs to, so it consults THIS workspace's policy and never another's.
-        // A read failure simply leaves the mapping unset and the bridge defers to
-        // the human flow — the same conservative answer as having no policy.
-        if let Ok(Some(row)) = crate::store::repo::get_thread(&db, thread).await {
-            asks.note_thread_workspace(thread, row.workspace_id);
-        }
         // Issue #172 made `Deny` reachable here for the first time (the
         // Permission Bridge's decisive half). Comparing against `Some(Allow)`
         // alone would fall through to a human card, quietly turning a policy
