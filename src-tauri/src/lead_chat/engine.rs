@@ -6739,6 +6739,11 @@ async fn acp_consumer(
                 // `None` arm would make every ACP ask miss those grants.
                 let risk = acp_permission_risk(&intent, &detail);
                 let want = if let Some(asks) = asks {
+                    // Issue #172: register this thread's workspace so the sync
+                    // Permission Bridge resolves the right policy (unknown -> defer).
+                    if let Ok(Some(row)) = repo::get_thread(&db, thread_id).await {
+                        asks.note_thread_workspace(thread_id, row.workspace_id);
+                    }
                     match asks.auto_decision(thread_id, &dir, risk, &action_key) {
                         Some(crate::ask::Decision::Allow) => crate::acp::Want::AllowOnce,
                         Some(crate::ask::Decision::Deny) => crate::acp::Want::RejectOnce,

@@ -114,6 +114,40 @@ pub struct PolicySnapshot {
     pub source: String,
     pub created_at: String,
     pub revoked_at: String,
+    /// True when the stored `rules` JSON did not parse and `rules` is therefore
+    /// the empty default rather than what the user actually configured. Every
+    /// field being `#[serde(default)]` only makes a MISSING field safe; one
+    /// wrong field TYPE fails the whole parse, and silently reading that as
+    /// "no rules" would drop `denied_repos`/`protected_branches`/`deny_actions`
+    /// — turning a corrupt row into a strictly MORE permissive policy than the
+    /// user wrote. Adjudication fails closed on this flag instead.
+    #[serde(default)]
+    pub rules_unreadable: bool,
+}
+
+/// Build the snapshot for one stored `authority_policy` row. The ONLY
+/// construction path any caller should use: a row whose `rules` JSON does not
+/// parse resolves to empty rules AND `rules_unreadable: true`, so the
+/// fail-closed handling lives in one place rather than depending on each call
+/// site remembering not to `unwrap_or_default()` the parse.
+pub fn snapshot_from_row(
+    row: crate::store::entities::authority_policy::Model,
+    scope: PolicyScope,
+) -> PolicySnapshot {
+    let (rules, rules_unreadable) = match serde_json::from_str::<PolicyRules>(&row.rules) {
+        Ok(rules) => (rules, false),
+        Err(_) => (PolicyRules::default(), true),
+    };
+    PolicySnapshot {
+        id: row.id,
+        scope,
+        revision: row.revision,
+        rules,
+        source: row.source,
+        created_at: row.created_at,
+        revoked_at: row.revoked_at,
+        rules_unreadable,
+    }
 }
 
 /// The hard-coded, conservative default used when no configured policy row
@@ -131,6 +165,7 @@ pub fn default_policy(scope: PolicyScope) -> PolicySnapshot {
         source: "system".to_string(),
         created_at: String::new(),
         revoked_at: String::new(),
+        rules_unreadable: false,
     }
 }
 
@@ -206,6 +241,7 @@ pub enum VerdictReason {
     RepoDeniedByPolicy,
     RepoOutsideProjectScope,
     ProtectedBranch,
+    UnreadablePolicy,
     HumanDenied,
     GateApprovedOverride,
     GateDeniedOverride,
@@ -298,6 +334,24 @@ pub fn adjudicate_lane(
     }
     if !looks_like_valid_ref(lane.base_branch) {
         return build(LaneDecision::Denied, VerdictReason::InvalidBase, Some(lane.base_branch.to_string()));
+    }
+
+    // A policy whose rules did not parse is UNKNOWN, not empty: every check
+    // below reads `policy.rules`, and running them against the empty default
+    // would answer "nothing is denied" for a row that may well have denied
+    // this exact repo or branch. Fail closed to a human Gate — but honor a
+    // Gate resolution already recorded at this same revision, so the corrupt
+    // row leaves a human path forward instead of stranding the Lane.
+    if policy.rules_unreadable {
+        return match lane.gate_override {
+            Some(GateOverride::Approved) => {
+                build(LaneDecision::AllowedByPolicy, VerdictReason::GateApprovedOverride, None)
+            }
+            Some(GateOverride::Denied) => {
+                build(LaneDecision::Denied, VerdictReason::GateDeniedOverride, None)
+            }
+            None => build(LaneDecision::NeedsGate, VerdictReason::UnreadablePolicy, None),
+        };
     }
 
     if matches_name(&policy.rules.denied_repos, lane.repo_name) {
@@ -406,6 +460,14 @@ pub fn bridge_decision(policy: &PolicySnapshot, action: &PermissionAction<'_>) -
             },
         )
     };
+    // Unknown rules cannot decisively answer anything: with the empty default
+    // both lists below are vacuously unmatched, so state the intent outright
+    // rather than leaving it to fall through. Defer is exactly the pre-#172
+    // AskRegistry/human flow, so a corrupt row costs a human card, never an
+    // auto-approval of something `deny_actions` may have named.
+    if policy.rules_unreadable {
+        return build(LaneDecision::NeedsGate, BridgeDecision::Defer, VerdictReason::UnreadablePolicy);
+    }
     if policy.rules.deny_actions.iter().any(|p| action_pattern_matches(p, action.action_key)) {
         return build(LaneDecision::Denied, BridgeDecision::Deny, VerdictReason::ActionDeniedByPolicy);
     }
@@ -658,5 +720,86 @@ mod tests {
         assert_eq!(proj.kind(), "project");
         assert_eq!(PolicyScope::parse("project", 3), Some(proj));
         assert_eq!(PolicyScope::parse("bogus", 1), None);
+    }
+
+    // ---- unreadable rules fail closed ----
+
+    fn row_with_rules(rules: &str) -> crate::store::entities::authority_policy::Model {
+        crate::store::entities::authority_policy::Model {
+            id: 7,
+            scope: "workspace".to_string(),
+            scope_id: 1,
+            revision: "3".to_string(),
+            rules: rules.to_string(),
+            source: "user".to_string(),
+            created_at: String::new(),
+            revoked_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_partial_rules_shape_still_parses_and_is_not_flagged() {
+        // Every field is `#[serde(default)]`, so a MISSING field stays safe —
+        // this is the case the struct's own doc promises, and it must keep
+        // working or every older policy row would start gating.
+        let snap = snapshot_from_row(row_with_rules(r#"{"denied_repos":["api"]}"#), PolicyScope::Workspace(1));
+        assert!(!snap.rules_unreadable);
+        assert_eq!(snap.rules.denied_repos, vec!["api".to_string()]);
+    }
+
+    #[test]
+    fn unparseable_rules_are_flagged_rather_than_read_as_no_rules() {
+        // One wrong field TYPE fails the whole parse. Reading that as the empty
+        // default would silently DROP denied_repos/protected_branches.
+        let snap = snapshot_from_row(
+            row_with_rules(r#"{"denied_repos":"api","protected_branches":["main"]}"#),
+            PolicyScope::Workspace(1),
+        );
+        assert!(snap.rules_unreadable);
+        assert!(snap.rules.denied_repos.is_empty(), "the empty rules are NOT the user's");
+    }
+
+    #[test]
+    fn an_unreadable_policy_gates_instead_of_allowing() {
+        let mut policy = default_policy(PolicyScope::Workspace(1));
+        policy.rules_unreadable = true;
+        let lane = base_lane();
+        let verdict = adjudicate_lane(&policy, "1-1", &lane);
+        assert_eq!(verdict.decision, LaneDecision::NeedsGate);
+        assert_eq!(verdict.reason, VerdictReason::UnreadablePolicy);
+    }
+
+    #[test]
+    fn an_unreadable_policy_still_honors_a_gate_resolution_at_this_revision() {
+        // Otherwise a corrupt row would strand every lane with no way forward.
+        let mut policy = default_policy(PolicyScope::Workspace(1));
+        policy.rules_unreadable = true;
+        let mut lane = base_lane();
+        lane.gate_override = Some(GateOverride::Approved);
+        assert_eq!(adjudicate_lane(&policy, "1-1", &lane).decision, LaneDecision::AllowedByPolicy);
+        lane.gate_override = Some(GateOverride::Denied);
+        assert_eq!(adjudicate_lane(&policy, "1-1", &lane).decision, LaneDecision::Denied);
+    }
+
+    #[test]
+    fn an_unreadable_policy_defers_the_bridge_rather_than_deciding() {
+        let mut policy = default_policy(PolicyScope::Workspace(1));
+        policy.rules_unreadable = true;
+        // Even a key the (lost) rules might have denied must not be auto-allowed.
+        let (bridge, _) = bridge_decision(&policy, &PermissionAction { action_key: "Run: rm -rf /" });
+        assert_eq!(bridge, BridgeDecision::Defer);
+    }
+
+    #[test]
+    fn a_shape_violation_outranks_an_unreadable_policy() {
+        // The policy-independent fail-closed checks still run first: an
+        // unreadable policy must not soften a missing reason into a Gate.
+        let mut policy = default_policy(PolicyScope::Workspace(1));
+        policy.rules_unreadable = true;
+        let mut lane = base_lane();
+        lane.reason = "   ";
+        let verdict = adjudicate_lane(&policy, "1-1", &lane);
+        assert_eq!(verdict.decision, LaneDecision::Denied);
+        assert_eq!(verdict.reason, VerdictReason::MissingReason);
     }
 }

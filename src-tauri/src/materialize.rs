@@ -8,6 +8,56 @@ use crate::store::{entities, repo, Db};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+/// What one [`materialize_direction`] call actually did.
+///
+/// An AuthorityPolicy refusal (issue #172) is neither `Err` nor success: no
+/// error occurred, but the write was declined and no worktree exists. Encoding
+/// it as an empty `Vec` — as the first cut of #172 did — is indistinguishable
+/// from the legitimate "this lane binds no repo" return, and since every caller
+/// branched on `Err` alone, a refused lane was recorded as confirmed and
+/// dispatched to a worker with nothing on disk. One discriminated value, mapped
+/// exhaustively at each call site, is what keeps that from being possible.
+#[derive(Clone, Debug)]
+pub enum MaterializeOutcome {
+    /// The lane's worktrees. Empty only when the lane binds no write repo.
+    Ready(Vec<entities::worktree::Model>),
+    /// A human Gate must be resolved before this write may happen. The caller
+    /// KEEPS the direction row: the Gate card points at it, and approving the
+    /// Gate re-runs materialize to completion.
+    Gated(authority::LaneVerdict),
+    /// The policy refused this lane outright — no Gate can unstick it. The
+    /// caller owns rolling back whatever it created for the lane.
+    Denied(authority::LaneVerdict),
+}
+
+impl MaterializeOutcome {
+    /// The worktrees this call produced; empty for either refusal.
+    pub fn worktrees(&self) -> &[entities::worktree::Model] {
+        match self {
+            MaterializeOutcome::Ready(rows) => rows,
+            MaterializeOutcome::Gated(_) | MaterializeOutcome::Denied(_) => &[],
+        }
+    }
+
+    /// Consume the outcome for its worktrees, discarding a refusal verdict.
+    /// Only for callers that have ALREADY handled the refusal arms (and for
+    /// tests asserting the materialized shape) — never as a way to skip them.
+    pub fn into_worktrees(self) -> Vec<entities::worktree::Model> {
+        match self {
+            MaterializeOutcome::Ready(rows) => rows,
+            MaterializeOutcome::Gated(_) | MaterializeOutcome::Denied(_) => Vec::new(),
+        }
+    }
+
+    /// The verdict behind a refusal, or `None` when the lane materialized.
+    pub fn refusal(&self) -> Option<&authority::LaneVerdict> {
+        match self {
+            MaterializeOutcome::Ready(_) => None,
+            MaterializeOutcome::Gated(verdict) | MaterializeOutcome::Denied(verdict) => Some(verdict),
+        }
+    }
+}
+
 /// The deterministic worktree path for a direction branch inside its target repo:
 /// `<repo>/.worktrees/<weft|weft-dev>/<branch>`. The branch suffix keeps the path
 /// user-visible and aligned with the repo's own naming style while `.worktrees/weft`
@@ -109,23 +159,34 @@ async fn bootstrap_worktree_deps(path: &str) {
 /// makes adjudication a complete no-op (`AllowedByPolicy` every time),
 /// preserving today's confirm-gated single-repo flow exactly. Always records
 /// a `decision` Evidence row, win or lose, for the audit trail.
+/// The base branch NAME a lane effectively targets, for policy matching. A
+/// blank `dir.base_branch` is the planner's "use the repo default" value (see
+/// `planner::de_string_or_null`), and this function resolves it to the same
+/// name `materialize_direction` will actually branch off. Adjudicating the raw
+/// blank instead would make `protected_branches: ["main"]` miss every lane that
+/// took the default — i.e. nearly all of them — and only start matching after
+/// materialize writes the resolved name back into the row, one write too late.
+fn effective_base_branch(repo_ref: &entities::repo_ref::Model, dir: &entities::direction::Model) -> String {
+    let explicit = dir.base_branch.trim();
+    if !explicit.is_empty() {
+        return explicit.to_string();
+    }
+    let repo_path = std::path::Path::new(&repo_ref.local_git_path);
+    git::live_default_branch(repo_path)
+        .unwrap_or_else(|| git::recorded_base_or_default(repo_path, &repo_ref.base_ref, repo_ref.base_ref_is_default))
+}
+
 async fn authorize_materialize(
     db: &Db,
     dir: &entities::direction::Model,
     repo_ref: &entities::repo_ref::Model,
     thread_workspace_id: i32,
-) -> Result<bool> {
+    effective_base: &str,
+) -> Result<authority::LaneVerdict> {
+    let scope = authority::PolicyScope::Workspace(thread_workspace_id);
     let policy = match repo::get_active_authority_policy(db, "workspace", thread_workspace_id).await? {
-        Some(row) => authority::PolicySnapshot {
-            id: row.id,
-            scope: authority::PolicyScope::Workspace(thread_workspace_id),
-            revision: row.revision,
-            rules: serde_json::from_str(&row.rules).unwrap_or_default(),
-            source: row.source,
-            created_at: row.created_at,
-            revoked_at: row.revoked_at,
-        },
-        None => authority::default_policy(authority::PolicyScope::Workspace(thread_workspace_id)),
+        Some(row) => authority::snapshot_from_row(row, scope),
+        None => authority::default_policy(scope),
     };
     let scope_revision = repo::latest_plan_revision(db, dir.thread_id)
         .await?
@@ -145,14 +206,13 @@ async fn authorize_materialize(
         repo_known: true,
         repo_name: &repo_ref.name,
         reason: &dir.reason,
-        base_branch: &dir.base_branch,
+        base_branch: effective_base,
         human_authorized: true,
         human_denied: false,
         duplicate_lane_id: false,
         gate_override,
     };
     let verdict = authority::adjudicate_lane(&policy, &scope_revision, &lane);
-    let allowed = verdict.decision == authority::LaneDecision::AllowedByPolicy;
     let summary = format!("lane decision: {:?} ({:?})", verdict.decision, verdict.reason);
     let payload = serde_json::json!({
         "decision": verdict.decision,
@@ -182,13 +242,10 @@ async fn authorize_materialize(
             dir.id
         );
     }
-    Ok(allowed)
+    Ok(verdict)
 }
 
-pub async fn materialize_direction(
-    db: &Db,
-    direction_id: i32,
-) -> Result<Vec<entities::worktree::Model>> {
+pub async fn materialize_direction(db: &Db, direction_id: i32) -> Result<MaterializeOutcome> {
     use sea_orm::EntityTrait;
     let dir = entities::direction::Entity::find_by_id(direction_id)
         .one(&db.0)
@@ -200,7 +257,7 @@ pub async fn materialize_direction(
         .context("thread not found")?;
 
     let Some(repo_ref) = repo::direction_repo_of(db, direction_id).await? else {
-        return Ok(Vec::new());
+        return Ok(MaterializeOutcome::Ready(Vec::new()));
     };
     if let Some(existing) = repo::worktree_for(db, direction_id, repo_ref.id).await? {
         let repo_path = std::path::Path::new(&repo_ref.local_git_path);
@@ -235,7 +292,7 @@ pub async fn materialize_direction(
             // Already materialized and registered — still try deps in case a prior
             // reclaim left the checkout without node_modules. No-op when ready.
             bootstrap_worktree_deps(&existing.path).await;
-            return Ok(vec![existing]);
+            return Ok(MaterializeOutcome::Ready(vec![existing]));
         }
         // Issue #172: about to RECREATE a worktree on disk (the reclaimed/replaced
         // case) — a real write, so it is gated exactly like the first-time create
@@ -244,8 +301,13 @@ pub async fn materialize_direction(
         // valid, already-registered worktree here would strand a dispatched
         // worker mid-flight on a later policy tighten (the issue's own "已
         // materialize 后策略被收紧时,停止新的写入" — new writes, not existing ones).
-        if !authorize_materialize(db, &dir, &repo_ref, thread.workspace_id).await? {
-            return Ok(Vec::new());
+        let verdict =
+            authorize_materialize(db, &dir, &repo_ref, thread.workspace_id, &effective_base_branch(&repo_ref, &dir))
+                .await?;
+        match verdict.decision {
+            authority::LaneDecision::AllowedByPolicy => {}
+            authority::LaneDecision::NeedsGate => return Ok(MaterializeOutcome::Gated(verdict)),
+            authority::LaneDecision::Denied => return Ok(MaterializeOutcome::Denied(verdict)),
         }
         // The dir was reclaimed (remove_direction_worktree) or replaced, but the row (and
         // usually the branch) survives. Recreate the on-disk worktree for the
@@ -373,26 +435,25 @@ pub async fn materialize_direction(
         if changed {
             if let Some(updated) = repo::worktree_for(db, direction_id, repo_ref.id).await? {
                 bootstrap_worktree_deps(&updated.path).await;
-                return Ok(vec![updated]);
+                return Ok(MaterializeOutcome::Ready(vec![updated]));
             }
         }
         bootstrap_worktree_deps(&existing.path).await;
-        return Ok(vec![existing]);
+        return Ok(MaterializeOutcome::Ready(vec![existing]));
     }
     // Issue #172: no worktree row exists at all yet — a first-time create, gated
     // the SAME way as the recreate path above, and BEFORE any git/filesystem
     // work happens (issue's "越界在创建 worktree 之前拦截" acceptance bar).
-    if !authorize_materialize(db, &dir, &repo_ref, thread.workspace_id).await? {
-        return Ok(Vec::new());
-    }
     let repo_path = std::path::Path::new(&repo_ref.local_git_path);
-    let path = worktree_path(repo_path, &dir.branch);
-    git::git_exclude(repo_path, ".worktrees/");
     // Branch off the chosen base (or the repo's live default branch), syncing
     // origin first so the worktree starts from the latest remote state.
     let explicit = !dir.base_branch.trim().is_empty();
     // For the blank-base path, capture the live default separately so we can
     // detect when it differs from the recorded base_ref and persist the update.
+    // Resolved BEFORE the gate below so adjudication sees the branch this lane
+    // will really be based on — `protected_branches` must match the resolved
+    // default, not the blank placeholder. Both calls are reads; every write
+    // (git_exclude, add_worktree_synced) still happens strictly after the gate.
     let live_default: Option<String> = if explicit {
         None
     } else {
@@ -407,6 +468,14 @@ pub async fn materialize_direction(
             git::recorded_base_or_default(repo_path, &repo_ref.base_ref, repo_ref.base_ref_is_default)
         })
     };
+    let verdict = authorize_materialize(db, &dir, &repo_ref, thread.workspace_id, &base).await?;
+    match verdict.decision {
+        authority::LaneDecision::AllowedByPolicy => {}
+        authority::LaneDecision::NeedsGate => return Ok(MaterializeOutcome::Gated(verdict)),
+        authority::LaneDecision::Denied => return Ok(MaterializeOutcome::Denied(verdict)),
+    }
+    let path = worktree_path(repo_path, &dir.branch);
+    git::git_exclude(repo_path, ".worktrees/");
     let add = git::add_worktree_synced(repo_path, &dir.branch, &path, &base, explicit)
         .with_context(|| format!("worktree for repo {}", repo_ref.name))?;
     if add.created_branch && !add.synced {
@@ -541,7 +610,7 @@ pub async fn materialize_direction(
     match finish {
         Ok(rec) => {
             bootstrap_worktree_deps(&rec.path).await;
-            Ok(vec![rec])
+            Ok(MaterializeOutcome::Ready(vec![rec]))
         }
         Err(err) => {
             // Remove the checkout we own (created OR adopted as a crash orphan); delete the
@@ -1009,7 +1078,7 @@ mod tests {
         let dir = repo::create_direction(&db, t.id, "x", "claude", r.id, "r", "plan+impl", "develop")
             .await.unwrap();
 
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts.len(), 1);
         let wt_head = Cmd::new("git").args(["rev-parse", "HEAD"])
             .current_dir(&wts[0].path).output().unwrap();
@@ -1116,7 +1185,7 @@ mod tests {
             .await.unwrap();
 
         // ① materialize off HEAD (X); reclaim the dir + delete the work branch.
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
         let work_branch = wts[0].branch.clone();
         let _ = crate::git::remove_worktree(&repo_path, &wt_path);
@@ -1130,7 +1199,7 @@ mod tests {
         assert_ne!(x, sha("HEAD"), "HEAD advanced to Y");
 
         // ③ Re-materialize: must recreate off the STORED target (X), not the advanced HEAD.
-        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts2.len(), 1);
         assert!(wt_path.exists(), "worktree recreated");
         assert_eq!(
@@ -1193,7 +1262,7 @@ mod tests {
             .await.unwrap();
 
         // ① materialize (off the default main), then reclaim the dir + delete the work branch.
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
         let work_branch = wts[0].branch.clone();
         let _ = crate::git::remove_worktree(&repo_path, &wt_path);
@@ -1209,7 +1278,7 @@ mod tests {
 
         // ③ Re-materialize: the work branch is gone, so the base is used. It must NOT be the
         // user-edited branch "develop" verbatim — it re-resolves to the default (main).
-        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts2.len(), 1);
         assert!(wt_path.exists(), "worktree recreated");
         assert_eq!(
@@ -1267,7 +1336,7 @@ mod tests {
         let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
             .await.unwrap();
 
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts.len(), 1, "materialize must still create the worktree");
 
         // The HEAD fallback stores an EMPTY base (reconcile default-equiv) but pins the
@@ -1318,7 +1387,7 @@ mod tests {
         // (must not silently branch off an arbitrary fallback).
         let dir_a = repo::create_direction(&db, t.id, "a", "claude", r.id, "reason", "plan+impl", "develop")
             .await.unwrap();
-        let wts_a = materialize_direction(&db, dir_a.id).await.unwrap();
+        let wts_a = materialize_direction(&db, dir_a.id).await.unwrap().into_worktrees();
         let wt_a = std::path::Path::new(&wts_a[0].path).to_path_buf();
         let branch_a = wts_a[0].branch.clone();
         let _ = crate::git::remove_worktree(&repo_path, &wt_a);
@@ -1335,7 +1404,7 @@ mod tests {
         // (we check out the surviving work branch; the base is unused).
         let dir_b = repo::create_direction(&db, t.id, "b", "claude", r.id, "reason", "plan+impl", "release")
             .await.unwrap();
-        let wts_b = materialize_direction(&db, dir_b.id).await.unwrap();
+        let wts_b = materialize_direction(&db, dir_b.id).await.unwrap().into_worktrees();
         let wt_b = std::path::Path::new(&wts_b[0].path).to_path_buf();
         let _ = crate::git::remove_worktree(&repo_path, &wt_b);
         let _ = std::fs::remove_dir_all(&wt_b);
@@ -1385,7 +1454,7 @@ mod tests {
             .await.unwrap();
         assert!(!wt_path.exists(), "precondition: dir absent");
 
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts.len(), 1);
         assert!(wt_path.exists(), "worktree recreated");
         assert!(wts[0].created_branch, "created_branch must flip true after weft created the branch");
@@ -1443,7 +1512,7 @@ mod tests {
         // EXPLICIT base = release. ① materialize: forks the work branch off release @ R1.
         let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "release")
             .await.unwrap();
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
         let work_branch = wts[0].branch.clone();
         let row1 = repo::worktree_for(&db, dir.id, r.id).await.unwrap().unwrap();
@@ -1468,7 +1537,7 @@ mod tests {
 
         // ② re-materialize: the gone work branch is recreated off release@R2 (a FRESH branch) →
         // the stored fork commit must be UPDATED to R2.
-        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts2.len(), 1);
         assert!(wt_path.exists(), "worktree dir recreated");
         assert_eq!(sha(&work_branch), r2, "recreated work branch forked off release@R2");
@@ -1533,7 +1602,7 @@ mod tests {
             .await.unwrap();
 
         // ① materialize off release, then reclaim the dir, then DELETE the work branch.
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
         let work_branch = wts[0].branch.clone();
         assert!(wt_path.exists());
@@ -1549,7 +1618,7 @@ mod tests {
 
         // ② re-materialize: the gone work branch must be recreated off the STORED base
         // (release), NOT an arbitrary fallback (main/HEAD).
-        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts2.len(), 1);
         assert!(wt_path.exists(), "worktree dir recreated");
         assert_eq!(
@@ -1601,7 +1670,7 @@ mod tests {
                 .unwrap();
 
         // ① First materialize: creates the worktree dir and row.
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts.len(), 1, "first materialize must succeed");
         let wt_path = std::path::Path::new(&wts[0].path);
         assert!(wt_path.exists(), "worktree dir must exist after first materialize");
@@ -1618,7 +1687,7 @@ mod tests {
         assert!(existing.is_some(), "worktree row must survive reclaim");
 
         // ③ Re-materialize: must recreate the directory.
-        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts2.len(), 1, "re-materialize must return one worktree");
         assert!(
             std::path::Path::new(&wts2[0].path).exists(),
@@ -1675,14 +1744,14 @@ mod tests {
             .await.unwrap();
 
         // ① First materialize: a REAL registered worktree at the deterministic path.
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
         let work_branch = wts[0].branch.clone();
         assert!(wt_path.exists(), "precondition: worktree dir exists");
 
         // The NORMAL idempotent case: a real registered worktree still at the path → Ok,
         // returns the existing row without recreating.
-        let again = materialize_direction(&db, dir.id).await.unwrap();
+        let again = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(again.len(), 1, "a valid registered worktree returns the row idempotently");
 
         // ② Replace the dir OUT-OF-BAND with a PLAIN directory: drop the real worktree
@@ -1761,7 +1830,7 @@ mod tests {
         // ---- Case A: work branch reset OFF main (not descending from release) → Err. ----
         let dir_a = repo::create_direction(&db, t.id, "a", "claude", r.id, "reason", "plan+impl", "release")
             .await.unwrap();
-        let wts_a = materialize_direction(&db, dir_a.id).await.unwrap();
+        let wts_a = materialize_direction(&db, dir_a.id).await.unwrap().into_worktrees();
         let wt_a = std::path::Path::new(&wts_a[0].path).to_path_buf();
         let branch_a = wts_a[0].branch.clone();
         assert_eq!(sha(&branch_a), release_sha, "precondition: work branch forked off release");
@@ -1782,7 +1851,7 @@ mod tests {
         // ---- Case B: work branch still descends from release → Ok. ----
         let dir_b = repo::create_direction(&db, t.id, "b", "claude", r.id, "reason", "plan+impl", "release")
             .await.unwrap();
-        let wts_b = materialize_direction(&db, dir_b.id).await.unwrap();
+        let wts_b = materialize_direction(&db, dir_b.id).await.unwrap().into_worktrees();
         let wt_b = std::path::Path::new(&wts_b[0].path).to_path_buf();
         let branch_b = wts_b[0].branch.clone();
         // Reclaim the dir; the work branch (still off release) survives untouched.
@@ -1851,7 +1920,7 @@ mod tests {
         // ---- Case A: registered work branch reset OFF main (not descending from release) → Err. ----
         let dir_a = repo::create_direction(&db, t.id, "a", "claude", r.id, "reason", "plan+impl", "release")
             .await.unwrap();
-        let wts_a = materialize_direction(&db, dir_a.id).await.unwrap();
+        let wts_a = materialize_direction(&db, dir_a.id).await.unwrap().into_worktrees();
         let wt_a = std::path::Path::new(&wts_a[0].path).to_path_buf();
         let branch_a = wts_a[0].branch.clone();
         assert_eq!(sha(&branch_a), release_sha, "precondition: work branch forked off release");
@@ -1872,7 +1941,7 @@ mod tests {
         // ---- Case B: registered work branch still descends from release → idempotent Ok. ----
         let dir_b = repo::create_direction(&db, t.id, "b", "claude", r.id, "reason", "plan+impl", "release")
             .await.unwrap();
-        let wts_b = materialize_direction(&db, dir_b.id).await.unwrap();
+        let wts_b = materialize_direction(&db, dir_b.id).await.unwrap().into_worktrees();
         let wt_b = std::path::Path::new(&wts_b[0].path).to_path_buf();
         let branch_b = wts_b[0].branch.clone();
         assert!(crate::git::branch_descends_from(&repo_path, &branch_b, "release"),
@@ -1938,7 +2007,7 @@ mod tests {
         // Explicit base `release` (a real branch); materialize the lane off release.
         let dir = repo::create_direction(&db, t.id, "a", "claude", r.id, "reason", "plan+impl", "release")
             .await.unwrap();
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         let wt = std::path::Path::new(&wts[0].path).to_path_buf();
         let branch = wts[0].branch.clone();
         assert_eq!(sha(&branch), release_sha, "precondition: work branch forked off release");
@@ -2024,7 +2093,7 @@ mod tests {
         // ---- Case A: registered work branch reset off main (not descending from develop) → Err. ----
         let dir_a = repo::create_direction(&db, t.id, "a", "claude", r.id, "reason", "plan+impl", "develop")
             .await.unwrap();
-        let wts_a = materialize_direction(&db, dir_a.id).await.unwrap();
+        let wts_a = materialize_direction(&db, dir_a.id).await.unwrap().into_worktrees();
         let wt_a = std::path::Path::new(&wts_a[0].path).to_path_buf();
         let branch_a = wts_a[0].branch.clone();
         // The materialize fetched origin/develop and branched off it; develop exists ONLY as origin/develop.
@@ -2057,7 +2126,7 @@ mod tests {
         g(&["branch", "-D", &branch_a]);
         let dir_b = repo::create_direction(&db, t.id, "b", "claude", r.id, "reason", "plan+impl", "develop")
             .await.unwrap();
-        let wts_b = materialize_direction(&db, dir_b.id).await.unwrap();
+        let wts_b = materialize_direction(&db, dir_b.id).await.unwrap().into_worktrees();
         let wt_b = std::path::Path::new(&wts_b[0].path).to_path_buf();
         let branch_b = wts_b[0].branch.clone();
         assert!(crate::git::branch_descends_from(&clone, &branch_b, "origin/develop"),
@@ -2120,7 +2189,7 @@ mod tests {
         // Explicit base = main; the lane forks off origin/main (commit A).
         let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", &main)
             .await.unwrap();
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         let wt = std::path::Path::new(&wts[0].path).to_path_buf();
         let work_branch = wts[0].branch.clone();
         assert_eq!(wts[0].base_commit, a_sha, "recorded fork commit is origin/main's tip A");
@@ -2195,7 +2264,7 @@ mod tests {
         let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
         let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "develop")
             .await.unwrap();
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         let wt = std::path::Path::new(&wts[0].path).to_path_buf();
         let work_branch = wts[0].branch.clone();
         assert_eq!(wts[0].base_commit, local_develop_sha,
@@ -2269,7 +2338,7 @@ mod tests {
         let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
         let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "release")
             .await.unwrap();
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         let wt = std::path::Path::new(&wts[0].path).to_path_buf();
         let work_branch = wts[0].branch.clone();
         assert_eq!(wts[0].base_commit, release_sha, "recorded fork commit is release's tip R");
@@ -2584,7 +2653,7 @@ mod tests {
 
         // ① Materialize: weft creates the worktree (branch + checkout) under the managed root
         // and records the row owning both.
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts.len(), 1);
         let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
         assert!(wt_path.exists(), "precondition: on-disk worktree created");
@@ -2602,7 +2671,7 @@ mod tests {
         // ③ Re-materialize the SAME direction: the create path runs (no row), add_worktree_synced
         // hits the path-exists fast-path (ownership=false). The orphan must be ADOPTED so the new
         // row owns BOTH — else reclaim/cascade would refuse to clean weft's own leftover.
-        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts2.len(), 1);
         assert!(
             wts2[0].created_branch,
@@ -2677,7 +2746,7 @@ mod tests {
         // branched_from="HEAD"). Delete the DB row AND clear the recorded target so the SECOND
         // materialize hits the ADOPT arm (branched_from empty) with target_branch still "" —
         // exactly the crash-orphan state R54-1 fixes.
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts.len(), 1, "materialize must create the worktree");
         let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
         let branch = wts[0].branch.clone();
@@ -2688,7 +2757,7 @@ mod tests {
 
         // ② Re-materialize: the create path runs (no DB row), the path exists+is registered →
         // the ADOPT arm fires (add.branched_from empty, add.base_commit = the work branch tip).
-        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts2.len(), 1);
 
         // The recorded base stays blank (a name or "" — reconcile expects that, never a sha) and
@@ -2766,7 +2835,7 @@ mod tests {
         // ① First materialize forks the work branch off the default (create-SUCCESS). Delete the DB
         // row AND clear the recorded target so the SECOND materialize hits the ADOPT arm
         // (branched_from empty) — the crash-orphan shape, but with the default still ALIVE.
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts.len(), 1, "materialize must create the worktree");
         let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
         let branch = wts[0].branch.clone();
@@ -2779,7 +2848,7 @@ mod tests {
         // ② Re-materialize: the create path runs (no DB row), the path exists+is registered →
         // the ADOPT arm fires (add.branched_from empty). Because the base RESOLVES, this must
         // fall through to the NORMAL recording (default branch NAME), NOT the detached shape.
-        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts2.len(), 1);
 
         let d2 = entities::direction::Entity::find_by_id(dir.id)
@@ -2855,7 +2924,7 @@ mod tests {
 
         // ① First materialize forks the work branch off the default (create-SUCCESS). Capture the
         // resolved branch-off COMMIT so we can prove the recorded target is NOT a frozen commit.
-        let wts = materialize_direction(&db, dir.id).await.unwrap();
+        let wts = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts.len(), 1, "materialize must create the worktree");
         let wt_path = std::path::Path::new(&wts[0].path).to_path_buf();
         let branch = wts[0].branch.clone();
@@ -2890,7 +2959,7 @@ mod tests {
         // ② Re-materialize: the create path runs (no DB row), the path exists+is registered → the
         // ADOPT arm fires (add.branched_from empty). Because the default RESOLVES (as the remote ref),
         // this must fall through to the NORMAL recording (default branch NAME), NOT the detached shape.
-        let wts2 = materialize_direction(&db, dir.id).await.unwrap();
+        let wts2 = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(wts2.len(), 1);
 
         let d2 = entities::direction::Entity::find_by_id(dir.id)
@@ -3126,7 +3195,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let worktree = materialize_direction(&db, direction.id).await.unwrap().remove(0);
+        let worktree = materialize_direction(&db, direction.id).await.unwrap().into_worktrees().remove(0);
         let worktree_path = std::path::PathBuf::from(&worktree.path);
         let branch = worktree.branch.clone();
         let shadow = crate::checkpoint::shadow_repo_for(worktree.id).unwrap();
@@ -3381,7 +3450,7 @@ mod tests {
         let dir = repo::create_direction(&db, t.id, "x", "claude", r.id, "because", "plan+impl", "")
             .await
             .unwrap();
-        let worktrees = materialize_direction(&db, dir.id).await.unwrap();
+        let worktrees = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert!(worktrees.is_empty(), "a denied lane must never receive a worktree");
         assert!(
             repo::worktree_for(&db, dir.id, r.id).await.unwrap().is_none(),
@@ -3422,7 +3491,7 @@ mod tests {
         let dir = repo::create_direction(&db, t.id, "x", "claude", r.id, "because", "plan+impl", &default_branch)
             .await
             .unwrap();
-        let worktrees = materialize_direction(&db, dir.id).await.unwrap();
+        let worktrees = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert!(worktrees.is_empty(), "a protected-branch lane must Gate, not auto-materialize");
         assert!(repo::worktree_for(&db, dir.id, r.id).await.unwrap().is_none());
 
@@ -3430,7 +3499,7 @@ mod tests {
         repo::record_gate_decision(&db, dir.id, &policy.revision, "approved", "reviewed the diff")
             .await
             .unwrap();
-        let worktrees = materialize_direction(&db, dir.id).await.unwrap();
+        let worktrees = materialize_direction(&db, dir.id).await.unwrap().into_worktrees();
         assert_eq!(worktrees.len(), 1, "an approved Gate override must let materialize proceed");
         assert!(
             repo::worktree_for(&db, dir.id, r.id).await.unwrap().is_some(),
@@ -3455,7 +3524,7 @@ mod tests {
         let baseline = repo::create_direction(&db, t.id, "baseline", "claude", r.id, "because", "plan+impl", "")
             .await
             .unwrap();
-        let worktrees = materialize_direction(&db, baseline.id).await.unwrap();
+        let worktrees = materialize_direction(&db, baseline.id).await.unwrap().into_worktrees();
         assert_eq!(worktrees.len(), 1, "the default policy must allow an ordinary confirmed lane");
 
         // Tighten: deny this repo from now on.
@@ -3469,7 +3538,7 @@ mod tests {
         let later = repo::create_direction(&db, t.id, "later", "claude", r.id, "because", "plan+impl", "")
             .await
             .unwrap();
-        let worktrees = materialize_direction(&db, later.id).await.unwrap();
+        let worktrees = materialize_direction(&db, later.id).await.unwrap().into_worktrees();
         assert!(worktrees.is_empty(), "a tightened policy must deny a lane the old state would have allowed");
         assert!(repo::worktree_for(&db, later.id, r.id).await.unwrap().is_none());
 

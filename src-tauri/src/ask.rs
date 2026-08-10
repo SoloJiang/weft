@@ -1818,17 +1818,28 @@ impl Inner {
 #[derive(Default, Clone)]
 pub struct AskRegistry {
     inner: Arc<Mutex<Inner>>,
-    /// Issue #172's Permission Bridge: the currently active `AuthorityPolicy`
-    /// snapshot, refreshed by `commands::refresh_authority_bridge_snapshot`
-    /// on every policy tighten/loosen/revoke. `None` (the default — no
-    /// command has ever configured a policy) makes [`Self::auto_decision`]'s
-    /// bridge check a complete no-op, so this field's mere existence changes
-    /// nothing for any installation that never touches AuthorityPolicy. A
-    /// `std::sync::RwLock` (not `tokio::sync`) because every reader is on the
+    /// Issue #172's Permission Bridge: the active `AuthorityPolicy` snapshot
+    /// PER WORKSPACE, seeded at startup by `commands::seed_authority_bridge`
+    /// and refreshed by `commands::refresh_authority_bridge_snapshot` on every
+    /// policy tighten/loosen/revoke. An empty map (no installation has ever
+    /// configured a policy) makes [`Self::auto_decision`]'s bridge check a
+    /// complete no-op.
+    ///
+    /// Keyed by workspace, never a single global slot: a policy belongs to one
+    /// workspace, and one shared slot would let workspace A's `allow_actions`
+    /// auto-approve workspace B's asks (and A's `deny_actions` auto-deny them).
+    /// A `std::sync::RwLock` (not `tokio::sync`) because every reader is on the
     /// SYNCHRONOUS hot path (`auto_decision` itself is sync) — see that
     /// method's own doc for why the snapshot is cached here instead of
     /// queried from the store per ask.
-    authority: Arc<std::sync::RwLock<Option<crate::authority::PolicySnapshot>>>,
+    authority: Arc<std::sync::RwLock<HashMap<i32, crate::authority::PolicySnapshot>>>,
+    /// Which workspace each thread belongs to, recorded by the ask-creating
+    /// paths (which are async and DB-aware) so the SYNC bridge can resolve an
+    /// ask's workspace without a store round-trip. A thread absent from this
+    /// map makes the bridge defer — the pre-#172 human flow — because applying
+    /// SOME workspace's policy to an ask whose workspace is unknown is exactly
+    /// the cross-workspace leak this map exists to prevent.
+    thread_workspace: Arc<std::sync::RwLock<HashMap<i32, i32>>>,
     /// Serializes the durable-revoke command path (mutate → acked flush → rollback).
     /// Without it, two overlapping revokes of the same grant can race: the earlier
     /// one's rollback (on a failed write) re-seeds a grant a later, already-succeeded
@@ -2204,7 +2215,7 @@ impl AskRegistry {
         // (and its 3 production call sites — the ACP route, the Codex
         // app-server route, and the PreToolUse hook route, which all funnel
         // through this one function) passing with zero behavior change.
-        if let Some(decision) = self.authority_bridge_decision(action_key) {
+        if let Some(decision) = self.authority_bridge_decision(thread, action_key) {
             return Some(decision);
         }
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -2234,25 +2245,57 @@ impl AskRegistry {
     /// Called by `commands::refresh_authority_bridge_snapshot` after every
     /// policy tighten/loosen/revoke; never by the ask-creation paths
     /// themselves.
-    pub fn set_authority_snapshot(&self, snapshot: Option<crate::authority::PolicySnapshot>) {
+    pub fn set_authority_snapshot(
+        &self,
+        workspace_id: i32,
+        snapshot: Option<crate::authority::PolicySnapshot>,
+    ) {
         let mut g = self.authority.write().unwrap_or_else(|e| e.into_inner());
-        *g = snapshot;
+        match snapshot {
+            // A revoked/absent policy REMOVES the entry rather than leaving a
+            // stale one: the hard-coded conservative default then applies, and
+            // the bridge defers to the human flow exactly as it did pre-#172.
+            None => g.remove(&workspace_id),
+            Some(snapshot) => g.insert(workspace_id, snapshot),
+        };
     }
 
-    /// The currently cached AuthorityPolicy snapshot, if any — exposed for
-    /// tests and for a future read-only "what policy is live" UI surface.
-    pub fn authority_snapshot(&self) -> Option<crate::authority::PolicySnapshot> {
-        self.authority.read().unwrap_or_else(|e| e.into_inner()).clone()
+    /// The cached AuthorityPolicy snapshot for one workspace, if any — exposed
+    /// for tests and for a future read-only "what policy is live" UI surface.
+    pub fn authority_snapshot(&self, workspace_id: i32) -> Option<crate::authority::PolicySnapshot> {
+        self.authority
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&workspace_id)
+            .cloned()
+    }
+
+    /// Record which workspace a thread belongs to, so the sync bridge can find
+    /// that thread's policy. Called by the async ask-creating paths; calling it
+    /// more than once for the same thread is a harmless overwrite.
+    pub fn note_thread_workspace(&self, thread_id: i32, workspace_id: i32) {
+        self.thread_workspace
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(thread_id, workspace_id);
     }
 
     /// The Permission Bridge's decisive half (issue #172): `Some(Allow)` /
-    /// `Some(Deny)` when the cached policy has an opinion on `action_key`,
-    /// `None` (defer) otherwise — including when no policy is cached at all.
-    /// `action_key` MUST already be the canonical `ask::action_key` encoding
-    /// every ask-creation call site builds (see that function's own doc); this
-    /// method never re-derives or loosens it.
-    fn authority_bridge_decision(&self, action_key: &str) -> Option<Decision> {
-        let snapshot = self.authority_snapshot()?;
+    /// `Some(Deny)` when the policy of THIS ask's workspace has an opinion on
+    /// `action_key`, `None` (defer) otherwise — including when no policy is
+    /// cached for it and when the thread's workspace is not known here, which
+    /// is why a missing registration can only ever cost a human card, never
+    /// hand an ask to another workspace's rules. `action_key` MUST already be
+    /// the canonical `ask::action_key` encoding every ask-creation call site
+    /// builds (see that function's own doc); this method never re-derives or
+    /// loosens it.
+    fn authority_bridge_decision(&self, thread: i32, action_key: &str) -> Option<Decision> {
+        let workspace_id = *self
+            .thread_workspace
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&thread)?;
+        let snapshot = self.authority_snapshot(workspace_id)?;
         let (bridge, _verdict) = crate::authority::bridge_decision(
             &snapshot,
             &crate::authority::PermissionAction { action_key },
@@ -6161,29 +6204,40 @@ mod tests {
             source: "user".to_string(),
             created_at: String::new(),
             revoked_at: String::new(),
+            rules_unreadable: false,
         }
+    }
+
+    /// A registry that already knows thread 1 lives in workspace 1 — the
+    /// registration the async ask-creating paths perform in production. Without
+    /// it the bridge deliberately defers, so every test below would pass for the
+    /// wrong reason.
+    fn bridge_registry() -> AskRegistry {
+        let r = AskRegistry::new();
+        r.note_thread_workspace(1, 1);
+        r
     }
 
     #[test]
     fn no_installed_snapshot_leaves_auto_decision_completely_unchanged() {
-        let r = AskRegistry::new();
-        assert!(r.authority_snapshot().is_none());
+        let r = bridge_registry();
+        assert!(r.authority_snapshot(1).is_none());
         assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "anything").is_none());
     }
 
     #[test]
     fn installed_snapshot_with_no_opinion_still_defers() {
-        let r = AskRegistry::new();
-        r.set_authority_snapshot(Some(bridge_test_policy(Default::default())));
+        let r = bridge_registry();
+        r.set_authority_snapshot(1, Some(bridge_test_policy(Default::default())));
         assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "anything").is_none());
     }
 
     #[test]
     fn bridge_auto_allows_a_configured_action_before_any_human_card() {
-        let r = AskRegistry::new();
+        let r = bridge_registry();
         let mut rules = crate::authority::PolicyRules::default();
         rules.allow_actions = vec!["Run: git status".to_string()];
-        r.set_authority_snapshot(Some(bridge_test_policy(rules)));
+        r.set_authority_snapshot(1, Some(bridge_test_policy(rules)));
         assert_eq!(
             r.auto_decision(1, "10", RiskLevel::Unknown, "Run: git status"),
             Some(Decision::Allow)
@@ -6194,10 +6248,10 @@ mod tests {
 
     #[test]
     fn bridge_auto_denies_a_configured_action_with_no_human_card() {
-        let r = AskRegistry::new();
+        let r = bridge_registry();
         let mut rules = crate::authority::PolicyRules::default();
         rules.deny_actions = vec!["Run: rm -rf /".to_string()];
-        r.set_authority_snapshot(Some(bridge_test_policy(rules)));
+        r.set_authority_snapshot(1, Some(bridge_test_policy(rules)));
         assert_eq!(
             r.auto_decision(1, "10", RiskLevel::Unknown, "Run: rm -rf /"),
             Some(Decision::Deny)
@@ -6210,10 +6264,10 @@ mod tests {
         // "CLI 自身的 approval/sandbox 设置永不放宽 Weft 策略" cuts both ways — a
         // human's own explicit standing grant is not something a LATER policy
         // silently revokes out from under an already-running task either).
-        let r = AskRegistry::new();
+        let r = bridge_registry();
         let mut rules = crate::authority::PolicyRules::default();
         rules.deny_actions = vec!["Run: git status".to_string()];
-        r.set_authority_snapshot(Some(bridge_test_policy(rules)));
+        r.set_authority_snapshot(1, Some(bridge_test_policy(rules)));
         r.answer(
             r.request(1, "10", "bash", "s", "d", RiskLevel::Unknown, "Run: git status").0,
             Answer::Full,
@@ -6225,14 +6279,60 @@ mod tests {
     }
 
     #[test]
-    fn set_authority_snapshot_none_clears_a_previously_installed_policy() {
+    fn one_workspaces_policy_never_decides_another_workspaces_ask() {
+        // Workspace 1 opts an action in; workspace 2 has no policy at all and
+        // must keep deferring every ask to the human flow.
+        let r = AskRegistry::new();
+        r.note_thread_workspace(1, 1);
+        r.note_thread_workspace(2, 2);
+        let mut rules = crate::authority::PolicyRules::default();
+        rules.allow_actions = vec!["Run: git status".to_string()];
+        r.set_authority_snapshot(1, Some(bridge_test_policy(rules)));
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::Unknown, "Run: git status"),
+            Some(Decision::Allow)
+        );
+        assert!(
+            r.auto_decision(2, "10", RiskLevel::Unknown, "Run: git status").is_none(),
+            "workspace 2 has no policy — workspace 1's allow must not reach it"
+        );
+    }
+
+    #[test]
+    fn a_deny_in_one_workspace_does_not_deny_another_workspaces_ask() {
+        let r = AskRegistry::new();
+        r.note_thread_workspace(1, 1);
+        r.note_thread_workspace(2, 2);
+        let mut rules = crate::authority::PolicyRules::default();
+        rules.deny_actions = vec!["Run: rm -rf /".to_string()];
+        r.set_authority_snapshot(1, Some(bridge_test_policy(rules)));
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::Unknown, "Run: rm -rf /"),
+            Some(Decision::Deny)
+        );
+        assert!(r.auto_decision(2, "10", RiskLevel::Unknown, "Run: rm -rf /").is_none());
+    }
+
+    #[test]
+    fn an_unregistered_thread_defers_instead_of_borrowing_a_policy() {
+        // The bridge must never guess a workspace: with no registration the
+        // pre-#172 human flow runs, which is the conservative answer.
         let r = AskRegistry::new();
         let mut rules = crate::authority::PolicyRules::default();
         rules.allow_actions = vec!["Run: git status".to_string()];
-        r.set_authority_snapshot(Some(bridge_test_policy(rules)));
-        assert!(r.authority_snapshot().is_some());
-        r.set_authority_snapshot(None);
-        assert!(r.authority_snapshot().is_none());
+        r.set_authority_snapshot(1, Some(bridge_test_policy(rules)));
+        assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "Run: git status").is_none());
+    }
+
+    #[test]
+    fn set_authority_snapshot_none_clears_a_previously_installed_policy() {
+        let r = bridge_registry();
+        let mut rules = crate::authority::PolicyRules::default();
+        rules.allow_actions = vec!["Run: git status".to_string()];
+        r.set_authority_snapshot(1, Some(bridge_test_policy(rules)));
+        assert!(r.authority_snapshot(1).is_some());
+        r.set_authority_snapshot(1, None);
+        assert!(r.authority_snapshot(1).is_none());
         assert!(r.auto_decision(1, "10", RiskLevel::Unknown, "Run: git status").is_none());
     }
 }

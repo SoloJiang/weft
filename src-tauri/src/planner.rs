@@ -1356,6 +1356,14 @@ async fn confirm_with_manual_tool_with_session_liveness(
         // checkout left recreated (undoing the user's reclaim) while nothing is dispatched. The
         // directions pre-exist, so we never delete them — only the just-made recreation is reverted.
         let mut recreated_fastpath: Vec<i32> = Vec::new();
+        // Lanes the AuthorityPolicy refused on THIS pass (issue #172). A plan
+        // confirmed under an older, looser policy must not keep re-dispatching
+        // a lane the policy now gates or denies — that is exactly the "已
+        // materialize 后策略被收紧时,停止新的写入" boundary, and this fast path
+        // recreates reclaimed worktrees, which is a new write. Refused lanes are
+        // dropped from the dispatch set rather than failing the whole retry: the
+        // other lanes in the plan are still legitimately re-dispatchable.
+        let mut refused_fastpath: Vec<i32> = Vec::new();
         for &id in &matching {
             // repo_id for this direction (from the `all` list already loaded). If the row/worktree
             // can't be read, treat as NOT reclaimed — never crash the idempotent retry.
@@ -1366,11 +1374,18 @@ async fn confirm_with_manual_tool_with_session_liveness(
                 ),
                 None => false,
             };
-            if let Err(err) = materialize::materialize_direction(db, id).await {
-                for r in &recreated_fastpath {
-                    let _ = materialize::reclaim_recreated_worktree(db, *r).await;
+            let outcome = match materialize::materialize_direction(db, id).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    for r in &recreated_fastpath {
+                        let _ = materialize::reclaim_recreated_worktree(db, *r).await;
+                    }
+                    return Err(err);
                 }
-                return Err(err);
+            };
+            if outcome.refusal().is_some() {
+                refused_fastpath.push(id);
+                continue;
             }
             if was_reclaimed {
                 recreated_fastpath.push(id);
@@ -1399,6 +1414,7 @@ async fn confirm_with_manual_tool_with_session_liveness(
             &upstream_lanes_from_resolved(&resolved, &fastpath_proposal),
         )
         .await;
+        matching.retain(|id| !refused_fastpath.contains(id));
         return Ok(matching);
     }
     let existing_dirs = repo::list_directions(db, thread_id).await?;
@@ -1601,9 +1617,32 @@ async fn confirm_with_manual_tool_with_session_liveness(
             // the reused lane existed before and is never torn down) AND undo any reused-lane
             // recreations, so nothing is marked confirmed — pending_writes keeps surfacing the Needs
             // cards (no post-commit stranding) and the user's reclaim stands.
-            if let Err(err) = materialize::materialize_direction(db, ex_id).await {
-                rollback_attempt(db, &created_now, &recreated_reused).await;
-                return Err(err);
+            let outcome = match materialize::materialize_direction(db, ex_id).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    rollback_attempt(db, &created_now, &recreated_reused).await;
+                    return Err(err);
+                }
+            };
+            // An AuthorityPolicy refusal (issue #172) is not an error, but it is
+            // not a materialized lane either. A DENIED reused lane fails the whole
+            // confirm — nothing can unstick it, so committing the plan around it
+            // would strand the user with a permanently unrunnable lane. A GATED
+            // one keeps its row (the Gate card points at it) but must NOT join
+            // `dispatch_ids`: #171's invariant is that everything dispatched has a
+            // worktree, and this lane has none until a human resolves its Gate.
+            match &outcome {
+                materialize::MaterializeOutcome::Denied(verdict) => {
+                    rollback_attempt(db, &created_now, &recreated_reused).await;
+                    anyhow::bail!("lane_denied_by_policy:{:?}", verdict.reason);
+                }
+                materialize::MaterializeOutcome::Gated(_) => {
+                    if let Some(pd) = proposal.directions.get_mut(idx) {
+                        pd.direction_id = ex_id;
+                    }
+                    continue;
+                }
+                materialize::MaterializeOutcome::Ready(_) => {}
             }
             if was_reclaimed {
                 recreated_reused.push(ex_id);
@@ -1656,13 +1695,36 @@ async fn confirm_with_manual_tool_with_session_liveness(
                 return Err(err);
             }
         };
-        if let Err(err) = materialize::materialize_direction(db, dir.id).await {
-            // The failing lane has no worktree yet; drop its row, then roll back
-            // the earlier (materialized) lanes and undo any reused-lane recreations so a
-            // corrected retry starts clean (and the user's reclaim is restored).
-            let _ = repo::delete_direction(db, dir.id).await;
-            rollback_attempt(db, &created_now, &recreated_reused).await;
-            return Err(err);
+        let outcome = match materialize::materialize_direction(db, dir.id).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                // The failing lane has no worktree yet; drop its row, then roll back
+                // the earlier (materialized) lanes and undo any reused-lane recreations so a
+                // corrected retry starts clean (and the user's reclaim is restored).
+                let _ = repo::delete_direction(db, dir.id).await;
+                rollback_attempt(db, &created_now, &recreated_reused).await;
+                return Err(err);
+            }
+        };
+        // Policy refusal, same split as the reused-lane path above: a DENIED lane
+        // is torn down with the rest of the attempt (a row nothing can ever
+        // materialize is worse than no row), a GATED one keeps its row so the
+        // human has a Gate to resolve, and neither is dispatched.
+        match &outcome {
+            materialize::MaterializeOutcome::Denied(verdict) => {
+                let _ = repo::delete_direction(db, dir.id).await;
+                rollback_attempt(db, &created_now, &recreated_reused).await;
+                anyhow::bail!("lane_denied_by_policy:{:?}", verdict.reason);
+            }
+            materialize::MaterializeOutcome::Gated(_) => {
+                created_now.push(dir.id);
+                committed_route_markers.push((dir.id, route));
+                if let Some(pd) = proposal.directions.get_mut(idx) {
+                    pd.direction_id = dir.id;
+                }
+                continue;
+            }
+            materialize::MaterializeOutcome::Ready(_) => {}
         }
         created_now.push(dir.id);
         committed_route_markers.push((dir.id, route));
@@ -2208,11 +2270,7 @@ pub async fn approve_direction_with_pin(
     index: usize,
     manual_tool: Option<&str>,
 ) -> Result<i32> {
-    let direction_id =
-        approve_direction_with_pin_with_session_liveness(db, thread_id, index, manual_tool, None)
-            .await?;
-    record_decision_evidence_for_approval(db, thread_id, index, direction_id).await;
-    Ok(direction_id)
+    approve_direction_with_pin_with_session_liveness(db, thread_id, index, manual_tool, None).await
 }
 
 /// Runtime-aware counterpart of [`approve_direction_with_pin`]. A live worker
@@ -2225,16 +2283,14 @@ pub async fn approve_direction_with_pin_and_live_sessions(
     manual_tool: Option<&str>,
     is_session_live: &(dyn Fn(i32) -> bool + Send + Sync),
 ) -> Result<i32> {
-    let direction_id = approve_direction_with_pin_with_session_liveness(
+    approve_direction_with_pin_with_session_liveness(
         db,
         thread_id,
         index,
         manual_tool,
         Some(is_session_live),
     )
-    .await?;
-    record_decision_evidence_for_approval(db, thread_id, index, direction_id).await;
-    Ok(direction_id)
+    .await
 }
 
 /// Evidence write site 4 (issue #174 R1-04), approval half. Best-effort and
@@ -2246,36 +2302,20 @@ pub async fn approve_direction_with_pin_and_live_sessions(
 /// recorded `policy_revision` is "the plan version as of just after
 /// approval" rather than a byte-exact "as of the approval itself" — adequate
 /// for a first Evidence ledger, not a correctness-critical value.
-async fn record_decision_evidence_for_approval(
-    db: &Db,
-    thread_id: i32,
-    index: usize,
-    direction_id: i32,
-) {
-    let policy_revision = repo::get_plan(db, thread_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|plan| plan.created_at)
-        .unwrap_or_default();
-    record_decision_evidence(
-        db,
-        thread_id,
-        direction_id,
-        &format!("approve_direction:{thread_id}:{index}"),
-        "allowed_by_policy",
-        &policy_revision,
-    )
-    .await;
-}
-
 /// Append `decision` evidence (issue #174 R1-04): the settled Lane policy
 /// decision plus the plan's OCC version (`plan.created_at`) as
-/// `policy_revision`. Issue #172 will replace this with a real
-/// `AuthorityPolicy` revision; the column's shape (an opaque revision string)
-/// is deliberately left compatible with that migration rather than inventing
-/// a richer structure now. Best-effort: a failed evidence write must never
-/// fail the decision itself.
+/// `policy_revision`.
+///
+/// Issue #172 took over the APPROVAL half of this ledger: every lane that
+/// reaches `materialize::materialize_direction` gets a `decision` row written
+/// by `authorize_materialize` carrying the real `authority_policy` revision and
+/// the verdict's own reason/hit_rule. The post-hoc `allowed_by_policy` rows
+/// that used to be appended here after confirm/approve were not merely
+/// duplicates: `list_lane_gates` reads the NEWEST `decision` row per lane, so a
+/// row written after materialize shadowed the `needs_gate` verdict and made the
+/// Gate card unreachable for the very lanes that needed one. The denial half
+/// stays here — a denied lane never materializes, so nothing else records it.
+/// Best-effort: a failed evidence write must never fail the decision itself.
 async fn record_decision_evidence(
     db: &Db,
     thread_id: i32,
@@ -2285,7 +2325,10 @@ async fn record_decision_evidence(
     policy_revision: &str,
 ) {
     let summary = format!("lane decision: {policy}");
-    let payload = serde_json::json!({ "policy": policy }).to_string();
+    // Same key `authority`'s own decision rows use, so every `decision` row in
+    // the ledger answers `payload["decision"]` uniformly — `list_lane_gates`
+    // reads exactly that and treats a row without the key as unparseable.
+    let payload = serde_json::json!({ "decision": policy }).to_string();
     if let Err(error) = crate::store::repo::append_evidence(
         db,
         crate::store::repo::EvidenceWrite {
@@ -2528,9 +2571,20 @@ async fn approve_direction_with_pin_with_session_liveness(
             // per-thread gate. The approval and the pin then commit together,
             // so an exit cannot leave an approved lane without its explicit
             // engine choice. A failed CAS restores a reclaimed worktree below.
-            if let Err(err) = materialize::materialize_direction(db, id).await {
+            let outcome = match materialize::materialize_direction(db, id).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    reclaim_recreated_reused_worktree(db, id, was_reclaimed).await;
+                    return Err(err);
+                }
+            };
+            // Issue #172: a DENIED lane can never be unstuck, so the approval must
+            // not commit around it. A GATED lane falls through and the approval
+            // DOES commit — the lane is approved but has no worktree, so nothing
+            // dispatches it until a human resolves the Gate card.
+            if let materialize::MaterializeOutcome::Denied(verdict) = &outcome {
                 reclaim_recreated_reused_worktree(db, id, was_reclaimed).await;
-                return Err(err);
+                anyhow::bail!("lane_denied_by_policy:{:?}", verdict.reason);
             }
             // Test-only seam: a re-propose may still land between our initial
             // read and the one transaction that records approval plus pin.
@@ -2574,22 +2628,25 @@ async fn approve_direction_with_pin_with_session_liveness(
             #[cfg(test)]
             tests::approve_persist_gate(db, thread_id).await;
             persist_decision(db, thread_id, &proposal, &plan).await?;
-            if let Err(err) = materialize::materialize_direction(db, id).await {
-                // R45-2: the approval is persisted but rematerialization failed
-                // (path is now a plain dir, the branch no longer descends from
-                // base, …) — revert the lane to pending so the Needs card stays
-                // retryable (else refreshNeeds drops it with no worker dispatched).
-                revert_reused_approval(
-                    db,
-                    thread_id,
-                    index,
-                    id,
-                    &proposal,
-                    &plan,
-                    was_reclaimed,
-                )
-                .await;
-                return Err(err);
+            let outcome = match materialize::materialize_direction(db, id).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    // R45-2: the approval is persisted but rematerialization failed
+                    // (path is now a plain dir, the branch no longer descends from
+                    // base, …) — revert the lane to pending so the Needs card stays
+                    // retryable (else refreshNeeds drops it with no worker dispatched).
+                    revert_reused_approval(db, thread_id, index, id, &proposal, &plan, was_reclaimed)
+                        .await;
+                    return Err(err);
+                }
+            };
+            // Issue #172: a DENIED lane gets the same revert as a hard failure —
+            // the approval is already persisted here, so leaving it approved would
+            // strand a lane nothing can ever materialize. A GATED lane keeps its
+            // approval: the Gate card is the retry path.
+            if let materialize::MaterializeOutcome::Denied(verdict) = &outcome {
+                revert_reused_approval(db, thread_id, index, id, &proposal, &plan, was_reclaimed).await;
+                anyhow::bail!("lane_denied_by_policy:{:?}", verdict.reason);
             }
         }
         if let Some(route) = reuse_route.as_ref() {
@@ -2642,11 +2699,20 @@ async fn approve_direction_with_pin_with_session_liveness(
         matches!(route.source, crate::engine_routing::RoutingSource::Manual),
     )
     .await?;
-    if let Err(err) = materialize::materialize_direction(db, dir.id).await {
-        // Roll back the just-created row so a corrected retry starts clean and
-        // doesn't hit the idempotent fast-path with a worktree-less task.
+    let outcome = match materialize::materialize_direction(db, dir.id).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            // Roll back the just-created row so a corrected retry starts clean and
+            // doesn't hit the idempotent fast-path with a worktree-less task.
+            let _ = repo::delete_direction(db, dir.id).await;
+            return Err(err);
+        }
+    };
+    // Issue #172, same split as the reused-lane path: tear a DENIED lane's row
+    // back down, keep a GATED one so its Gate card has a lane to point at.
+    if let materialize::MaterializeOutcome::Denied(verdict) = &outcome {
         let _ = repo::delete_direction(db, dir.id).await;
-        return Err(err);
+        anyhow::bail!("lane_denied_by_policy:{:?}", verdict.reason);
     }
     // Test-only seam: let a test land a re-propose / confirm in the window between
     // our plan read and the CAS, deterministically driving the CAS rejection below.

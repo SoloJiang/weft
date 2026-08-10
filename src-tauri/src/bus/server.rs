@@ -222,8 +222,23 @@ async fn handle_ask(
         // A standing rule (full access / always-allow / issue #103's read-only
         // batch-or-issue grant) decides without surfacing. Matches on the exact
         // action key, but only after the exact live identity proof above.
-        if asks.auto_decision(thread, &dir, risk, &action_key) == Some(Decision::Allow) {
-            return hook_decision("allow", "Auto-approved by a weft rule");
+        // Issue #172: tell the SYNC Permission Bridge which workspace this ask
+        // belongs to, so it consults THIS workspace's policy and never another's.
+        // A read failure simply leaves the mapping unset and the bridge defers to
+        // the human flow — the same conservative answer as having no policy.
+        if let Ok(Some(row)) = crate::store::repo::get_thread(&db, thread).await {
+            asks.note_thread_workspace(thread, row.workspace_id);
+        }
+        // Issue #172 made `Deny` reachable here for the first time (the
+        // Permission Bridge's decisive half). Comparing against `Some(Allow)`
+        // alone would fall through to a human card, quietly turning a policy
+        // that FORBIDS an action into one that merely asks about it — and the
+        // ACP and Codex routes both honor Deny, so the same policy would behave
+        // differently per engine. Map the decision exhaustively instead.
+        match asks.auto_decision(thread, &dir, risk, &action_key) {
+            Some(Decision::Allow) => return hook_decision("allow", "Auto-approved by a weft rule"),
+            Some(Decision::Deny) => return hook_decision("deny", "Denied by the workspace policy"),
+            None => {}
         }
 
         asks.request(thread, &dir, tool, &summary, &detail, risk, &action_key)

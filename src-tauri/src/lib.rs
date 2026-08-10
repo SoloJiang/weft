@@ -269,6 +269,15 @@ pub fn run() {
                 let db = app.state::<store::Db>().inner().clone();
                 commands::spawn_pending_repo_action_cleanups(db.clone());
                 commands::spawn_pending_repo_action_feedback(db.clone(), None);
+                // Issue #172: install every workspace's active AuthorityPolicy
+                // into the Permission Bridge before any CLI ask can arrive.
+                // Without it the bridge starts empty every launch and a
+                // configured policy silently stops applying to CLI asks.
+                let bridge_asks = app.state::<ask::AskRegistry>().inner().clone();
+                let bridge_db = db.clone();
+                tauri::async_runtime::spawn(async move {
+                    commands::seed_authority_bridge(&bridge_db, &bridge_asks).await;
+                });
                 tauri::async_runtime::spawn(async move {
                     curator::resume_running_analyses(&db).await;
                 });

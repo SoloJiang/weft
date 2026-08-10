@@ -2833,50 +2833,15 @@ async fn confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sess
     )
     .await?;
     asks.grant_read_only_issue(thread_id);
-    // Evidence write site 4 (issue #174 R1-04): this is the ONLY production
-    // path that materializes a Lane decision today — `planner::
-    // approve_direction`/`deny_direction` also record decision evidence
-    // (for future per-lane UI/bus wiring) but neither is currently called
-    // from a tauri command or bus tool. `confirm` only ever dispatches
-    // AllowedByPolicy lanes (see `readiness::proposal_lane_policy`'s
-    // Confirmed-phase rule), so every id here gets that verdict.
-    record_confirm_decision_evidence(db, thread_id, &ids).await;
+    // Evidence write site 4 (issue #174 R1-04) used to append an
+    // `allowed_by_policy` row per confirmed lane here. Issue #172 made that
+    // both redundant and harmful: `materialize::authorize_materialize` already
+    // writes a `decision` row for every lane it adjudicates — with the real
+    // `authority_policy` revision, not the plan's OCC token — and this one, id
+    // being higher, became the NEWEST decision row. `list_lane_gates` reads the
+    // newest row per lane, so a lane the policy had just gated was overwritten
+    // with "allowed", and its Gate card silently disappeared.
     Ok(ids)
-}
-
-async fn record_confirm_decision_evidence(db: &Db, thread_id: i32, direction_ids: &[i32]) {
-    if direction_ids.is_empty() {
-        return;
-    }
-    let policy_revision = crate::store::repo::get_plan(db, thread_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|plan| plan.created_at)
-        .unwrap_or_default();
-    for &direction_id in direction_ids {
-        let summary = "lane decision: allowed_by_policy".to_string();
-        let payload = serde_json::json!({ "policy": "allowed_by_policy" }).to_string();
-        if let Err(error) = crate::store::repo::append_evidence(
-            db,
-            crate::store::repo::EvidenceWrite {
-                thread_id,
-                direction_id,
-                kind: crate::store::repo::EVIDENCE_KIND_DECISION,
-                source: "planner",
-                source_ref: &format!("confirm_proposal:{thread_id}"),
-                revision: "",
-                policy_revision: &policy_revision,
-                summary: &summary,
-                payload: &payload,
-                collection_state: crate::store::repo::EVIDENCE_COLLECTION_OK,
-            },
-        )
-        .await
-        {
-            eprintln!("[weft][evidence] decision evidence for direction {direction_id}: {error}");
-        }
-    }
 }
 
 /// Confirm the stored proposal: create its directions + materialize worktrees.
@@ -3032,18 +2997,32 @@ pub struct AuthorityPolicyDto {
     pub source: String,
     pub created_at: String,
     pub revoked_at: String,
+    /// The stored `rules` JSON did not parse, so `rules` above is the empty
+    /// default and the backend is gating every Lane in this scope. Surfaced so
+    /// the UI never presents an empty rule set as if it were the user's.
+    pub rules_unreadable: bool,
 }
 
 fn authority_policy_dto(row: crate::store::entities::authority_policy::Model) -> AuthorityPolicyDto {
+    let scope_id = row.scope_id;
+    let scope = row.scope.clone();
+    // Same fail-closed parse the adjudicator uses, so the UI can never show an
+    // empty (i.e. maximally permissive-looking) rule set for a row the backend
+    // is actually treating as unreadable.
+    let snapshot = crate::authority::snapshot_from_row(
+        row,
+        crate::authority::PolicyScope::Workspace(scope_id),
+    );
     AuthorityPolicyDto {
-        id: row.id,
-        scope: row.scope,
-        scope_id: row.scope_id,
-        revision: row.revision,
-        rules: serde_json::from_str(&row.rules).unwrap_or_default(),
-        source: row.source,
-        created_at: row.created_at,
-        revoked_at: row.revoked_at,
+        id: snapshot.id,
+        scope,
+        scope_id,
+        revision: snapshot.revision,
+        rules: snapshot.rules,
+        source: snapshot.source,
+        created_at: snapshot.created_at,
+        revoked_at: snapshot.revoked_at,
+        rules_unreadable: snapshot.rules_unreadable,
     }
 }
 
@@ -3120,21 +3099,49 @@ pub async fn revoke_authority_policy(
 /// a read failure here leaves the previous snapshot in place (the bridge
 /// simply keeps deferring to the existing AskRegistry/human flow, never fails
 /// closed on a transient read error by BLOCKING every CLI action).
-async fn refresh_authority_bridge_snapshot(db: &Db, asks: &crate::ask::AskRegistry, workspace_id: i32) {
+pub async fn refresh_authority_bridge_snapshot(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    workspace_id: i32,
+) {
     match crate::store::repo::get_active_authority_policy(db, "workspace", workspace_id).await {
-        Ok(Some(row)) => asks.set_authority_snapshot(Some(crate::authority::PolicySnapshot {
-            id: row.id,
-            scope: crate::authority::PolicyScope::Workspace(workspace_id),
-            revision: row.revision,
-            rules: serde_json::from_str(&row.rules).unwrap_or_default(),
-            source: row.source,
-            created_at: row.created_at,
-            revoked_at: row.revoked_at,
-        })),
-        Ok(None) => asks.set_authority_snapshot(None),
+        Ok(Some(row)) => asks.set_authority_snapshot(
+            workspace_id,
+            Some(crate::authority::snapshot_from_row(
+                row,
+                crate::authority::PolicyScope::Workspace(workspace_id),
+            )),
+        ),
+        Ok(None) => asks.set_authority_snapshot(workspace_id, None),
         Err(error) => {
+            // Fail CLOSED on a read error: drop whatever was cached so the
+            // bridge defers to the human flow. The previous shape kept the old
+            // snapshot, which meant a revoke whose refresh read failed left the
+            // REVOKED (possibly over-broad) rules auto-approving for the rest
+            // of the process while the UI reported the revoke as successful.
+            // Clearing costs a human card; keeping costs an un-revokable grant.
             eprintln!("[weft][authority] bridge snapshot refresh for workspace {workspace_id}: {error}");
+            asks.set_authority_snapshot(workspace_id, None);
         }
+    }
+}
+
+/// Install every workspace's active AuthorityPolicy into the Permission Bridge
+/// at startup. Without this the bridge holds nothing until someone happens to
+/// re-save a policy in this process, so a configured `deny_actions` silently
+/// stopped applying to CLI asks after every restart — while `get_authority_policy`
+/// still displayed it as active and `materialize` still enforced it, because
+/// both read the row from the store rather than this cache.
+pub async fn seed_authority_bridge(db: &Db, asks: &crate::ask::AskRegistry) {
+    let workspaces = match crate::store::repo::list_workspaces(db).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            eprintln!("[weft][authority] bridge seed: {error}");
+            return;
+        }
+    };
+    for ws in workspaces {
+        refresh_authority_bridge_snapshot(db, asks, ws.id).await;
     }
 }
 
@@ -3201,11 +3208,41 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
     Ok(out)
 }
 
+/// The policy revision a Gate for this direction must be decided under: the
+/// workspace's ACTIVE `authority_policy` revision right now, or the hard-coded
+/// default's `"0"` when no policy is configured. Resolved server-side so a
+/// caller can never record a decision against a revision that is not in force
+/// — neither a stale one read off an old card nor a not-yet-minted one.
+async fn current_gate_policy_revision(db: &Db, direction_id: i32) -> anyhow::Result<String> {
+    let Some(dir) = crate::store::repo::get_direction(db, direction_id).await? else {
+        anyhow::bail!("lane {direction_id} not found");
+    };
+    let Some(thread) = crate::store::repo::get_thread(db, dir.thread_id).await? else {
+        anyhow::bail!("issue {} not found", dir.thread_id);
+    };
+    let active =
+        crate::store::repo::get_active_authority_policy(db, "workspace", thread.workspace_id).await?;
+    Ok(match active {
+        Some(row) => row.revision,
+        None => crate::authority::default_policy(crate::authority::PolicyScope::Workspace(
+            thread.workspace_id,
+        ))
+        .revision,
+    })
+}
+
 /// Resolve one Lane's Gate: record the human's decision, keyed to the EXACT
 /// policy revision it was decided under (see `store::repo::
 /// record_gate_decision`'s own doc on why), then re-run materialize so an
 /// approval takes effect immediately rather than waiting for the next
 /// unrelated dispatch. `decision` must be `"approved"` or `"denied"`.
+///
+/// `policy_revision` is what the CARD was rendered against, and it is checked
+/// against the live revision rather than trusted: an approval recorded under a
+/// superseded revision is invisible to `authority::adjudicate_lane` (which only
+/// honors an override at the current revision), so the button would appear to
+/// work while changing nothing. Failing loudly instead lets the UI reload the
+/// card and re-ask the human against the rules actually in force.
 #[tauri::command]
 pub async fn resolve_lane_gate(
     db: State<'_, Db>,
@@ -3214,18 +3251,31 @@ pub async fn resolve_lane_gate(
     decision: String,
     reason: Option<String>,
 ) -> R<Vec<crate::store::entities::worktree::Model>> {
+    let current = current_gate_policy_revision(&db, direction_id).await.map_err(e)?;
+    if policy_revision != current {
+        return Err("gate_policy_changed".to_string());
+    }
     crate::store::repo::record_gate_decision(
         &db,
         direction_id,
-        &policy_revision,
+        &current,
         &decision,
         reason.as_deref().unwrap_or(""),
     )
     .await
     .map_err(e)?;
-    crate::materialize::materialize_direction(&db, direction_id)
+    let outcome = crate::materialize::materialize_direction(&db, direction_id)
         .await
-        .map_err(e)
+        .map_err(e)?;
+    // A denial resolves the Gate by design — report it as success with no
+    // worktrees. A lane still GATED after an approval means another rule
+    // (or a policy change that raced this call) refused it, and returning an
+    // empty list would read as "materialized nothing" — surface it instead.
+    match outcome {
+        crate::materialize::MaterializeOutcome::Ready(rows) => Ok(rows),
+        crate::materialize::MaterializeOutcome::Denied(_) => Ok(Vec::new()),
+        crate::materialize::MaterializeOutcome::Gated(_) => Err("gate_still_pending".to_string()),
+    }
 }
 
 /// Newest-first scope revision history for a thread (issue #172's versioned
@@ -3293,10 +3343,23 @@ pub async fn create_direction(
     )
     .await
     .map_err(e)?;
-    materialize::materialize_direction(&db, dir.id)
-        .await
-        .map_err(e)?;
-    Ok(dir)
+    let outcome = materialize::materialize_direction(&db, dir.id).await.map_err(e)?;
+    // Issue #172: this entry point is independent of the planner, so neither
+    // confirm's rollback nor the confirmed fast path would ever clean up after
+    // it. A DENIED lane's row is torn back down and the failure reported; a
+    // GATED one keeps its row so the human has a Gate card to resolve, but the
+    // caller is told the lane is not runnable yet rather than handed a
+    // direction that looks materialized and has nothing on disk.
+    match outcome.refusal() {
+        None => Ok(dir),
+        Some(verdict) => {
+            if matches!(verdict.decision, crate::authority::LaneDecision::Denied) {
+                let _ = repo::delete_direction(&db, dir.id).await;
+                return Err(format!("lane_denied_by_policy:{:?}", verdict.reason));
+            }
+            Err(format!("lane_needs_gate:{:?}", verdict.reason))
+        }
+    }
 }
 
 /// Set a task's lifecycle status (human override; the agent does this via the
