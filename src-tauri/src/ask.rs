@@ -2660,12 +2660,27 @@ impl AskRegistry {
         let covered_ids: HashSet<u64> = covered.iter().map(|a| a.id).collect();
         g.open.retain(|a| !covered_ids.contains(&a.id));
         for c in covered {
+            // EVERY swept ask is checked against the policy, not just the one
+            // that was clicked. A `Full` answer resolves every other open ask
+            // for the same task, and those carry DIFFERENT action keys — so
+            // rechecking only `ask.action_key` let a sibling the policy denies
+            // ride out on the target's `Allow`. The sweep is a convenience for
+            // the human, never a way around a constraint.
+            let verdict = match self.authority_bridge_decision(c.thread, &c.action_key) {
+                Some(Decision::Deny) => Decision::Deny,
+                Some(Decision::Allow) | None => decision,
+            };
             if let Some(tx) = g.waiters.remove(&c.id) {
-                let _ = tx.send(decision);
+                let _ = tx.send(verdict);
             }
             g.emit(AskEvent::Resolved {
                 ask: c,
-                answer: ans,
+                // The event reports what actually happened to THIS ask, so a
+                // sibling forced to Deny is not recorded as approved.
+                answer: match verdict {
+                    Decision::Deny => Answer::Deny,
+                    Decision::Allow => ans,
+                },
             });
         }
         // Mirror the new grant to the store (single source: the only place a

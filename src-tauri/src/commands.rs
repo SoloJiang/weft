@@ -3583,6 +3583,33 @@ async fn resolve_lane_gate_impl(
     // best-effort: the decision row is already durable and `judge_lane` reads it
     // directly, so a failed evidence write must not report the denial as failed.
     if matches!(intent, GateDecision::Denied) {
+        // Fenced against worker admission. `chat_open_worker_impl` checks the
+        // lane's authority state and then holds the workspace write lock through
+        // session and process startup; recording the veto outside that lock let
+        // a worker whose check had already passed go on starting while this
+        // command reported a successful denial. Reachable from the transient
+        // recovery card during a confirm dispatch, or from two clients at once.
+        //
+        // Order is thread gate (held above) -> workspace write lock, which is
+        // what every other path takes. Only the DENY branch needs it: the
+        // approve branch reaches `materialize_direction`, which takes the same
+        // lock itself, and acquiring it here would nest.
+        let workspace_lock = match crate::store::repo::get_direction(db, direction_id)
+            .await
+            .map_err(e)?
+        {
+            Some(dir) => match crate::store::repo::get_thread(db, dir.thread_id).await.map_err(e)? {
+                Some(thread) => {
+                    Some(crate::materialize::workspace_write_lock(thread.workspace_id).await)
+                }
+                None => None,
+            },
+            None => None,
+        };
+        let _write_guard = match workspace_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let _ = crate::materialize::readjudicate_lane(db, direction_id).await;
         return Ok(GateResolutionDto { worktrees: Vec::new(), dispatch_direction_ids: Vec::new() });
     }

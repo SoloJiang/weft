@@ -1588,6 +1588,26 @@ pub(crate) async fn chat_open_worker_impl(
     // own the same initial route. Hold this through the first start/send so a
     // stale no-native engine cannot appear between the planner's liveness check
     // and its durable route transaction.
+    // The planner's per-thread gate, taken BEFORE the route gate.
+    //
+    // Without it the authority state below is only a snapshot: a re-proposal can
+    // replace the plan just after the check and the open continues through
+    // session and process startup for a lane that is now `OutOfScope`. The
+    // workspace lock does not help — it serializes policy against materialize,
+    // not plan mutations.
+    //
+    // The ORDER is not free choice. `confirm_with_manual_tool_with_session_
+    // liveness` and `approve_direction_with_pin_with_session_liveness` both take
+    // the thread gate and THEN route gates, so acquiring it after the route gate
+    // here would be an ABBA deadlock against them. Global order is
+    // thread gate -> route gate -> workspace write lock, and this path now takes
+    // all three in it. No caller of this function holds the thread gate
+    // (`coordinator::deliver`, `revive`, the `chat_open_worker` command), and
+    // nothing reachable from here re-takes it, so it cannot self-deadlock.
+    let _plan_gate = match crate::store::repo::get_direction(db, direction_id).await? {
+        Some(dir) => Some(crate::planner::thread_gate(dir.thread_id).lock_owned().await),
+        None => None,
+    };
     let _initial_route_guard = engine::initial_worker_route_gate(direction_id)
         .lock_owned()
         .await;
