@@ -2537,6 +2537,23 @@ pub async fn record_gate_decision(
 /// under an OLDER revision is never returned here, which is what makes a
 /// policy tighten/loosen silently invalidate every outstanding Gate approval
 /// (issue #172's "stale policy decision" rule, applied to Gate overrides).
+/// Drop every recorded Gate resolution for one lane, returning it to
+/// "undecided" so the next adjudication raises a fresh Gate.
+///
+/// Used to roll back an APPROVAL whose materialize then failed: the approval is
+/// written before the git work, so a failed `git worktree add` would otherwise
+/// leave the lane approved-but-unmaterialized — `adjudicate_lane` answers
+/// `AllowedByPolicy` from the override, the newest decision evidence says
+/// allowed, and `list_lane_gates` (which only surfaces `needs_gate`) hides it.
+/// The lane would have no worktree, no card, and no retry surface.
+pub async fn clear_gate_decisions(db: &Db, direction_id: i32) -> Result<()> {
+    lane_gate_decision::Entity::delete_many()
+        .filter(lane_gate_decision::Column::DirectionId.eq(direction_id))
+        .exec(&db.0)
+        .await?;
+    Ok(())
+}
+
 pub async fn get_gate_decision(
     db: &Db,
     direction_id: i32,

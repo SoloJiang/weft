@@ -3293,9 +3293,22 @@ pub async fn resolve_lane_gate(
     )
     .await
     .map_err(e)?;
-    let outcome = crate::materialize::materialize_direction(&db, direction_id)
-        .await
-        .map_err(e)?;
+    let outcome = match crate::materialize::materialize_direction(&db, direction_id).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // The approval is already durable but the git work failed (the path
+            // is now a plain dir, the branch no longer descends from base, …).
+            // Left as-is the lane is approved, unmaterialized, and invisible:
+            // the override answers AllowedByPolicy, so no Gate is ever raised
+            // again and the card that would let a human retry never returns.
+            // Roll the approval back and re-adjudicate so the Gate comes back.
+            if decision == "approved" {
+                let _ = crate::store::repo::clear_gate_decisions(&db, direction_id).await;
+                let _ = crate::materialize::readjudicate_lane(&db, direction_id).await;
+            }
+            return Err(e(error));
+        }
+    };
     // A denial resolves the Gate by design — report it as success with no
     // worktrees. A lane still GATED after an approval means another rule
     // (or a policy change that raced this call) refused it, and returning an

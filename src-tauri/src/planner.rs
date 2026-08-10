@@ -1431,6 +1431,9 @@ async fn confirm_with_manual_tool_with_session_liveness(
     // Reused lanes are NEVER in created_now — they must not be torn down on a later
     // failure because they existed (and may be running) before this confirm call.
     let mut dispatch_ids: Vec<i32> = Vec::new();
+    // Lane INDICES the AuthorityPolicy sent to a Gate on this confirm. Kept by
+    // index (not id) because the dependency graph below is index-based.
+    let mut gated_idx: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut created_now: Vec<i32> = Vec::new();
     // Markers are committed only after the plan CAS succeeds. If a later lane
     // fails, rollback removes the direction/worktree and no audit row claims a
@@ -1640,6 +1643,7 @@ async fn confirm_with_manual_tool_with_session_liveness(
                     if let Some(pd) = proposal.directions.get_mut(idx) {
                         pd.direction_id = ex_id;
                     }
+                    gated_idx.insert(idx);
                     continue;
                 }
                 materialize::MaterializeOutcome::Ready(_) => {}
@@ -1722,6 +1726,7 @@ async fn confirm_with_manual_tool_with_session_liveness(
                 if let Some(pd) = proposal.directions.get_mut(idx) {
                     pd.direction_id = dir.id;
                 }
+                gated_idx.insert(idx);
                 continue;
             }
             materialize::MaterializeOutcome::Ready(_) => {}
@@ -1810,7 +1815,54 @@ async fn confirm_with_manual_tool_with_session_liveness(
         &upstream_lanes_from_resolved(&resolved, &proposal),
     )
     .await;
+    // Issue #172 x #173: a Gate blocks its own lane AND everything declared
+    // downstream of it. The loop above only skipped the gated lane itself —
+    // its dependents materialized fine (their own lanes are not gated) and were
+    // pushed to `dispatch_ids`, and the dependency EDGES are only recorded just
+    // above, AFTER the dispatch set was built, so nothing downstream would
+    // notice that its declared producer never got a worktree. Their workers
+    // would start immediately against a producer that does not exist.
+    let blocked_by_gate = gate_blocked_direction_ids(&resolved, &proposal, &gated_idx);
+    dispatch_ids.retain(|id| !blocked_by_gate.contains(id));
     Ok(dispatch_ids)
+}
+
+/// Direction ids that must not be dispatched because a Gate blocks them or
+/// something they declared as upstream. Walks the proposal's resolved
+/// `depends_on_index` graph to a fixpoint, so a chain A->B->C blocks C when A
+/// is gated, not just B. An UNRESOLVED upstream (`None`) is not treated as a
+/// dependency here: `upstream_merge_state` already answers `Unknown` (blocking)
+/// for those, so the lane is stopped downstream of dispatch rather than here.
+fn gate_blocked_direction_ids(
+    resolved: &ResolvedProposal,
+    proposal: &Proposal,
+    gated_idx: &std::collections::HashSet<usize>,
+) -> std::collections::HashSet<i32> {
+    let mut blocked = gated_idx.clone();
+    loop {
+        let before = blocked.len();
+        for (idx, lane) in resolved.directions.iter().enumerate() {
+            if blocked.contains(&idx) {
+                continue;
+            }
+            if lane
+                .depends_on_index
+                .iter()
+                .flatten()
+                .any(|upstream| blocked.contains(upstream))
+            {
+                blocked.insert(idx);
+            }
+        }
+        if blocked.len() == before {
+            break;
+        }
+    }
+    blocked
+        .into_iter()
+        .filter_map(|idx| proposal.directions.get(idx).map(|pd| pd.direction_id))
+        .filter(|id| *id != 0)
+        .collect()
 }
 
 /// One lane's identity for resolving `depends_on` names to ids — the minimal
@@ -2959,6 +3011,94 @@ async fn workspace_repos(db: &Db, thread_id: i32) -> Result<Vec<(i32, String)>> 
 
 #[cfg(test)]
 mod tests {
+
+    /// A Gate stops its own lane AND everything declared downstream of it —
+    /// transitively. Dependents materialize fine (their own lanes are not
+    /// gated), so without this filter their workers start against a producer
+    /// that has no worktree.
+    #[test]
+    fn a_gated_lane_blocks_its_transitive_dependents_from_dispatch() {
+        fn pd(name: &str, direction_id: i32) -> ProposedDirection {
+            ProposedDirection {
+                name: name.to_string(),
+                repo: "svc".to_string(),
+                reason: "r".to_string(),
+                mandate: "impl-only".to_string(),
+                base_branch: String::new(),
+                decision: String::new(),
+                direction_id,
+            }
+        }
+        fn lane(name: &str, direction_id: i32, upstreams: Vec<Option<usize>>) -> ResolvedDirection {
+            let mut d = resolve(&pd(name, direction_id), &[(1, "svc".to_string())]);
+            d.depends_on_index = upstreams;
+            d
+        }
+        // a (gated) <- b <- c ; d is independent.
+        let resolved = ResolvedProposal {
+            thread_id: 1,
+            rationale: String::new(),
+            status: "proposed".to_string(),
+            created_at: String::new(),
+            directions: vec![
+                lane("a", 10, vec![]),
+                lane("b", 11, vec![Some(0)]),
+                lane("c", 12, vec![Some(1)]),
+                lane("d", 13, vec![]),
+            ],
+        };
+        let proposal = Proposal {
+            rationale: String::new(),
+            directions: vec![pd("a", 10), pd("b", 11), pd("c", 12), pd("d", 13)],
+        };
+
+        let gated: std::collections::HashSet<usize> = [0usize].into_iter().collect();
+        let blocked = gate_blocked_direction_ids(&resolved, &proposal, &gated);
+
+        assert!(blocked.contains(&10), "the gated lane itself is blocked");
+        assert!(blocked.contains(&11), "its direct dependent is blocked");
+        assert!(blocked.contains(&12), "the dependency is transitive");
+        assert!(!blocked.contains(&13), "an independent lane still dispatches");
+    }
+
+    /// No Gate means no filtering at all — the common path must be untouched.
+    #[test]
+    fn no_gate_blocks_nothing() {
+        let resolved = ResolvedProposal {
+            thread_id: 1,
+            rationale: String::new(),
+            status: "proposed".to_string(),
+            created_at: String::new(),
+            directions: vec![resolve(
+                &ProposedDirection {
+                    name: "a".to_string(),
+                    repo: "svc".to_string(),
+                    reason: "r".to_string(),
+                    mandate: "impl-only".to_string(),
+                    base_branch: String::new(),
+                    decision: String::new(),
+                    direction_id: 10,
+                },
+                &[(1, "svc".to_string())],
+            )],
+        };
+        let proposal = Proposal {
+            rationale: String::new(),
+            directions: vec![ProposedDirection {
+                name: "a".to_string(),
+                repo: "svc".to_string(),
+                reason: "r".to_string(),
+                mandate: "impl-only".to_string(),
+                base_branch: String::new(),
+                decision: String::new(),
+                direction_id: 10,
+            }],
+        };
+        assert!(
+            gate_blocked_direction_ids(&resolved, &proposal, &Default::default()).is_empty()
+        );
+    }
+
     use super::*;
 
     /// Per-thread one-shot "race action" the approve flow fires (via
