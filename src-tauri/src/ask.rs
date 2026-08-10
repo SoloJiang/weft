@@ -1720,12 +1720,19 @@ impl Inner {
     /// A batch release is a convenience for the human, never a way around a
     /// constraint: an ask that opened before a tighten must not ride out on a
     /// backlog sweep that predates it.
-    fn resolve_read_only(&mut self, hit: Vec<Ask>, denied: &HashSet<u64>) -> usize {
+    fn resolve_read_only(&mut self, hit: Vec<Ask>, verdicts: &SweepVerdicts) -> usize {
+        // An ask whose policy cannot be determined is NOT resolved by the
+        // sweep: it stays open for a human, the same outcome `auto_decision`
+        // produces by deferring.
+        let hit: Vec<Ask> = hit
+            .into_iter()
+            .filter(|ask| !verdicts.deferred.contains(&ask.id))
+            .collect();
         let ids: HashSet<u64> = hit.iter().map(|a| a.id).collect();
         self.open.retain(|a| !ids.contains(&a.id));
         for ask in &hit {
             if let Some(tx) = self.waiters.remove(&ask.id) {
-                let verdict = match denied.contains(&ask.id) {
+                let verdict = match verdicts.denied.contains(&ask.id) {
                     true => Decision::Deny,
                     false => Decision::Allow,
                 };
@@ -1734,7 +1741,7 @@ impl Inner {
         }
         let n = hit.len();
         for ask in hit {
-            let answer = match denied.contains(&ask.id) {
+            let answer = match verdicts.denied.contains(&ask.id) {
                 true => Answer::Deny,
                 false => Answer::Allow,
             };
@@ -1830,6 +1837,14 @@ impl Inner {
 /// value was applied at, so an out-of-order refresh cannot overwrite a newer
 /// one — in EITHER direction (see `apply_authority_refresh`).
 #[derive(Clone)]
+/// A batch release's verdict per ask: denied outright, deferred to a human
+/// because the policy is indeterminate, or released with the sweep.
+struct SweepVerdicts {
+    denied: HashSet<u64>,
+    /// Left OPEN rather than resolved — see `sweep_verdicts`.
+    deferred: HashSet<u64>,
+}
+
 struct AuthorityBridgeEntry {
     applied_revision: Option<i64>,
     snapshot: Option<crate::authority::PolicySnapshot>,
@@ -2147,9 +2162,15 @@ impl AskRegistry {
         // workspace's own constraint — the same ordering `auto_decision` and
         // `answer` apply. An ask that opened before a tighten is denied here
         // too, rather than escaping through a sweep that predates the rule.
-        let denied = self.policy_denied_ids(&cleared);
-        for ask in cleared {
-            let verdict = match denied.contains(&ask.id) {
+        let verdicts = self.sweep_verdicts(&cleared);
+        // Deferred asks go back to `open`: an indeterminate policy defers to a
+        // human here exactly as `auto_decision` does.
+        let (deferred, releasable): (Vec<Ask>, Vec<Ask>) = cleared
+            .into_iter()
+            .partition(|ask| verdicts.deferred.contains(&ask.id));
+        g.open.extend(deferred);
+        for ask in releasable {
+            let verdict = match verdicts.denied.contains(&ask.id) {
                 true => Decision::Deny,
                 false => Decision::Allow,
             };
@@ -2529,21 +2550,35 @@ impl AskRegistry {
             .remove(&thread_id);
     }
 
-    /// Which of these asks the CURRENT policy denies.
+    /// How a batch release must treat each ask, keeping all THREE policy states
+    /// rather than reducing them to denied/not-denied.
     ///
-    /// Every batch release consults this. A sweep resolves asks that opened at
-    /// different times, and one that opened before a tighten must not be
-    /// released by a mechanism the tighten never reached.
-    fn policy_denied_ids(&self, asks: &[Ask]) -> HashSet<u64> {
-        asks.iter()
-            .filter(|ask| {
-                matches!(
-                    self.authority_bridge_decision(ask.thread, &ask.action_key),
-                    Some(Decision::Deny)
-                )
-            })
-            .map(|ask| ask.id)
-            .collect()
+    /// Collapsing to a deny-set is what let a sweep release an ask while the
+    /// policy was indeterminate — suspended, unreadable, revoked, or its
+    /// workspace lookup failed — even though `auto_decision` correctly defers in
+    /// exactly those states. An unknown is not an allow here either.
+    ///
+    /// The indeterminate arm does not resolve the ask at all: it stays OPEN for
+    /// a human, which is the same outcome `auto_decision` produces by returning
+    /// `None`. Denying it instead would turn a transient read failure into a
+    /// refusal of work the user asked for; releasing it is the fail-open this
+    /// exists to prevent. Leaving it pending is the only answer that is neither.
+    fn sweep_verdicts(&self, asks: &[Ask]) -> SweepVerdicts {
+        let mut denied = HashSet::new();
+        let mut deferred = HashSet::new();
+        for ask in asks {
+            if self.authority_is_indeterminate(ask.thread) {
+                deferred.insert(ask.id);
+                continue;
+            }
+            if matches!(
+                self.authority_bridge_decision(ask.thread, &ask.action_key),
+                Some(Decision::Deny)
+            ) {
+                denied.insert(ask.id);
+            }
+        }
+        SweepVerdicts { denied, deferred }
     }
 
     /// Record that the startup seed could not enumerate workspaces.
@@ -2976,8 +3011,8 @@ impl AskRegistry {
             })
             .cloned()
             .collect();
-        let denied = self.policy_denied_ids(&hit);
-        g.resolve_read_only(hit, &denied)
+        let verdicts = self.sweep_verdicts(&hit);
+        g.resolve_read_only(hit, &verdicts)
     }
 
     /// Issue-wide counterpart of `grant_read_only_session` (issue #103's
@@ -3002,8 +3037,8 @@ impl AskRegistry {
             })
             .cloned()
             .collect();
-        let denied = self.policy_denied_ids(&hit);
-        g.resolve_read_only(hit, &denied)
+        let verdicts = self.sweep_verdicts(&hit);
+        g.resolve_read_only(hit, &verdicts)
     }
 
     /// Revoke one session's read-only batch grant (issue #103). Returns whether

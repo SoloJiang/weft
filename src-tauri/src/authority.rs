@@ -198,7 +198,16 @@ pub fn revoked_policy(scope: PolicyScope, revision: String, revoked_at: String) 
     PolicySnapshot {
         id: 0,
         scope,
-        revision,
+        // DISTINCT from the revision the revoked row carried, because a revoke
+        // stamps `revoked_at` on that row without allocating a new revision.
+        // Reusing it left a Gate card rendered under the ACTIVE policy still
+        // valid: both revision checks in `resolve_lane_gate` accepted the stale
+        // card, the approval was recorded under that same revision, and
+        // adjudication then honoured its own override and materialized the lane
+        // — a revoke that a pre-revoke card could walk straight through. A human
+        // may still approve a gated lane in a revoked scope; they just have to
+        // do it on a card that post-dates the revoke.
+        revision: format!("{revision}:revoked"),
         rules: PolicyRules::default(),
         source: "system".to_string(),
         created_at: String::new(),
@@ -418,6 +427,25 @@ pub fn looks_like_valid_ref(base_branch: &str) -> bool {
     // replace, stash, and whatever git adds next) is not. Chasing prefixes one
     // at a time is what let this class recur three times.
     if base_branch.starts_with("refs/") && !base_branch.starts_with("refs/heads/") {
+        return false;
+    }
+    // Git's PSEUDO-refs — `HEAD`, `FETCH_HEAD`, `ORIG_HEAD`, `MERGE_HEAD`,
+    // `CHERRY_PICK_HEAD` — resolve to a commit without naming a branch, so they
+    // dodge `protected_branches` exactly as a tag or a SHA does, and
+    // `git::resolve_base_ref` accepts them verbatim. They share one shape: git
+    // requires a pseudo-ref to be all upper case (with `_` and digits), which no
+    // conventional branch name uses.
+    //
+    // Matching the SHAPE rather than a list is the point. Enumerating `HEAD`,
+    // then `FETCH_HEAD`, then the next one is how this class reached a fourth
+    // spelling. A branch genuinely named `RELEASE` is refused too — fail closed,
+    // and git itself discourages such names for this ambiguity.
+    let bare = bare_branch_name(base_branch);
+    if !bare.is_empty()
+        && bare
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+    {
         return false;
     }
     !base_branch.chars().any(|c| {
@@ -874,6 +902,11 @@ mod tests {
         assert!(looks_like_valid_ref("release-2024"));
         // Tag and other non-branch namespaces resolve to a commit without
         // naming a branch, so they dodge `protected_branches` the same way.
+        // Pseudo-refs resolve to a commit without naming a branch.
+        assert!(!looks_like_valid_ref("HEAD"));
+        assert!(!looks_like_valid_ref("FETCH_HEAD"));
+        assert!(!looks_like_valid_ref("ORIG_HEAD"));
+        assert!(!looks_like_valid_ref("MERGE_HEAD"));
         assert!(!looks_like_valid_ref("refs/tags/main-tip"));
         assert!(!looks_like_valid_ref("refs/tags/v1.0"));
         assert!(!looks_like_valid_ref("refs/remotes/origin/main"));
@@ -898,6 +931,7 @@ mod tests {
             "9fddf70ced1a2b3c4d5e6f70819a2b3c4d5e6f70",
             "9fddf70",
             "refs/tags/main-tip",
+            "HEAD",
         ] {
             let lane = LaneCandidate {
                 lane_id: "l1",

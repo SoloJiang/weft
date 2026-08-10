@@ -6128,9 +6128,13 @@ mod tests {
 
         let scope = crate::authority::PolicyScope::Workspace(ws.id);
         let resolved = repo::resolve_policy_snapshot(&db, scope).await.unwrap();
-        assert_eq!(
+        // Derived FROM the revoked row's revision but deliberately distinct from
+        // it, so a Gate card rendered under the active policy cannot be approved
+        // after the revoke — see `authority::revoked_policy`.
+        assert_eq!(resolved.revision, format!("{}:revoked", created.revision));
+        assert_ne!(
             resolved.revision, created.revision,
-            "a revoked scope keeps the revoked revision, not the default's \"0\""
+            "a pre-revoke card's revision must not still be in force"
         );
 
         // A fresh verdict under that policy, written the way materialize writes it.
