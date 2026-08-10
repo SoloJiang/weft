@@ -320,7 +320,7 @@ export const zh = {
         awaiting_gate_decision: "尚无策略覆盖此任务",
         gate_approved_override: "已针对当前策略版本批准",
         gate_denied_override: "已针对当前策略版本拒绝",
-        unmaterialized_lane: "策略已允许，但一直没有创建工作区",
+        stranded_lane: "策略已允许，但没有任何 agent 在处理",
       },
     },
   },

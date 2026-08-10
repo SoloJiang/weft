@@ -18,7 +18,7 @@ type GateReasonKey =
   | "awaiting_gate_decision"
   | "gate_approved_override"
   | "gate_denied_override"
-  | "unmaterialized_lane";
+  | "stranded_lane";
 
 /** Which failure arm a click maps to — derived once from the action the user
  *  actually took, not re-guessed at render time. */
@@ -33,7 +33,7 @@ function gateReasonKey(reason: string): GateReasonKey {
     case "unreadable_policy":
     case "gate_approved_override":
     case "gate_denied_override":
-    case "unmaterialized_lane":
+    case "stranded_lane":
       return reason;
     default:
       return "awaiting_gate_decision";
@@ -164,8 +164,15 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
       // name and Open Session action disabled and its branch hidden, while a
       // worker ran happily in a checkout the UI did not know about. Reload the
       // thread's children before dispatching so the card is whole.
+      // Settled, not awaited bare. The Gate is ALREADY resolved on the backend
+      // at this point, so letting a failed refresh throw sent a successful
+      // approval into the catch below: the row came back with "couldn't
+      // approve" on it and — worse — the dispatch never ran, leaving the lane
+      // materialized, permitted, and with no worker, which nothing else starts.
+      // A stale card is recoverable by reloading; a silently unstarted lane is
+      // what the user walks away from.
       if (resolution.worktrees.length > 0) {
-        await loadThreadChildren(gate.thread_id);
+        await Promise.allSettled([loadThreadChildren(gate.thread_id)]);
       }
       await Promise.allSettled(
         resolution.dispatch_direction_ids.map((id) => dispatchDirection(id)),
@@ -253,7 +260,7 @@ function LaneGateRow({
             <Check size={12} />
             {/* A stranded lane is already permitted — the action is to finish
                 setting it up, not to grant something. Same command behind it. */}
-            {t(reasonKey === "unmaterialized_lane" ? "scope.gate.resume" : "scope.gate.approve")}
+            {t(reasonKey === "stranded_lane" ? "scope.gate.resume" : "scope.gate.approve")}
           </Button>
           <Button size="sm" variant="ghost" onClick={onDeny} disabled={busy}>
             <X size={12} />

@@ -329,7 +329,7 @@ export const en = {
         awaiting_gate_decision: "no policy covers this yet",
         gate_approved_override: "approved for this policy revision",
         gate_denied_override: "denied for this policy revision",
-        unmaterialized_lane: "the policy allows it, but its workspace was never created",
+        stranded_lane: "the policy allows it, but no agent is working on it",
       },
     },
   },

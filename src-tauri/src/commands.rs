@@ -3095,7 +3095,20 @@ pub async fn set_authority_policy(
             return Err(e(error));
         }
     };
-    refresh_authority_bridge_snapshot(&db, &asks, workspace_id).await;
+    // Install the row the write RETURNED, not a re-read of it. The re-read was a
+    // second chance to fail: a transient read error there ends in the fail-closed
+    // branch, so the bridge drops the cache and every CLI ask in this workspace
+    // falls through to a human card — while this command reports the save as
+    // successful and the user has no reason to suspect the policy is not being
+    // applied. The committed row IS the new active policy; there is nothing a
+    // re-read could learn that it does not already have.
+    asks.set_authority_snapshot(
+        workspace_id,
+        Some(crate::authority::snapshot_from_row(
+            row.clone(),
+            crate::authority::PolicyScope::Workspace(workspace_id),
+        )),
+    );
     Ok(authority_policy_dto(row))
 }
 
@@ -3214,6 +3227,34 @@ pub struct GateResolutionDto {
     pub dispatch_direction_ids: Vec<i32>,
 }
 
+/// What a human decided about one Gate — the ONE discriminated value
+/// `resolve_lane_gate` branches on, parsed from the wire string exactly once.
+///
+/// The two arms are not symmetric and must not be handled by "whatever
+/// adjudication says next". An approval asks for a checkout to be created, so
+/// it goes through materialize and is re-judged there. A denial asks for
+/// nothing to be created, so sending it through the same path makes the refusal
+/// depend on a second adjudication that a concurrent policy loosen can flip —
+/// fail-open, on the one decision that must fail closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GateDecision {
+    Approved,
+    Denied,
+}
+
+impl GateDecision {
+    /// `None` for anything else. The store rejects unknown decisions too, but
+    /// only after the write is attempted; refusing here keeps an unrecognized
+    /// string from ever being handled as "not a denial".
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "approved" => Some(Self::Approved),
+            "denied" => Some(Self::Denied),
+            _ => None,
+        }
+    }
+}
+
 /// Holds a lane's Gate resolution for the duration of one `resolve_lane_gate`
 /// call, releasing it on drop (including on the early-return error paths).
 struct GateResolutionGuard(i32);
@@ -3261,9 +3302,15 @@ pub struct LaneGateDto {
 /// registered worktree whose latest `decision` evidence names `needs_gate`.
 #[tauri::command]
 pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGateDto>> {
+    list_lane_gates_impl(&db, thread_id).await
+}
+
+/// [`list_lane_gates`] against a plain `Db`, so which states produce a card can
+/// be exercised without a Tauri `State`.
+async fn list_lane_gates_impl(db: &Db, thread_id: i32) -> R<Vec<LaneGateDto>> {
     use crate::lane_state::LaneAuthorityState;
 
-    let directions = crate::store::repo::list_directions(&db, thread_id).await.map_err(e)?;
+    let directions = crate::store::repo::list_directions(db, thread_id).await.map_err(e)?;
     let mut out = Vec::new();
     for dir in directions {
         // ONE resolved state per lane, mapped exhaustively. Every predicate this
@@ -3271,7 +3318,7 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
         // checkout validity, session liveness, upstream blockers, terminal
         // lifecycle — now lives in `lane_state` and is the same answer every
         // other surface sees.
-        let state = crate::lane_state::lane_authority_state(&db, dir.id)
+        let state = crate::lane_state::lane_authority_state(db, dir.id)
             .await
             .map_err(e)?;
         let (verdict, reason) = match &state {
@@ -3279,22 +3326,40 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
             LaneAuthorityState::AwaitingGate(verdict) => {
                 (verdict.as_ref(), gate_reason_slug(verdict))
             }
-            // Allowed but with no usable checkout — recoverable, and the only
-            // other card: hiding it because "it is allowed now" is what left
-            // such a lane with neither a worker nor a way back.
-            LaneAuthorityState::NeedsMaterialize(verdict) => {
-                (verdict.as_ref(), "unmaterialized_lane".to_string())
+            // Permitted, and yet nothing is running it — the recovery card.
+            //
+            // BOTH allowed-but-idle states qualify, and the second one is the
+            // easy half to lose. `NeedsMaterialize` is the obvious case (the
+            // policy was loosened while the Gate was pending, or the git write
+            // failed after an approval). `ReadyToStart` is the lane whose
+            // checkout was created and whose dispatch never happened: the
+            // approval materialized it and the app exited before the frontend
+            // started the workers, or a tighten made confirm drop it and its
+            // dependents from dispatch and a later loosen flipped it back to
+            // allowed with the proposal UI long closed. Nothing else picks
+            // either of them up — boot revival needs a session that exists and
+            // the restart effect only revives `working` lanes — so without this
+            // card they sit idle forever, along with everything released behind
+            // them. A checkout on disk is not evidence that a worker ever ran.
+            //
+            // The transient version of this (materialized, about to be
+            // dispatched by the caller that just materialized it) is a card that
+            // appears for the length of one dispatch and is cleared by the
+            // panel's own reload — the same trade the pre-`lane_state` code
+            // made, and the right side of it: a card too many is a reload, a
+            // card too few is a lane nobody can start.
+            LaneAuthorityState::NeedsMaterialize(verdict)
+            | LaneAuthorityState::ReadyToStart(verdict) => {
+                (verdict.as_ref(), "stranded_lane".to_string())
             }
             // Everything else has no decision to offer. Denied is settled;
             // Finished and Running have nothing to ask; OutOfScope is not the
             // user's current scope; BlockedUpstream's real blocker is the
-            // producer, which carries its own card; ReadyToStart is simply
-            // waiting to be dispatched; NotApplicable binds no repo.
+            // producer, which carries its own card; NotApplicable binds no repo.
             LaneAuthorityState::Denied(_)
             | LaneAuthorityState::Finished
             | LaneAuthorityState::OutOfScope
             | LaneAuthorityState::BlockedUpstream { .. }
-            | LaneAuthorityState::ReadyToStart(_)
             | LaneAuthorityState::Running
             | LaneAuthorityState::NotApplicable => continue,
         };
@@ -3365,6 +3430,8 @@ async fn current_gate_policy_revision(db: &Db, direction_id: i32) -> anyhow::Res
 /// honors an override at the current revision), so the button would appear to
 /// work while changing nothing. Failing loudly instead lets the UI reload the
 /// card and re-ask the human against the rules actually in force.
+///
+/// The two decisions take DIFFERENT paths on purpose — see `GateDecision`.
 #[tauri::command]
 pub async fn resolve_lane_gate(
     db: State<'_, Db>,
@@ -3372,6 +3439,18 @@ pub async fn resolve_lane_gate(
     policy_revision: String,
     decision: String,
     reason: Option<String>,
+) -> R<GateResolutionDto> {
+    resolve_lane_gate_impl(&db, direction_id, &policy_revision, &decision, reason.as_deref()).await
+}
+
+/// [`resolve_lane_gate`] against a plain `Db`, so the approve/deny split can be
+/// exercised without a Tauri `State`.
+async fn resolve_lane_gate_impl(
+    db: &Db,
+    direction_id: i32,
+    policy_revision: &str,
+    decision: &str,
+    reason: Option<&str>,
 ) -> R<GateResolutionDto> {
     // One resolution per lane at a time. Two windows (or a double-click) can
     // both pass the revision check below and append conflicting decisions; in
@@ -3382,7 +3461,10 @@ pub async fn resolve_lane_gate(
     // a race between two humans, not something to silently pick a winner for.
     let _guard = GateResolutionGuard::acquire(direction_id)
         .ok_or_else(|| "gate_resolution_in_flight".to_string())?;
-    let current = current_gate_policy_revision(&db, direction_id).await.map_err(e)?;
+    // Parsed BEFORE any work, so an unrecognized string is refused rather than
+    // reaching the branch below as "not denied" and being treated as approval.
+    let intent = GateDecision::parse(decision).ok_or_else(|| "gate_decision_invalid".to_string())?;
+    let current = current_gate_policy_revision(db, direction_id).await.map_err(e)?;
     if policy_revision != current {
         return Err("gate_policy_changed".to_string());
     }
@@ -3400,12 +3482,12 @@ pub async fn resolve_lane_gate(
     // Lock order is thread gate → workspace write lock (materialize takes the
     // latter), matching confirm, so the two paths cannot deadlock against each
     // other.
-    let _plan_gate = match crate::store::repo::get_direction(&db, direction_id).await.map_err(e)? {
+    let _plan_gate = match crate::store::repo::get_direction(db, direction_id).await.map_err(e)? {
         Some(dir) => {
             let gate = crate::planner::thread_gate(dir.thread_id);
             let held = gate.clone().lock_owned().await;
             if matches!(
-                crate::lane_state::lane_authority_state(&db, direction_id).await.map_err(e)?,
+                crate::lane_state::lane_authority_state(db, direction_id).await.map_err(e)?,
                 crate::lane_state::LaneAuthorityState::OutOfScope
             ) {
                 return Err("gate_out_of_scope".to_string());
@@ -3415,15 +3497,42 @@ pub async fn resolve_lane_gate(
         None => None,
     };
     crate::store::repo::record_gate_decision(
-        &db,
+        db,
         direction_id,
         &current,
-        &decision,
-        reason.as_deref().unwrap_or(""),
+        decision,
+        reason.unwrap_or(""),
     )
     .await
     .map_err(e)?;
-    let outcome = match crate::materialize::materialize_direction(&db, direction_id).await {
+    // The revision check above is a READ, and the write below is a separate
+    // statement — a policy change committing in between records this decision
+    // against a revision that is already dead, which `adjudicate_lane` ignores.
+    // Re-reading after the write closes that window: the decision is durable
+    // only if the rules it was made under are still the rules in force. Rolled
+    // back and reported as a changed policy otherwise, which is the same answer
+    // the pre-check gives and the same card the UI knows how to re-render.
+    let after = current_gate_policy_revision(db, direction_id).await.map_err(e)?;
+    if after != current {
+        let _ = crate::store::repo::clear_gate_decisions(db, direction_id).await;
+        let _ = crate::materialize::readjudicate_lane(db, direction_id).await;
+        return Err("gate_policy_changed".to_string());
+    }
+    // A DENIAL never enters materialize. Sending it through and relying on
+    // adjudication to honor it is fail-open: a loosen landing between the
+    // decision and the adjudication makes the override invisible, so the lane
+    // comes back `Ready` and this command hands the caller a fresh checkout and
+    // a dispatch set for work a human just refused. Nothing is lost by skipping
+    // it — `materialize_direction` never tears anything down, so its `Denied`
+    // arm already created and removed nothing. Re-adjudicating still records
+    // the refusal in the evidence ledger for readiness and audit, and is
+    // best-effort: the decision row is already durable and `judge_lane` reads it
+    // directly, so a failed evidence write must not report the denial as failed.
+    if matches!(intent, GateDecision::Denied) {
+        let _ = crate::materialize::readjudicate_lane(db, direction_id).await;
+        return Ok(GateResolutionDto { worktrees: Vec::new(), dispatch_direction_ids: Vec::new() });
+    }
+    let outcome = match crate::materialize::materialize_direction(db, direction_id).await {
         Ok(outcome) => outcome,
         Err(error) => {
             // The approval is already durable but the git work failed (the path
@@ -3432,17 +3541,21 @@ pub async fn resolve_lane_gate(
             // the override answers AllowedByPolicy, so no Gate is ever raised
             // again and the card that would let a human retry never returns.
             // Roll the approval back and re-adjudicate so the Gate comes back.
-            if decision == "approved" {
-                let _ = crate::store::repo::clear_gate_decisions(&db, direction_id).await;
-                let _ = crate::materialize::readjudicate_lane(&db, direction_id).await;
+            // Only approvals reach here now, but the rollback stays keyed to the
+            // decision rather than assumed: clearing a DENIAL on a materialize
+            // error would silently un-refuse the lane.
+            if matches!(intent, GateDecision::Approved) {
+                let _ = crate::store::repo::clear_gate_decisions(db, direction_id).await;
+                let _ = crate::materialize::readjudicate_lane(db, direction_id).await;
             }
             return Err(e(error));
         }
     };
-    // A denial resolves the Gate by design — report it as success with no
-    // worktrees. A lane still GATED after an approval means another rule
-    // (or a policy change that raced this call) refused it, and returning an
-    // empty list would read as "materialized nothing" — surface it instead.
+    // Only an approval reaches this match. A lane still GATED after one means
+    // another rule (or a policy change that raced this call) refused it, and
+    // returning an empty list would read as "materialized nothing" — surface it
+    // instead. `Denied` here is a policy that started denying between the
+    // approval and the write, not the human's own decision.
     match outcome {
         crate::materialize::MaterializeOutcome::Ready(rows) => {
             // Clearing this Gate can unblock lanes BEYOND it. Confirm removed
@@ -3450,7 +3563,7 @@ pub async fn resolve_lane_gate(
             // those lanes materialized fine, so they carry no Gate of their own
             // and nothing else will ever start them. Hand the caller every lane
             // the approval actually released, this one included.
-            let dispatch_direction_ids = released_by_gate(&db, direction_id).await.map_err(e)?;
+            let dispatch_direction_ids = released_by_gate(db, direction_id).await.map_err(e)?;
             Ok(GateResolutionDto { worktrees: rows, dispatch_direction_ids })
         }
         crate::materialize::MaterializeOutcome::Denied(_) => {
@@ -5405,6 +5518,166 @@ pub async fn db_change_password(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// An unrecognized decision string must be REFUSED, never fall through the
+    /// deny branch as "not a denial" and be materialized as an approval.
+    #[test]
+    fn gate_decision_parse_admits_only_the_two_known_words() {
+        assert_eq!(GateDecision::parse("approved"), Some(GateDecision::Approved));
+        assert_eq!(GateDecision::parse("denied"), Some(GateDecision::Denied));
+        for unknown in ["", "Approved", "approve", "deny", "yes", "allowed"] {
+            assert_eq!(GateDecision::parse(unknown), None, "{unknown:?}");
+        }
+    }
+
+    /// A denial must not create a checkout even when the policy stops gating
+    /// the lane underneath it.
+    ///
+    /// This is the fail-open case the deny branch exists for: the decision is
+    /// recorded at revision N, a loosen commits, and adjudication at N+1 no
+    /// longer sees an override to honor — so routing a denial through
+    /// materialize returns `Ready`, hands back a fresh worktree, and dispatches
+    /// a worker for work a human just refused. Simulated here by revoking the
+    /// gating policy after the decision lands, which is the same "the override
+    /// is no longer honored" state the race produces.
+    #[tokio::test]
+    async fn denying_a_gate_never_materializes_even_if_the_policy_stops_gating() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-gate-deny-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r =
+            repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+                .await
+                .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await
+            .unwrap();
+
+        // Gate the lane by protecting the base branch it forks from.
+        let rules = crate::authority::PolicyRules {
+            protected_branches: vec![main.clone()],
+            ..Default::default()
+        };
+        let rules_json = serde_json::to_string(&rules).unwrap();
+        repo::create_authority_policy(&db, "workspace", ws.id, &rules_json, "user")
+            .await
+            .unwrap();
+        let gated = crate::materialize::materialize_direction(&db, dir.id).await.unwrap();
+        assert!(
+            matches!(gated, crate::materialize::MaterializeOutcome::Gated(_)),
+            "the protected base branch must raise a Gate, got {gated:?}"
+        );
+
+        let revision = current_gate_policy_revision(&db, dir.id).await.unwrap();
+        let resolved = resolve_lane_gate_impl(&db, dir.id, &revision, "denied", Some("no"))
+            .await
+            .unwrap();
+        assert!(resolved.worktrees.is_empty(), "a denial materializes nothing");
+        assert!(resolved.dispatch_direction_ids.is_empty(), "a denial dispatches nothing");
+
+        // The loosen the race would interleave: with the gating policy gone the
+        // lane is allowed outright, so anything that re-entered materialize on
+        // the denial's behalf would now succeed.
+        repo::revoke_authority_policy(&db, "workspace", ws.id).await.unwrap();
+        assert!(
+            repo::worktree_for(&db, dir.id, r.id).await.unwrap().is_none(),
+            "denying a Gate must leave the lane without a checkout"
+        );
+        assert!(
+            !crate::lane_state::lane_authority_state(&db, dir.id)
+                .await
+                .unwrap()
+                .is_dispatchable(),
+            "a denied lane is never dispatchable"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// A lane that was materialized and never dispatched must keep a card.
+    ///
+    /// This is the resolve-to-dispatch crash window: the approval commits, the
+    /// checkout is created, and the app exits before the frontend opens the
+    /// workers. On restart the lane is allowed, has a valid checkout, has no
+    /// session and is not `working`, so neither boot revival nor the restart
+    /// effect touches it. The recovery card is the only thing that gets it
+    /// running again — and every dependent the approval released is behind it.
+    #[tokio::test]
+    async fn a_materialized_lane_that_never_started_keeps_its_recovery_card() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-gate-stranded-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r =
+            repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+                .await
+                .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let dir = repo::create_direction(&db, t.id, "d", "claude", r.id, "reason", "plan+impl", "")
+            .await
+            .unwrap();
+
+        // No policy configured, so the lane is allowed and materializes — the
+        // state the frontend would immediately dispatch from.
+        let wts = crate::materialize::materialize_direction(&db, dir.id)
+            .await
+            .unwrap()
+            .into_worktrees();
+        assert_eq!(wts.len(), 1, "an allowed lane materializes");
+        assert!(
+            crate::lane_state::lane_authority_state(&db, dir.id)
+                .await
+                .unwrap()
+                .is_dispatchable(),
+            "materialized and sessionless is exactly ReadyToStart"
+        );
+
+        // The dispatch that never happened.
+        let cards = list_lane_gates_impl(&db, t.id).await.unwrap();
+        assert_eq!(cards.len(), 1, "a permitted, unstarted lane must stay actionable");
+        assert_eq!(cards[0].direction_id, dir.id);
+        assert_eq!(cards[0].verdict_reason, "stranded_lane");
+
+        // …and stops asking once a worker is actually live.
+        let session = repo::create_session(&db, dir.id, r.id, "claude", &wts[0].path)
+            .await
+            .unwrap();
+        repo::set_session_status(&db, session.id, "running").await.unwrap();
+        assert!(
+            list_lane_gates_impl(&db, t.id).await.unwrap().is_empty(),
+            "a running lane has nothing to ask"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
 
     #[test]
     fn waiting_dingtalk_bridge_retries_after_copy_was_already_initialized() {
