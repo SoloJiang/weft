@@ -173,9 +173,18 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
   // A rejected fetch is surfaced, never collapsed into the empty state.
   if (fetchState === "rejected") {
     return (
-      <div className="flex items-center gap-1.5 rounded-[var(--radius-lg)] border border-danger/35 bg-danger/10 px-4 py-3 text-[11px] text-danger">
-        <AlertTriangle size={13} />
-        {t("scope.gate.loadFailed")}
+      <div className="flex items-center justify-between gap-2 rounded-[var(--radius-lg)] border border-danger/35 bg-danger/10 px-4 py-3 text-[11px] text-danger">
+        <div className="flex items-center gap-1.5">
+          <AlertTriangle size={13} />
+          {t("scope.gate.loadFailed")}
+        </div>
+        {/* Without this the banner is terminal: the effect keys off threadId,
+            the thread's lane ids and the proposal version, and none of those
+            change while someone is staring at a blocked lane — so one transient
+            failure hid every pending Gate until an app restart. */}
+        <Button size="sm" variant="ghost" onClick={() => reload()}>
+          {t("scope.gate.retry")}
+        </Button>
       </div>
     );
   }

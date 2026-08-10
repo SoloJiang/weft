@@ -313,6 +313,7 @@ export const zh = {
       denyFailed: "拒绝失败，请重试。",
       policyChanged: "策略在此期间发生了变化——请重新查看更新后的卡片再做决定。",
       loadFailed: "待决定事项加载失败——可能仍有任务在等待。",
+      retry: "重试",
       reason: {
         protected_branch: "目标是受保护分支",
         unreadable_policy: "已保存的策略无法解析，因此不做任何假定",

@@ -3068,6 +3068,12 @@ pub async fn set_authority_policy(
     rules: crate::authority::PolicyRules,
 ) -> R<AuthorityPolicyDto> {
     let rules_json = serde_json::to_string(&rules).map_err(e)?;
+    // Same lock materialization takes across authorize-and-write, so a tighten
+    // cannot commit between a lane's verdict and its git writes — the checkout
+    // would otherwise be created under rules that are no longer active. Held
+    // through the bridge refresh too, so the cache lands with the row.
+    let workspace_lock = crate::materialize::workspace_write_lock(workspace_id).await;
+    let _write_guard = workspace_lock.lock().await;
     let row = crate::store::repo::create_authority_policy(&db, "workspace", workspace_id, &rules_json, "user")
         .await
         .map_err(e)?;
@@ -3085,6 +3091,10 @@ pub async fn revoke_authority_policy(
     asks: State<'_, crate::ask::AskRegistry>,
     workspace_id: i32,
 ) -> R<()> {
+    // See `set_authority_policy` — a revoke is a policy change like any other
+    // and must not land between a lane's verdict and its writes.
+    let workspace_lock = crate::materialize::workspace_write_lock(workspace_id).await;
+    let _write_guard = workspace_lock.lock().await;
     crate::store::repo::revoke_authority_policy(&db, "workspace", workspace_id)
         .await
         .map_err(e)?;
@@ -3256,12 +3266,15 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
     // task with no way to approve or clean it up. A lane counts as
     // planner-owned once some plan revision has referenced it; anything the
     // scope history has never seen is left alone.
+    // Every revision, not a page of them: a fixed cap misclassifies a direction
+    // referenced only by an older proposal as standalone, which switches the
+    // scope filter off for exactly the obsolete cards it exists to hide.
     let planner_owned: std::collections::HashSet<i32> =
-        crate::store::repo::list_plan_revisions(&db, thread_id, 200)
+        crate::store::repo::all_plan_revision_proposals(&db, thread_id)
             .await
             .map_err(e)?
             .iter()
-            .filter_map(|rev| serde_json::from_str::<serde_json::Value>(&rev.proposal).ok())
+            .filter_map(|proposal| serde_json::from_str::<serde_json::Value>(proposal).ok())
             .filter_map(|value| value.get("directions").and_then(|d| d.as_array()).cloned())
             .flatten()
             .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
@@ -3333,10 +3346,16 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
         // closed. What distinguishes a healthy lane from a paused one is
         // whether a worker was ever opened for it, not whether a directory
         // exists. `denied` is settled and stays hidden.
-        let never_started = crate::store::repo::sessions_for_direction(&db, dir.id)
+        // A lane whose worker EXITED is as stopped as one that never started —
+        // both need the resume card. `sessions_for_direction` returns history,
+        // including exited/interrupted rows, so counting rows would hide the
+        // card for any lane that ever ran once. Only a session that could still
+        // receive work counts as running.
+        let never_started = !crate::store::repo::sessions_for_direction(&db, dir.id)
             .await
             .map_err(e)?
-            .is_empty();
+            .iter()
+            .any(|session| matches!(session.status.as_str(), "running" | "idle" | "starting"));
         let stranded = verdict == "allowed_by_policy" && (!checkout_ok || never_started);
         if verdict != "needs_gate" && !stranded {
             continue;

@@ -2384,6 +2384,21 @@ pub async fn latest_plan_revision(db: &Db, thread_id: i32) -> Result<Option<plan
 
 /// Newest-first bounded page of a thread's scope history — the full "what did
 /// the scope look like, and who changed it" audit trail issue #172 asks for.
+/// Every plan-revision proposal ever recorded for a thread, oldest or newest
+/// first is irrelevant — callers use it as a set. Unpaged on purpose: the only
+/// caller asks "has the planner EVER owned this lane?", and a page bound turns
+/// that into "recently", which silently reclassifies old lanes. Selects just
+/// the proposal column so the row width does not grow with the history.
+pub async fn all_plan_revision_proposals(db: &Db, thread_id: i32) -> Result<Vec<String>> {
+    Ok(plan_revision::Entity::find()
+        .filter(plan_revision::Column::ThreadId.eq(thread_id))
+        .select_only()
+        .column(plan_revision::Column::Proposal)
+        .into_tuple::<String>()
+        .all(&db.0)
+        .await?)
+}
+
 pub async fn list_plan_revisions(
     db: &Db,
     thread_id: i32,

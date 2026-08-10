@@ -268,6 +268,28 @@ async fn authorize_materialize(
     Ok(verdict)
 }
 
+/// The lock that makes a policy change and a lane's authorize-then-write
+/// mutually exclusive PER WORKSPACE.
+///
+/// Re-reading the revision at write admission narrows the race but cannot close
+/// it: `set_authority_policy` can still commit between that read and
+/// `add_worktree_synced`, so a checkout gets created under rules that are no
+/// longer active — precisely the stale-decision boundary this issue exists to
+/// enforce. Both sides take this lock instead.
+///
+/// Deliberately NOT held across `bootstrap_worktree_deps`: a dependency install
+/// runs for minutes, and blocking every policy edit in the workspace behind it
+/// would trade a narrow correctness window for a wide usability one. That
+/// install writes inside a checkout whose creation was already authorized.
+pub async fn workspace_write_lock(workspace_id: i32) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<i32, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let registry = LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::sync::Arc::clone(guard.entry(workspace_id).or_default())
+}
+
 /// Byte budget for the operator-configured `hit_rule` text copied into decision
 /// evidence. Far below the ledger's own 8 KiB payload bound, so the serialized
 /// row cannot approach it no matter what a policy names — and bounding the
@@ -290,10 +312,25 @@ pub async fn lane_has_valid_checkout(db: &Db, direction_id: i32) -> Result<bool>
     let Some(existing) = repo::worktree_for(db, direction_id, repo_ref.id).await? else {
         return Ok(false);
     };
-    Ok(git::is_registered_worktree(
-        std::path::Path::new(&repo_ref.local_git_path),
-        std::path::Path::new(&existing.path),
-        &existing.branch,
+    let repo_path = std::path::Path::new(&repo_ref.local_git_path);
+    if !git::is_registered_worktree(repo_path, std::path::Path::new(&existing.path), &existing.branch)
+    {
+        return Ok(false);
+    }
+    // The same ancestry invariant `materialize_direction`'s reuse path applies.
+    // Registration and branch alone do not make a checkout usable: a branch
+    // force-reset off its recorded fork point is still registered under the
+    // expected name, and materialize would refuse it — so releasing a dependent
+    // on registration alone dispatches a worker into a tree materialization
+    // itself considers invalid. An empty `base_commit` (legacy/reuse row) has no
+    // recorded fork point to check, and is skipped exactly as it is there.
+    if existing.base_commit.is_empty() {
+        return Ok(true);
+    }
+    Ok(git::is_ancestor(
+        repo_path,
+        &existing.base_commit,
+        &git::local_branch_ref(&existing.branch),
     ))
 }
 
@@ -568,6 +605,10 @@ pub async fn materialize_direction(db: &Db, direction_id: i32) -> Result<Materia
             git::recorded_base_or_default(repo_path, &repo_ref.base_ref, repo_ref.base_ref_is_default)
         })
     };
+    // Held across adjudication AND the git writes below, so a policy committed
+    // in between cannot slip a checkout past a verdict it would have refused.
+    let workspace_lock = workspace_write_lock(thread.workspace_id).await;
+    let workspace_write_guard = workspace_lock.lock().await;
     let verdict = authorize_materialize(db, &dir, &repo_ref, thread.workspace_id, &base).await?;
     match verdict.decision {
         authority::LaneDecision::AllowedByPolicy => {}
@@ -737,6 +778,9 @@ pub async fn materialize_direction(db: &Db, direction_id: i32) -> Result<Materia
         Ok::<entities::worktree::Model, anyhow::Error>(rec)
     }
     .await;
+    // Everything the policy governs is now durable; the deps install below is
+    // not part of the authorization decision, so release before it.
+    drop(workspace_write_guard);
     match finish {
         Ok(rec) => {
             bootstrap_worktree_deps(&rec.path).await;

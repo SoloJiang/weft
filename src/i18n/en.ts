@@ -322,6 +322,7 @@ export const en = {
       denyFailed: "Couldn't deny — try again.",
       policyChanged: "The policy changed while this was open — re-read the updated card and decide again.",
       loadFailed: "Couldn't load pending decisions — some tasks may be waiting.",
+      retry: "Try again",
       reason: {
         protected_branch: "targets a protected branch",
         unreadable_policy: "the saved policy can't be read, so nothing is assumed",
