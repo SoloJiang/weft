@@ -1866,6 +1866,14 @@ pub struct AskRegistry {
     /// that meaning, because it is also the state of every thread nobody has
     /// asked about yet.
     thread_workspace_unresolved: Arc<std::sync::RwLock<std::collections::HashSet<i32>>>,
+    /// Set when the startup seed could not enumerate workspaces at all.
+    ///
+    /// Without it, a failed seed leaves the cache simply EMPTY, and an empty
+    /// cache reads as "this workspace has no policy" — determinate, so the
+    /// standing grants and the hook allowlist auto-approve actions a stored
+    /// `deny_actions` forbids, for the whole life of the process. Absence cannot
+    /// mean "no policy" when we never managed to look.
+    authority_seed_failed: Arc<std::sync::atomic::AtomicBool>,
     /// Serializes the durable-revoke command path (mutate → acked flush → rollback).
     /// Without it, two overlapping revokes of the same grant can race: the earlier
     /// one's rollback (on a failed write) re-seeds a grant a later, already-succeeded
@@ -2440,9 +2448,18 @@ impl AskRegistry {
         else {
             return false;
         };
-        self.authority
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
+        let cached = self.authority.read().unwrap_or_else(|e| e.into_inner());
+        // No entry for this workspace AND the seed never ran: we have never
+        // looked at this scope's policy, so we cannot claim it permits anything.
+        // Once a refresh installs an entry, that entry answers.
+        if !cached.contains_key(&workspace_id)
+            && self
+                .authority_seed_failed
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return true;
+        }
+        cached
             .get(&workspace_id)
             .is_some_and(|entry| match &entry.snapshot {
                 // Suspended: emptied on purpose while a mutation or a failed
@@ -2489,6 +2506,16 @@ impl AskRegistry {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&thread_id);
+    }
+
+    /// Record that the startup seed could not enumerate workspaces.
+    ///
+    /// Every scope with no cached entry is indeterminate until a refresh
+    /// installs one — see `authority_is_indeterminate`. A later successful
+    /// enumeration clears it.
+    pub fn mark_authority_seed_failed(&self, failed: bool) {
+        self.authority_seed_failed
+            .store(failed, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Record that this thread's workspace could NOT be read.
@@ -6798,6 +6825,35 @@ mod tests {
         // …and an unknown policy defers rather than falling back to the grant.
         r.suspend_authority_snapshot(1);
         assert_eq!(r.auto_decision_gui(1, "10", gui_key), None);
+    }
+
+    /// A seed that never ran cannot be read as "no workspace has a policy".
+    #[test]
+    fn a_failed_startup_seed_defers_until_a_refresh_installs_a_policy() {
+        let r = AskRegistry::new();
+        r.note_thread_workspace(1, 1);
+        r.grant_read_only_issue(1);
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::ReadOnly, "Run: ls"),
+            Some(Decision::Allow),
+            "a successful seed over a workspace with no policy stays permissive"
+        );
+
+        // The startup enumeration failed: nothing was ever looked at.
+        r.mark_authority_seed_failed(true);
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::ReadOnly, "Run: ls"),
+            None,
+            "an unseeded scope cannot be claimed to permit anything"
+        );
+
+        // A refresh for THIS workspace answers for it, even while the seed
+        // remains marked failed for the rest.
+        r.set_authority_snapshot(1, Some(bridge_test_policy(crate::authority::PolicyRules::default())));
+        assert_eq!(
+            r.auto_decision(1, "10", RiskLevel::ReadOnly, "Run: ls"),
+            Some(Decision::Allow)
+        );
     }
 
     /// Revoking may only tighten — for the CLI bridge as well as for lanes.

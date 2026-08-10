@@ -3225,10 +3225,18 @@ pub async fn seed_authority_bridge(db: &Db, asks: &crate::ask::AskRegistry) {
     let workspaces = match crate::store::repo::list_workspaces(db).await {
         Ok(rows) => rows,
         Err(error) => {
+            // Returning here used to leave the cache EMPTY, and an empty cache
+            // reads as "this workspace has no policy" — determinate. The bus
+            // starts serving asks immediately after this, so every standing
+            // grant and the hook allowlist would auto-approve actions a stored
+            // `deny_actions` forbids, for the life of the process. Absence
+            // cannot mean "no policy" when we never managed to look.
             eprintln!("[weft][authority] bridge seed: {error}");
+            asks.mark_authority_seed_failed(true);
             return;
         }
     };
+    asks.mark_authority_seed_failed(false);
     for ws in workspaces {
         refresh_authority_bridge_snapshot(db, asks, ws.id).await;
     }

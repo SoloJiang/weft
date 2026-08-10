@@ -1722,8 +1722,24 @@ pub(crate) async fn chat_open_worker_impl(
     let prior = repo::latest_session_for(db, direction_id, repo_id).await?;
     let native = prior.as_ref().and_then(|s| s.native_session_id.clone());
     let resumed = native.is_some();
+    // A session already LIVE for this slot is adopted, not duplicated.
+    //
+    // Reusing only on `native_session_id` left a window the length of engine
+    // registration: two windows holding the same Gate card both approve, both
+    // receive the same dispatch set, and the second open arrives before the
+    // first worker has registered a native id — so it fell through here and
+    // created a SECOND session, i.e. a second agent in the same checkout. The
+    // route gate serializes the two calls but does not dedupe them.
+    //
+    // In-process liveness is the right test rather than the row's status: after
+    // a restart a stale `running` row has no engine behind it, and adopting that
+    // is exactly what the cold-recreate path below exists to avoid.
+    let live_prior = prior
+        .as_ref()
+        .is_some_and(|session| state.worker_is_running(session.id));
     let sess = match prior {
         Some(s) if s.native_session_id.is_some() => s,
+        Some(s) if live_prior => s,
         _ => {
             repo::create_session_for_current_direction(db, direction_id, repo_id, &wt.path).await?
         }
