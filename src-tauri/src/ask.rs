@@ -1814,6 +1814,16 @@ impl Inner {
     }
 }
 
+/// One workspace's Permission Bridge cache line: the snapshot in force (absent
+/// when the policy is revoked or unreadable) plus the policy revision that
+/// value was applied at, so an out-of-order refresh cannot overwrite a newer
+/// one — in EITHER direction (see `apply_authority_refresh`).
+#[derive(Clone)]
+struct AuthorityBridgeEntry {
+    applied_revision: Option<i64>,
+    snapshot: Option<crate::authority::PolicySnapshot>,
+}
+
 /// Cloneable handle to all pending Asks.
 #[derive(Default, Clone)]
 pub struct AskRegistry {
@@ -1832,7 +1842,7 @@ pub struct AskRegistry {
     /// SYNCHRONOUS hot path (`auto_decision` itself is sync) — see that
     /// method's own doc for why the snapshot is cached here instead of
     /// queried from the store per ask.
-    authority: Arc<std::sync::RwLock<HashMap<i32, crate::authority::PolicySnapshot>>>,
+    authority: Arc<std::sync::RwLock<HashMap<i32, AuthorityBridgeEntry>>>,
     /// Which workspace each thread belongs to, recorded by the ask-creating
     /// paths (which are async and DB-aware) so the SYNC bridge can resolve an
     /// ask's workspace without a store round-trip. A thread absent from this
@@ -2250,43 +2260,53 @@ impl AskRegistry {
         workspace_id: i32,
         snapshot: Option<crate::authority::PolicySnapshot>,
     ) {
+        self.apply_authority_refresh(workspace_id, snapshot, None)
+    }
+
+    /// [`set_authority_snapshot`] with the revision the caller OBSERVED when it
+    /// read the database — including for a clear, where the snapshot itself
+    /// carries no revision to order by.
+    ///
+    /// Refreshes are not ordered. Two overlapping policy mutations each read
+    /// then install, so the EARLIER read can land last: it caches a superseded
+    /// revision, or — the case a `Some`-only check misses — a stale revoke read
+    /// ERASES a newer policy that a concurrent set had just installed. Erasing
+    /// is not the safe direction it looks like: materialization keeps enforcing
+    /// the database's current rules while CLI asks quietly stop applying that
+    /// policy's `deny_actions`, and nothing repairs the split until an
+    /// unrelated refresh or a restart.
+    ///
+    /// Revisions are monotonic per scope (see `create_authority_policy`), so a
+    /// numeric comparison is enough. A refresh with NO observed revision is a
+    /// failed read: it always applies, because deferring to a human is the
+    /// right answer when the policy cannot be determined at all.
+    pub fn apply_authority_refresh(
+        &self,
+        workspace_id: i32,
+        snapshot: Option<crate::authority::PolicySnapshot>,
+        observed_revision: Option<i64>,
+    ) {
         let mut g = self.authority.write().unwrap_or_else(|e| e.into_inner());
-        // Refreshes are not ordered. Two overlapping policy mutations each read
-        // the database and then install; the EARLIER read can be descheduled
-        // and land last, caching a superseded revision (or a revoke clearing a
-        // snapshot a later `set` just installed) while materialization already
-        // enforces the newer row. CLI asks would then run on rules the database
-        // has moved past — auto-allowing what the current policy denies, until
-        // some unrelated refresh or a restart happened to fix it.
-        //
-        // Revisions are monotonic per scope (see `create_authority_policy`), so
-        // comparing them numerically is enough to drop a stale install. A CLEAR
-        // is never dropped: it is the fail-closed answer, used both for a real
-        // revoke and for a failed read, and deferring to a human is always a
-        // safe outcome.
-        let cached_revision = g
-            .get(&workspace_id)
-            .and_then(|current| current.revision.parse::<i64>().ok());
-        match snapshot {
-            // A revoked/absent policy REMOVES the entry rather than leaving a
-            // stale one: the hard-coded conservative default then applies, and
-            // the bridge defers to the human flow exactly as it did pre-#172.
-            None => {
-                g.remove(&workspace_id);
-            }
-            Some(snapshot) => {
-                let incoming = snapshot.revision.parse::<i64>().ok();
-                let is_stale = match (cached_revision, incoming) {
-                    (Some(cached), Some(incoming)) => incoming < cached,
-                    // An unparseable revision on either side carries no ordering
-                    // to compare, so take the write rather than pin the cache.
-                    _ => false,
-                };
-                if !is_stale {
-                    g.insert(workspace_id, snapshot);
-                }
-            }
+        let incoming = match &snapshot {
+            Some(snapshot) => snapshot.revision.parse::<i64>().ok(),
+            None => observed_revision,
         };
+        let cached = g.get(&workspace_id).and_then(|entry| entry.applied_revision);
+        let is_stale = match (cached, incoming) {
+            (Some(cached), Some(incoming)) => incoming < cached,
+            // Either side missing carries no ordering — take the write rather
+            // than pin the cache on a value nothing can supersede.
+            _ => false,
+        };
+        if is_stale {
+            return;
+        }
+        // A revoked/absent policy stores an entry with NO snapshot rather than
+        // dropping the key: the hard-coded conservative default applies and the
+        // bridge defers to the human flow exactly as it did pre-#172, but the
+        // revision it was applied at is remembered so a later stale read cannot
+        // undo it.
+        g.insert(workspace_id, AuthorityBridgeEntry { applied_revision: incoming, snapshot });
     }
 
     /// The cached AuthorityPolicy snapshot for one workspace, if any — exposed
@@ -2296,7 +2316,7 @@ impl AskRegistry {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(&workspace_id)
-            .cloned()
+            .and_then(|entry| entry.snapshot.clone())
     }
 
     /// Record which workspace a thread belongs to, so the sync bridge can find
@@ -2896,6 +2916,51 @@ impl AskRegistry {
 
 #[cfg(test)]
 mod tests {
+
+    /// An out-of-order bridge refresh must never overwrite a newer one — in
+    /// either direction. The clear arm is the one that bites: a slow revoke
+    /// read erasing a policy installed after it leaves materialization
+    /// enforcing rules the CLI side has silently stopped applying.
+    #[test]
+    fn a_stale_bridge_refresh_cannot_overwrite_a_newer_one() {
+        fn snapshot(revision: &str) -> crate::authority::PolicySnapshot {
+            crate::authority::PolicySnapshot {
+                id: 1,
+                scope: crate::authority::PolicyScope::Workspace(7),
+                revision: revision.to_string(),
+                rules: Default::default(),
+                source: "test".to_string(),
+                created_at: String::new(),
+                revoked_at: String::new(),
+                rules_unreadable: false,
+            }
+        }
+        let asks = AskRegistry::new();
+
+        asks.set_authority_snapshot(7, Some(snapshot("5")));
+        assert_eq!(asks.authority_snapshot(7).map(|s| s.revision), Some("5".to_string()));
+
+        // An older install is dropped.
+        asks.set_authority_snapshot(7, Some(snapshot("4")));
+        assert_eq!(asks.authority_snapshot(7).map(|s| s.revision), Some("5".to_string()));
+
+        // …and so is an older CLEAR.
+        asks.apply_authority_refresh(7, None, Some(4));
+        assert_eq!(asks.authority_snapshot(7).map(|s| s.revision), Some("5".to_string()));
+
+        // A clear at or beyond the cached revision applies.
+        asks.apply_authority_refresh(7, None, Some(6));
+        assert!(asks.authority_snapshot(7).is_none());
+
+        // A newer install after a clear applies.
+        asks.set_authority_snapshot(7, Some(snapshot("7")));
+        assert_eq!(asks.authority_snapshot(7).map(|s| s.revision), Some("7".to_string()));
+
+        // A clear with NO observed revision is a failed read: always applies.
+        asks.apply_authority_refresh(7, None, None);
+        assert!(asks.authority_snapshot(7).is_none());
+    }
+
     use super::*;
 
     /// The fold's whole job: one dangerous target lifts the whole request, so

@@ -2405,6 +2405,24 @@ pub async fn list_plan_revisions(
 /// `"1"`), never mutates an existing one, so the full policy history stays
 /// intact. `rules` is the caller's already-serialized `authority::
 /// PolicyRules` JSON.
+/// The highest revision ever allocated for a scope, ACTIVE or revoked. The
+/// active-policy read answers `None` after a revoke, which carries no ordering;
+/// the bridge needs one anyway so a slow revoke refresh cannot erase a policy
+/// that was installed after it (see `AskRegistry::apply_authority_refresh`).
+pub async fn latest_authority_policy_revision(
+    db: &Db,
+    scope: &str,
+    scope_id: i32,
+) -> Result<Option<i64>> {
+    Ok(authority_policy::Entity::find()
+        .filter(authority_policy::Column::Scope.eq(scope))
+        .filter(authority_policy::Column::ScopeId.eq(scope_id))
+        .order_by_desc(authority_policy::Column::Id)
+        .one(&db.0)
+        .await?
+        .and_then(|row| row.revision.parse::<i64>().ok()))
+}
+
 pub async fn create_authority_policy(
     db: &Db,
     scope: &str,
@@ -9066,6 +9084,26 @@ pub async fn latest_lane_decisions(db: &Db, thread_id: i32) -> Result<HashMap<i3
         }
     }
     Ok(out)
+}
+
+/// The newest `decision` evidence row for one lane, or `None` if it never had
+/// one. Filters by kind in the DATABASE rather than paging mixed-kind evidence
+/// and searching within it: a lane that accumulated more recent rows of other
+/// kinds (PR host updates, verification, reconciliation) would push its
+/// decision past any page bound, and a Gate that "disappears" once a lane gets
+/// busy is exactly the failure the Gate exists to prevent.
+pub async fn latest_decision_evidence(
+    db: &Db,
+    thread_id: i32,
+    direction_id: i32,
+) -> Result<Option<evidence::Model>> {
+    Ok(evidence::Entity::find()
+        .filter(evidence::Column::ThreadId.eq(thread_id))
+        .filter(evidence::Column::DirectionId.eq(direction_id))
+        .filter(evidence::Column::Kind.eq(EVIDENCE_KIND_DECISION))
+        .order_by_desc(evidence::Column::Id)
+        .one(&db.0)
+        .await?)
 }
 
 pub async fn list_evidence(

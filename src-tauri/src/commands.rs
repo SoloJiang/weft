@@ -3112,7 +3112,23 @@ pub async fn refresh_authority_bridge_snapshot(
                 crate::authority::PolicyScope::Workspace(workspace_id),
             )),
         ),
-        Ok(None) => asks.set_authority_snapshot(workspace_id, None),
+        // A revoke has no ACTIVE row to take a revision from, but the revoked
+        // row still carries one — and the clear has to be ordered against
+        // concurrent installs just as an install is, or a slow revoke read can
+        // erase a policy that landed after it. `None` here means even that read
+        // failed, which applies unconditionally: fail closed when the policy
+        // cannot be determined.
+        Ok(None) => {
+            let observed = crate::store::repo::latest_authority_policy_revision(
+                db,
+                "workspace",
+                workspace_id,
+            )
+            .await
+            .ok()
+            .flatten();
+            asks.apply_authority_refresh(workspace_id, None, observed)
+        }
         Err(error) => {
             // Fail CLOSED on a read error: drop whatever was cached so the
             // bridge defers to the human flow. The previous shape kept the old
@@ -3213,21 +3229,29 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
     // reviewed scope no longer contains. Empty means the plan records no ids
     // yet (nothing confirmed), in which case there is nothing to filter
     // against and every lane stays eligible.
-    let in_scope: std::collections::HashSet<i32> = crate::store::repo::get_plan(&db, thread_id)
+    let current_lanes: Option<Vec<serde_json::Value>> = crate::store::repo::get_plan(&db, thread_id)
         .await
         .map_err(e)?
         .and_then(|plan| serde_json::from_str::<serde_json::Value>(&plan.proposal).ok())
         .and_then(|value| value.get("directions").cloned())
-        .and_then(|dirs| dirs.as_array().cloned())
-        .unwrap_or_default()
+        .and_then(|dirs| dirs.as_array().cloned());
+    let in_scope: std::collections::HashSet<i32> = current_lanes
         .iter()
+        .flatten()
         .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
         .map(|id| id as i32)
         .filter(|id| *id != 0)
         .collect();
+    // Filter whenever a current plan was READ, not merely when it names ids. A
+    // re-proposal that replaces every gated lane records `direction_id: 0` for
+    // all of its new lanes, so an "is the id set empty?" guard would switch
+    // filtering off exactly when the old cards became obsolete — leaving them
+    // actionable. "No plan at all" is the only case with nothing to filter
+    // against.
+    let filter_to_scope = current_lanes.is_some();
     let mut out = Vec::new();
     for dir in directions {
-        if !in_scope.is_empty() && !in_scope.contains(&dir.id) {
+        if filter_to_scope && !in_scope.contains(&dir.id) {
             continue;
         }
         // Whether the lane has a checkout a worker could actually run in — the
@@ -3241,12 +3265,10 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
         let checkout_ok = crate::materialize::lane_has_valid_checkout(&db, dir.id)
             .await
             .map_err(e)?;
-        let evidence = crate::store::repo::list_evidence(&db, thread_id, Some(dir.id), 20)
-            .await
-            .map_err(e)?;
-        let Some(mut latest_decision) = evidence
-            .into_iter()
-            .find(|row| row.kind == crate::store::repo::EVIDENCE_KIND_DECISION)
+        let Some(mut latest_decision) =
+            crate::store::repo::latest_decision_evidence(&db, thread_id, dir.id)
+                .await
+                .map_err(e)?
         else {
             continue;
         };
@@ -3262,12 +3284,10 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
             if refreshed.is_none() {
                 continue;
             }
-            let evidence = crate::store::repo::list_evidence(&db, thread_id, Some(dir.id), 20)
-                .await
-                .map_err(e)?;
-            let Some(fresh) = evidence
-                .into_iter()
-                .find(|row| row.kind == crate::store::repo::EVIDENCE_KIND_DECISION)
+            let Some(fresh) =
+                crate::store::repo::latest_decision_evidence(&db, thread_id, dir.id)
+                    .await
+                    .map_err(e)?
             else {
                 continue;
             };
