@@ -18,6 +18,7 @@ type GateReasonKey =
   | "awaiting_gate_decision"
   | "gate_approved_override"
   | "gate_denied_override"
+  | "revoked_policy"
   | "stranded_lane";
 
 /** Which failure arm a click maps to — derived once from the action the user
@@ -31,6 +32,7 @@ function gateReasonKey(reason: string): GateReasonKey {
   switch (reason) {
     case "protected_branch":
     case "unreadable_policy":
+    case "revoked_policy":
     case "gate_approved_override":
     case "gate_denied_override":
     case "stranded_lane":

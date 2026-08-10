@@ -326,6 +326,7 @@ export const en = {
       reason: {
         protected_branch: "targets a protected branch",
         unreadable_policy: "the saved policy can't be read, so nothing is assumed",
+        revoked_policy: "the workspace policy was revoked, so nothing is assumed",
         awaiting_gate_decision: "no policy covers this yet",
         gate_approved_override: "approved for this policy revision",
         gate_denied_override: "denied for this policy revision",

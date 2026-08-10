@@ -2566,11 +2566,16 @@ pub async fn get_active_authority_policy(
 
 /// Revoke the active AuthorityPolicy for a scope (sets `revoked_at`; never
 /// deletes). A no-op if no active row exists. After this, `get_active_
-/// authority_policy` returns `None` and callers fall back to `authority::
-/// default_policy` — revoking a policy can only make a scope MORE
-/// conservative, never more permissive, because the fallback is the
-/// hard-coded conservative default (never an older, still-unrevoked
-/// revision — see that function's own doc).
+/// authority_policy` returns `None` and `resolve_policy_snapshot` resolves the
+/// scope to `authority::revoked_policy` — revoking a policy can only make a
+/// scope MORE conservative, never more permissive.
+///
+/// That property is why the fallback is NOT `authority::default_policy`: the
+/// default has empty `denied_repos` and `protected_branches`, so falling back to
+/// it would let "undo my policy" un-deny a repo and un-protect a branch. Nor is
+/// it an older, still-unrevoked revision — revoking is "undo my most recent
+/// configuration", not "retire one row while an earlier one keeps governing".
+/// A revoked scope adjudicates every Lane to a human Gate instead.
 pub async fn revoke_authority_policy(db: &Db, scope: &str, scope_id: i32) -> Result<()> {
     let Some(active) = get_active_authority_policy(db, scope, scope_id).await? else {
         return Ok(());
@@ -2579,6 +2584,34 @@ pub async fn revoke_authority_policy(db: &Db, scope: &str, scope_id: i32) -> Res
     a.revoked_at = Set(now());
     a.update(&db.0).await?;
     Ok(())
+}
+
+/// The AuthorityPolicy in force for a scope, right now — the ONE resolution of
+/// "which rules apply here", so no caller has to remember what `None` from
+/// `get_active_authority_policy` means.
+///
+/// Three cases, and conflating the last two is a permission bug rather than an
+/// untidiness:
+/// - an ACTIVE row → its snapshot;
+/// - no active row but the scope HAS been configured → `authority::
+///   revoked_policy`, which fails closed to a human Gate;
+/// - never configured at all → `authority::default_policy`, which is what keeps
+///   the feature inert for an installation that has never set one.
+pub async fn resolve_policy_snapshot(
+    db: &Db,
+    scope: crate::authority::PolicyScope,
+) -> Result<crate::authority::PolicySnapshot> {
+    let kind = scope.kind();
+    let id = scope.id();
+    if let Some(row) = get_active_authority_policy(db, kind, id).await? {
+        return Ok(crate::authority::snapshot_from_row(row, scope));
+    }
+    // Newest first, so this is the revision that was revoked.
+    let Some(revoked) = list_authority_policy_revisions(db, kind, id).await?.into_iter().next()
+    else {
+        return Ok(crate::authority::default_policy(scope));
+    };
+    Ok(crate::authority::revoked_policy(scope, revoked.revision, revoked.revoked_at))
 }
 
 /// Newest-first full revision history for a scope — the audit trail behind

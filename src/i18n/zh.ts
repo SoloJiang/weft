@@ -317,6 +317,7 @@ export const zh = {
       reason: {
         protected_branch: "目标是受保护分支",
         unreadable_policy: "已保存的策略无法解析，因此不做任何假定",
+        revoked_policy: "工作区策略已被撤销，因此不做任何假定",
         awaiting_gate_decision: "尚无策略覆盖此任务",
         gate_approved_override: "已针对当前策略版本批准",
         gate_denied_override: "已针对当前策略版本拒绝",

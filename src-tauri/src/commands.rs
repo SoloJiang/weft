@@ -3353,11 +3353,13 @@ async fn list_lane_gates_impl(db: &Db, thread_id: i32) -> R<Vec<LaneGateDto>> {
                 (verdict.as_ref(), "stranded_lane".to_string())
             }
             // Everything else has no decision to offer. Denied is settled;
-            // Finished and Running have nothing to ask; OutOfScope is not the
-            // user's current scope; BlockedUpstream's real blocker is the
-            // producer, which carries its own card; NotApplicable binds no repo.
+            // Finished and Running have nothing to ask; Deactivated was switched
+            // off on purpose; OutOfScope is not the user's current scope;
+            // BlockedUpstream's real blocker is the producer, which carries its
+            // own card; NotApplicable binds no repo.
             LaneAuthorityState::Denied(_)
             | LaneAuthorityState::Finished
+            | LaneAuthorityState::Deactivated
             | LaneAuthorityState::OutOfScope
             | LaneAuthorityState::BlockedUpstream { .. }
             | LaneAuthorityState::Running
@@ -3396,10 +3398,11 @@ fn gate_reason_slug(verdict: &crate::authority::LaneVerdict) -> String {
 }
 
 /// The policy revision a Gate for this direction must be decided under: the
-/// workspace's ACTIVE `authority_policy` revision right now, or the hard-coded
-/// default's `"0"` when no policy is configured. Resolved server-side so a
-/// caller can never record a decision against a revision that is not in force
-/// — neither a stale one read off an old card nor a not-yet-minted one.
+/// revision of whatever policy is in force for the workspace right now — an
+/// active row's, a revoked row's, or the hard-coded default's `"0"` when none
+/// was ever configured. Resolved server-side so a caller can never record a
+/// decision against a revision that is not in force — neither a stale one read
+/// off an old card nor a not-yet-minted one.
 async fn current_gate_policy_revision(db: &Db, direction_id: i32) -> anyhow::Result<String> {
     let Some(dir) = crate::store::repo::get_direction(db, direction_id).await? else {
         anyhow::bail!("lane {direction_id} not found");
@@ -3407,15 +3410,15 @@ async fn current_gate_policy_revision(db: &Db, direction_id: i32) -> anyhow::Res
     let Some(thread) = crate::store::repo::get_thread(db, dir.thread_id).await? else {
         anyhow::bail!("issue {} not found", dir.thread_id);
     };
-    let active =
-        crate::store::repo::get_active_authority_policy(db, "workspace", thread.workspace_id).await?;
-    Ok(match active {
-        Some(row) => row.revision,
-        None => crate::authority::default_policy(crate::authority::PolicyScope::Workspace(
-            thread.workspace_id,
-        ))
-        .revision,
-    })
+    // Resolved the same way adjudication resolves it, so a card is always
+    // stamped with the revision the verdict behind it was computed under —
+    // including the revoked revision a revoked scope now adjudicates at.
+    Ok(crate::store::repo::resolve_policy_snapshot(
+        db,
+        crate::authority::PolicyScope::Workspace(thread.workspace_id),
+    )
+    .await?
+    .revision)
 }
 
 /// Resolve one Lane's Gate: record the human's decision, keyed to the EXACT
@@ -5674,6 +5677,152 @@ mod tests {
             list_lane_gates_impl(&db, t.id).await.unwrap().is_empty(),
             "a running lane has nothing to ask"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// A lane switched off by a human is not actionable and not startable —
+    /// and, unlike a finished one, does not release what waits on it.
+    #[tokio::test]
+    async fn a_deactivated_lane_is_neither_actionable_nor_a_satisfied_prerequisite() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-gate-inactive-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r =
+            repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+                .await
+                .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let producer =
+            repo::create_direction(&db, t.id, "producer", "claude", r.id, "why", "plan+impl", "")
+                .await
+                .unwrap();
+        let consumer =
+            repo::create_direction(&db, t.id, "consumer", "claude", r.id, "why", "plan+impl", "")
+                .await
+                .unwrap();
+        repo::set_direction_upstream(&db, consumer.id, producer.id).await.unwrap();
+
+        // Both are allowed and materialized; only the producer gets switched off.
+        crate::materialize::materialize_direction(&db, producer.id).await.unwrap();
+        crate::materialize::materialize_direction(&db, consumer.id).await.unwrap();
+        repo::set_direction_status(&db, producer.id, "cancelled").await.unwrap();
+
+        let producer_state =
+            crate::lane_state::lane_authority_state(&db, producer.id).await.unwrap();
+        assert_eq!(producer_state.label(), "deactivated");
+        assert!(!producer_state.is_dispatchable(), "a cancelled lane never dispatches");
+        assert!(!producer_state.admits_worker(), "a cancelled lane never admits a worker");
+
+        // The whole point of keeping this distinct from Finished: a lane that
+        // was switched off produced nothing, so its consumer is blocked, not
+        // released. Treating the two alike would start the consumer against a
+        // producer whose work never happened.
+        let consumer_state =
+            crate::lane_state::lane_authority_state(&db, consumer.id).await.unwrap();
+        assert_eq!(consumer_state.label(), "blocked_upstream");
+
+        // Neither one may be offered a recovery card.
+        let cards = list_lane_gates_impl(&db, t.id).await.unwrap();
+        assert!(cards.is_empty(), "a deactivated lane and its blocked consumer show no card: {cards:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    /// Revoking a restrictive policy must not release what it was restricting.
+    ///
+    /// `revoke_authority_policy` documents that revoking "can only make a scope
+    /// MORE conservative, never more permissive". Falling back to the hard-coded
+    /// default broke exactly that: the default has empty `denied_repos` and
+    /// `protected_branches`, so a revoke un-denied the repo and un-protected the
+    /// branch, and a lane that had been refused came back materializable.
+    #[tokio::test]
+    async fn revoking_a_restrictive_policy_never_loosens_a_lane() {
+        use crate::store::repo;
+        let _env = crate::paths::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-revoke-closed-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+
+        let repo_path = root.join("repo");
+        crate::git::init_repo(&repo_path).unwrap();
+        let main = crate::git::current_branch(&repo_path).unwrap();
+
+        let db = crate::store::Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let r =
+            repo::add_repo_ref(&db, ws.id, "repo", repo_path.to_str().unwrap(), &main, "", true)
+                .await
+                .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t", "feature", "claude").await.unwrap();
+        let denied = repo::create_direction(&db, t.id, "d", "claude", r.id, "why", "plan+impl", "")
+            .await
+            .unwrap();
+
+        // A policy that DENIES this lane's repo outright.
+        let rules = crate::authority::PolicyRules {
+            denied_repos: vec!["repo".to_string()],
+            ..Default::default()
+        };
+        let rules_json = serde_json::to_string(&rules).unwrap();
+        repo::create_authority_policy(&db, "workspace", ws.id, &rules_json, "user")
+            .await
+            .unwrap();
+        let refused = crate::materialize::materialize_direction(&db, denied.id).await.unwrap();
+        assert!(
+            matches!(refused, crate::materialize::MaterializeOutcome::Denied(_)),
+            "the denied_repos rule must refuse the lane, got {refused:?}"
+        );
+
+        // Revoke it. The lane must NOT become allowed.
+        repo::revoke_authority_policy(&db, "workspace", ws.id).await.unwrap();
+        let after = crate::materialize::materialize_direction(&db, denied.id).await.unwrap();
+        assert!(
+            !matches!(after, crate::materialize::MaterializeOutcome::Ready(_)),
+            "revoking a denying policy must not materialize the lane it denied, got {after:?}"
+        );
+        assert!(
+            repo::worktree_for(&db, denied.id, r.id).await.unwrap().is_none(),
+            "no checkout may exist for a lane whose only permission came from a revoke"
+        );
+
+        // It resolves to a human decision, with a card that says why.
+        let state = crate::lane_state::lane_authority_state(&db, denied.id).await.unwrap();
+        assert_eq!(state.label(), "awaiting_gate");
+        let cards = list_lane_gates_impl(&db, t.id).await.unwrap();
+        assert_eq!(cards.len(), 1, "a revoked scope still offers a way forward");
+        assert_eq!(cards[0].verdict_reason, "revoked_policy");
+
+        // A scope that never had a policy is NOT this — it stays inert, which is
+        // what keeps the whole feature a no-op for a normal installation.
+        let fresh_ws = repo::create_workspace(&db, "never-configured").await.unwrap();
+        let snapshot = repo::resolve_policy_snapshot(
+            &db,
+            crate::authority::PolicyScope::Workspace(fresh_ws.id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot.revision, "0");
+        assert!(snapshot.revoked_at.is_empty(), "never-configured is not revoked");
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);

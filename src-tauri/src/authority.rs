@@ -150,8 +150,10 @@ pub fn snapshot_from_row(
     }
 }
 
-/// The hard-coded, conservative default used when no configured policy row
-/// exists (or the last one was revoked) for a scope. Its rules are the
+/// The hard-coded, conservative default used when a scope has NEVER had a
+/// configured policy row. A scope whose policy was revoked resolves to
+/// [`revoked_policy`] instead — see that function for why the two must differ.
+/// Its rules are the
 /// all-empty, `auto_materialize: false` default — identical, by construction,
 /// to a freshly-`Default::default()`d [`PolicyRules`]. Revision `"0"` so a
 /// REAL first configured policy (revision `"1"`) always compares as strictly
@@ -165,6 +167,48 @@ pub fn default_policy(scope: PolicyScope) -> PolicySnapshot {
         source: "system".to_string(),
         created_at: String::new(),
         revoked_at: String::new(),
+        rules_unreadable: false,
+    }
+}
+
+/// The policy in force for a scope whose configured policy was REVOKED.
+///
+/// Distinct from [`default_policy`] on purpose, and the distinction is a safety
+/// property rather than bookkeeping. `revoke_authority_policy` documents that
+/// revoking "can only make a scope MORE conservative, never more permissive" —
+/// but the hard-coded default has empty `denied_repos` and empty
+/// `protected_branches`, so falling back to it *removes* every rule the revoked
+/// policy carried. Revoking a policy that denied a repo, or gated a release
+/// branch, would hand that exact Lane an `allowed_by_policy` verdict.
+///
+/// So a revoked scope resolves to "a human decides", not "everything is
+/// allowed": [`adjudicate_lane`] reads the non-empty `revoked_at` and answers
+/// `NeedsGate`, with the same Gate-override escape the unreadable-policy branch
+/// has, so nothing is stranded. The rules are empty because none can be
+/// trusted, which also makes [`bridge_decision`] defer every CLI ask to the
+/// existing human flow.
+///
+/// A scope that never had a policy at all is NOT this — it keeps
+/// [`default_policy`], which is what leaves the feature inert for an
+/// installation that has never configured one.
+///
+/// `revision` is the revoked row's own, so a Gate decision recorded under it
+/// and a later real policy still compare in the right order.
+pub fn revoked_policy(scope: PolicyScope, revision: String, revoked_at: String) -> PolicySnapshot {
+    PolicySnapshot {
+        id: 0,
+        scope,
+        revision,
+        rules: PolicyRules::default(),
+        source: "system".to_string(),
+        created_at: String::new(),
+        // The discriminator `adjudicate_lane` reads. Never empty here: a
+        // revoked row always carries a stamp, and an empty one would make this
+        // snapshot indistinguishable from the permissive default.
+        revoked_at: match revoked_at.is_empty() {
+            true => "revoked".to_string(),
+            false => revoked_at,
+        },
         rules_unreadable: false,
     }
 }
@@ -246,6 +290,7 @@ pub enum VerdictReason {
     GateApprovedOverride,
     GateDeniedOverride,
     PolicyAutoMaterialize,
+    RevokedPolicy,
     HumanConfirmed,
     AwaitingGateDecision,
     ActionAllowedByPolicy,
@@ -378,6 +423,25 @@ pub fn adjudicate_lane(
                 build(LaneDecision::Denied, VerdictReason::GateDeniedOverride, None)
             }
             None => build(LaneDecision::NeedsGate, VerdictReason::UnreadablePolicy, None),
+        };
+    }
+
+    // A REVOKED policy is the same kind of unknown, for the same reason: the
+    // rules below are empty not because nothing was forbidden but because
+    // nothing can be consulted. Answering from them would let "undo my policy"
+    // silently un-deny a repo and un-protect a branch — the one thing
+    // `revoke_authority_policy` promises revoking cannot do. Fail closed to a
+    // human, honoring a Gate resolution already recorded at this revision so
+    // the Lane still has a way forward. See `authority::revoked_policy`.
+    if !policy.revoked_at.is_empty() {
+        return match lane.gate_override {
+            Some(GateOverride::Approved) => {
+                build(LaneDecision::AllowedByPolicy, VerdictReason::GateApprovedOverride, None)
+            }
+            Some(GateOverride::Denied) => {
+                build(LaneDecision::Denied, VerdictReason::GateDeniedOverride, None)
+            }
+            None => build(LaneDecision::NeedsGate, VerdictReason::RevokedPolicy, None),
         };
     }
 

@@ -224,10 +224,11 @@ async fn judge_materialize(
     effective_base: &str,
 ) -> Result<authority::LaneVerdict> {
     let scope = authority::PolicyScope::Workspace(thread_workspace_id);
-    let policy = match repo::get_active_authority_policy(db, "workspace", thread_workspace_id).await? {
-        Some(row) => authority::snapshot_from_row(row, scope),
-        None => authority::default_policy(scope),
-    };
+    // The resolver, not a bare `get_active … else default`: a scope whose policy
+    // was REVOKED must not fall back to the permissive hard-coded default, which
+    // would drop the very `denied_repos`/`protected_branches` the revoked policy
+    // carried. See `repo::resolve_policy_snapshot`.
+    let policy = repo::resolve_policy_snapshot(db, scope).await?;
     let scope_revision = repo::latest_plan_revision(db, dir.thread_id)
         .await?
         .map(|r| r.version)
@@ -726,10 +727,15 @@ pub async fn materialize_direction(db: &Db, direction_id: i32) -> Result<Materia
     // the race — but closing it fully needs a shared per-workspace lock across
     // policy mutation and materialization, which is a bigger change than this
     // PR should carry.
-    let admission_revision = repo::get_active_authority_policy(db, "workspace", thread.workspace_id)
-        .await?
-        .map(|row| row.revision)
-        .unwrap_or_else(|| "0".to_string());
+    // Read through the SAME resolver the verdict above used. Comparing an
+    // active-row-or-`"0"` read against a verdict computed from the resolver
+    // makes a revoked scope mismatch on every materialize — the answer stays
+    // correct (the re-judge below returns the Gate) but the comparison stops
+    // meaning "the policy moved", which is the only thing it is here to detect.
+    let admission_revision =
+        repo::resolve_policy_snapshot(db, authority::PolicyScope::Workspace(thread.workspace_id))
+            .await?
+            .revision;
     if admission_revision != verdict.policy_revision {
         // Do NOT report the stale verdict as a Gate. It carries the OLD
         // revision and an `AllowedByPolicy` decision, so confirm would commit

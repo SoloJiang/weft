@@ -824,7 +824,11 @@ fn planned_lane_source(plan: Option<&plan::Model>) -> PlannedLaneSource {
     }
 }
 
-fn direction_is_active(direction: &direction::Model) -> bool {
+/// Whether a lane is switched ON. The ONE definition of "deliberately
+/// deactivated" — `lane_state` resolves its `Deactivated` arm from this rather
+/// than keeping a second copy of the status list, since a list that exists
+/// twice is a list that drifts.
+pub(crate) fn direction_is_active(direction: &direction::Model) -> bool {
     !matches!(direction.status.as_str(), "inactive" | "cancelled")
 }
 
@@ -942,35 +946,31 @@ fn virtual_lane_facts(
 const CHECK_EVIDENCE_TTL: Duration = Duration::from_secs(10 * 60);
 const READINESS_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
 const CHECK_INFERENCE_TIMEOUT: Duration = Duration::from_secs(1);
-#[cfg(not(test))]
+/// How long the Git work of ONE signature probe may take, measured from the
+/// moment it actually holds a slot — see `GitSignatureProbe::sample`.
 const GIT_SIGNATURE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
-/// The probe budget is wall-clock, and under `cargo test` it is spent on a
-/// machine saturated by ~2200 parallel tests rather than on a user's idle
-/// laptop. A sample that elapses becomes `None`, which `CheckFlight` reads as
-/// "the worktree changed" — so machine load, not the code under test, decides
-/// whether a readiness assertion holds. Raised here for the same reason the
-/// probe concurrency bound is: neither is the property these tests exercise.
-#[cfg(test)]
-const GIT_SIGNATURE_PROBE_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a probe may WAIT for one of the `MAX_CONCURRENT_GIT_PROBES` slots
+/// before giving up, kept separate from the execution budget above.
+///
+/// One combined budget is what made readiness assertions depend on machine
+/// load: queueing is not evidence about a worktree, but a sample that spent its
+/// budget in line returned the same error a hung `git` does, `.ok()` turned that
+/// into `None`, and `CheckFlight` read "signature changed" from what was really
+/// "signature unknown" — discarding a valid report and asserting on an empty
+/// `repo_checks`. Splitting them keeps the backlog bound (a probe still cannot
+/// queue forever, and the process fan-out is still capped) while guaranteeing
+/// that a probe which does get scheduled gets its full budget to finish.
+const GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
 const BOUNDED_PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_CONCURRENT_CHECK_RUNNERS: usize = 2;
 const MAX_CONCURRENT_CHECK_INFERENCES: usize = 2;
-/// Bounds concurrent Git probe children in a RUNNING app, so a large portfolio
-/// and a slow fsmonitor cannot build an unbounded backlog of overlapping
-/// readiness refreshes.
-#[cfg(not(test))]
+/// Bounds concurrent Git probe children, so a large portfolio and a slow
+/// fsmonitor cannot build an unbounded backlog of overlapping readiness
+/// refreshes. Deliberately NOT relaxed under `cfg(test)`: the tests exercise the
+/// bound that ships. Queueing on it no longer costs a probe its execution
+/// budget (see `GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT`), so a saturated machine
+/// makes probes slower, not wrong.
 const MAX_CONCURRENT_GIT_PROBES: usize = 4;
-/// Under `cargo test` this gate is process-global across a binary that runs
-/// ~2200 tests in parallel, and `GitSignatureProbe::sample`'s timeout is one
-/// total budget that INCLUDES time queued on it. Four permits therefore make
-/// unrelated tests fail each other: a queued sample elapses, `.ok()` turns the
-/// error into `None`, and `CheckFlight` reads "signature changed" from what is
-/// really "signature unknown" — discarding a valid report and asserting on an
-/// empty `repo_checks`. The backlog bound is not the property these tests
-/// exercise; raising it here removes the cross-test coupling without touching
-/// what ships.
-#[cfg(test)]
-const MAX_CONCURRENT_GIT_PROBES: usize = 256;
 const MAX_CONCURRENT_MARKER_SWEEPS: usize = 2;
 const MARKER_SWEEP_TIMEOUT: Duration = Duration::from_millis(250);
 const CHECK_OUTPUT_TAIL_BYTES: usize = 2_000;
@@ -1678,7 +1678,11 @@ async fn latest_worker_facts(db: &Db, direction_id: i32) -> Result<WorkerSession
 #[derive(Clone, Debug)]
 struct GitSignatureProbe {
     program: PathBuf,
+    /// How long the Git work may take once this probe holds a slot.
     timeout: Duration,
+    /// How long this probe may wait FOR that slot. Separate from `timeout` on
+    /// purpose — see `GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT`.
+    admission_timeout: Duration,
     /// Production probes share the process-wide cap. Tests that need to prove
     /// a child actually starts may inject an isolated cap so unrelated
     /// parallel tests cannot consume the whole deadline before spawn.
@@ -1690,16 +1694,12 @@ impl GitSignatureProbe {
         Self {
             program: PathBuf::from("git"),
             timeout: GIT_SIGNATURE_PROBE_TIMEOUT,
+            admission_timeout: GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT,
             limit: None,
         }
     }
 
     async fn sample(&self, path: &Path) -> Result<GitWorktreeSignature> {
-        // This is deliberately one total budget, including time queued behind
-        // other board cards, rather than 15 seconds per subcommand. A large
-        // portfolio and a slow fsmonitor therefore cannot create an unbounded
-        // backlog of overlapping readiness refreshes.
-        let deadline = tokio::time::Instant::now() + self.timeout;
         // Board cards and multi-lane collection may sample concurrently. Keep
         // the process fan-out globally bounded across every issue rather than
         // multiplying one Git child per card, lane, and worktree.
@@ -1707,11 +1707,20 @@ impl GitSignatureProbe {
             .limit
             .clone()
             .unwrap_or_else(|| Arc::clone(git_probe_limit()));
-        let _permit = match tokio::time::timeout_at(deadline, limit.acquire_owned()).await {
+        // Waiting for a slot is bounded SEPARATELY from doing the work. One
+        // combined budget meant a probe could spend it all in line and then
+        // report the same failure a hung `git` reports — so how busy the machine
+        // was decided what the caller believed about the worktree. See
+        // `GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT`.
+        let admission = self.admission_timeout;
+        let _permit = match tokio::time::timeout(admission, limit.acquire_owned()).await {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => return Err(anyhow!("readiness Git probe semaphore closed")),
             Err(_) => return Err(anyhow!("readiness Git probe deadline elapsed while queued")),
         };
+        // The execution budget starts HERE, with a slot in hand, so it measures
+        // only how long this worktree's Git work takes.
+        let deadline = tokio::time::Instant::now() + self.timeout;
         // One inherited marker spans status/branch/HEAD. A configured
         // fsmonitor hook can daemonize and let Git's direct process exit, so
         // PGID/PPID cleanup alone is not sufficient for signature probes.
@@ -1760,29 +1769,6 @@ impl GitSignatureProbe {
             head_sha,
             dirty: !porcelain.stdout.is_empty(),
         })
-    }
-}
-
-#[cfg(test)]
-impl GitSignatureProbe {
-    /// `readiness()` with a PRIVATE concurrency limit, for tests that drive the
-    /// real `git`.
-    ///
-    /// `sample`'s timeout is one total budget that INCLUDES time queued on the
-    /// process-global probe semaphore. In a parallel test binary that semaphore
-    /// is shared by every test, so an unrelated test's queue can consume this
-    /// one's whole budget; the sample then fails, `.ok()` turns it into `None`,
-    /// and `CheckFlight` reads "signature changed" from what is really
-    /// "signature unknown" — discarding the report and yielding an empty
-    /// `repo_checks`. That is a load-dependent failure of the harness, not of
-    /// the code under test, and it is what made these tests flaky on CI while
-    /// passing under `--test-threads=1`.
-    fn isolated_readiness() -> Self {
-        Self {
-            program: PathBuf::from("git"),
-            timeout: GIT_SIGNATURE_PROBE_TIMEOUT,
-            limit: Some(Arc::new(Semaphore::new(1))),
-        }
     }
 }
 
@@ -3821,6 +3807,54 @@ mod tests {
         Arc,
     };
 
+    /// Time spent QUEUED must not come out of the Git budget.
+    ///
+    /// This is the flake that made a different `readiness` test fail on macOS CI
+    /// each run while `--test-threads=1` always passed: one combined budget let
+    /// an unrelated test's queue consume this probe's whole deadline, the sample
+    /// failed, `.ok()` turned it into `None`, and `CheckFlight` read "signature
+    /// changed" from what was really "signature unknown". The probe here is
+    /// given a slot-less semaphore held just past its own execution budget, so
+    /// it MUST have waited longer than that budget by the time it runs — and it
+    /// still has to produce a signature.
+    #[tokio::test]
+    async fn queue_time_does_not_consume_the_probe_execution_budget() {
+        let root = tempfile::tempdir().expect("tempdir");
+        crate::git::init_repo(root.path()).expect("init repo");
+
+        let limit = Arc::new(Semaphore::new(1));
+        let execution = Duration::from_millis(150);
+        let held = Arc::clone(&limit)
+            .acquire_owned()
+            .await
+            .expect("hold the only slot");
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(execution * 3).await;
+            drop(held);
+        });
+
+        let probe = GitSignatureProbe {
+            program: PathBuf::from("git"),
+            timeout: execution,
+            admission_timeout: Duration::from_secs(30),
+            limit: Some(limit),
+        };
+        let started = std::time::Instant::now();
+        let signature = probe.sample(root.path()).await;
+        let waited = started.elapsed();
+        releaser.await.expect("releaser");
+
+        assert!(
+            waited > execution,
+            "the probe must have queued longer than its own execution budget, waited {waited:?}"
+        );
+        assert!(
+            signature.is_ok(),
+            "a probe that queued past its execution budget must still sample: {:?}",
+            signature.err()
+        );
+    }
+
     struct ReaderTaskDropMarker {
         dropped: Arc<AtomicUsize>,
     }
@@ -3996,7 +4030,7 @@ mod tests {
         let error = verification_targets_for_direction(
             &db,
             direction.id,
-            &GitSignatureProbe::isolated_readiness(),
+            &GitSignatureProbe::readiness(),
             VerificationTargetPurpose::ReadinessCollection,
         )
         .await
@@ -4047,7 +4081,7 @@ mod tests {
             let error = verification_targets_for_direction(
                 &db,
                 direction.id,
-                &GitSignatureProbe::isolated_readiness(),
+                &GitSignatureProbe::readiness(),
                 VerificationTargetPurpose::ReadinessCollection,
             )
             .await
@@ -4144,7 +4178,7 @@ mod tests {
             "an idle worker does not occupy the verification target"
         );
 
-        let probe = GitSignatureProbe::isolated_readiness();
+        let probe = GitSignatureProbe::readiness();
         for active_status in ["starting", "running", "stopped"] {
             repo::set_session_status(&db, worker.id, active_status)
                 .await
@@ -4378,7 +4412,7 @@ mod tests {
             &open_asks,
             open_pr_snapshot_freshness(1_000, 60),
             CheckExecution::RunAllowed,
-            &GitSignatureProbe::isolated_readiness(),
+            &GitSignatureProbe::readiness(),
         )
         .await
         .expect("worker failure must preempt lane collection");
@@ -4510,7 +4544,7 @@ mod tests {
     }
 
     async fn sampled_check_target(path: &Path, stored_path: String) -> CheckTarget {
-        let signature = GitSignatureProbe::isolated_readiness()
+        let signature = GitSignatureProbe::readiness()
             .sample(path)
             .await
             .expect("sample test worktree signature");
@@ -5604,7 +5638,7 @@ mod tests {
         let stored_path = root.path().display().to_string();
         let pre_targets = vec![sampled_check_target(root.path(), stored_path).await];
         let changed_path = root.path().join("README.md");
-        let probe = GitSignatureProbe::isolated_readiness();
+        let probe = GitSignatureProbe::readiness();
         let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
 
         let evidence = checks_for_targets_with_runner_and_post_targets(
@@ -5650,7 +5684,7 @@ mod tests {
         let pre_head = pre_targets[0].head_sha.clone();
         let pre_branch = pre_targets[0].branch.clone();
         let switched_path = root.path().to_path_buf();
-        let probe = GitSignatureProbe::isolated_readiness();
+        let probe = GitSignatureProbe::readiness();
         let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
 
         let evidence = checks_for_targets_with_runner_and_post_targets(
@@ -5667,7 +5701,7 @@ mod tests {
         .await
         .expect("same-HEAD branch-switch result");
 
-        let after = GitSignatureProbe::isolated_readiness()
+        let after = GitSignatureProbe::readiness()
             .sample(root.path())
             .await
             .expect("sample switched branch");
@@ -5864,6 +5898,7 @@ mod tests {
         let git_probe = GitSignatureProbe {
             program: git_stub,
             timeout: Duration::from_secs(1),
+            admission_timeout: GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT,
             limit: Some(Arc::new(Semaphore::new(1))),
         };
 
@@ -6184,6 +6219,7 @@ mod tests {
         let git_probe = GitSignatureProbe {
             program: git_stub,
             timeout: Duration::from_secs(1),
+            admission_timeout: GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT,
             limit: Some(Arc::new(Semaphore::new(1))),
         };
         // The app prewarms this cached PATH at startup. Do the same before the
@@ -6330,6 +6366,7 @@ mod tests {
         let probe = GitSignatureProbe {
             program: git_stub,
             timeout: Duration::from_secs(2),
+            admission_timeout: GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT,
             limit: Some(Arc::new(Semaphore::new(1))),
         };
         let error = probe

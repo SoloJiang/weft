@@ -36,6 +36,14 @@ pub enum LaneAuthorityState {
     /// change can re-adjudicate completed work, and acting on that would start
     /// a second worker on a finished task.
     Finished,
+    /// Switched OFF by a human (`inactive` / `cancelled`, the statuses
+    /// `readiness::direction_is_active` excludes).
+    ///
+    /// Deliberately NOT folded into `Finished`, even though both are terminal
+    /// and neither is actionable: `Finished` satisfies a consumer's
+    /// prerequisite and this does not. A lane that was switched off produced
+    /// nothing, so anything waiting on it is blocked, not released.
+    Deactivated,
     /// The planner owned this lane and the current proposal no longer names it.
     /// Not the user's reviewed scope any more, so nothing may act on it.
     /// Standalone lanes (`create_direction`, never in any proposal) are never
@@ -79,6 +87,7 @@ impl LaneAuthorityState {
         match self {
             Self::NotApplicable => "not_applicable",
             Self::Finished => "finished",
+            Self::Deactivated => "deactivated",
             Self::OutOfScope => "out_of_scope",
             Self::Denied(_) => "denied",
             Self::AwaitingGate(_) => "awaiting_gate",
@@ -90,14 +99,19 @@ impl LaneAuthorityState {
     }
 
     /// The verdict behind this state, when there is one. `Finished`,
-    /// `OutOfScope`, `BlockedUpstream`, `Running` and `NotApplicable` are
-    /// lifecycle or graph facts rather than judgments.
+    /// `Deactivated`, `OutOfScope`, `BlockedUpstream`, `Running` and
+    /// `NotApplicable` are lifecycle or graph facts rather than judgments.
     pub fn verdict(&self) -> Option<&LaneVerdict> {
         match self {
             Self::Denied(v) | Self::AwaitingGate(v) | Self::NeedsMaterialize(v) | Self::ReadyToStart(v) => {
                 Some(v)
             }
-            Self::NotApplicable | Self::Finished | Self::OutOfScope | Self::BlockedUpstream { .. } | Self::Running => None,
+            Self::NotApplicable
+            | Self::Finished
+            | Self::Deactivated
+            | Self::OutOfScope
+            | Self::BlockedUpstream { .. }
+            | Self::Running => None,
         }
     }
 }
@@ -114,6 +128,12 @@ async fn local_state(db: &Db, direction_id: i32) -> Result<LaneAuthorityState> {
     };
     if dir.status == "done" {
         return Ok(LaneAuthorityState::Finished);
+    }
+    // Switched off by a human. Checked before adjudication because a
+    // deactivated lane must not be offered a recovery card or admit a worker
+    // however permissive the policy now is.
+    if !crate::readiness::direction_is_active(&dir) {
+        return Ok(LaneAuthorityState::Deactivated);
     }
     if !lane_is_in_current_scope(db, dir.thread_id, direction_id).await? {
         return Ok(LaneAuthorityState::OutOfScope);
@@ -252,6 +272,7 @@ mod tests {
         vec![
             LaneAuthorityState::NotApplicable,
             LaneAuthorityState::Finished,
+            LaneAuthorityState::Deactivated,
             LaneAuthorityState::OutOfScope,
             LaneAuthorityState::Denied(verdict(LaneDecision::Denied)),
             LaneAuthorityState::AwaitingGate(verdict(LaneDecision::NeedsGate)),
