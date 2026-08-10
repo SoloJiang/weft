@@ -135,7 +135,7 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
     ? ""
     : (directionsByThread[threadId] ?? []).map((d) => d.id).join(",");
   const proposalSignature = proposal ? `${proposal.status}:${proposal.created_at}` : "";
-  // Which of this thread's lanes have a live session RIGHT NOW.
+  // Which of this thread's lanes are occupied by a LIVE worker right now.
   //
   // A confirm reloads directions and clears the proposal BEFORE it starts the
   // returned workers, so this effect runs while every materialized lane is
@@ -144,10 +144,21 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
   // other two signals changes: the lane ids are identical and the proposal is
   // already cleared. Without this the recovery cards stayed on screen
   // indefinitely while the workers were happily running.
+  //
+  // Liveness, not mere presence: an exited session stays in `sessions`, so
+  // testing for an entry made this signature blind to the running → exited
+  // transition — the exact moment the backend moves a materialized non-review
+  // lane back to `ReadyToStart` and a recovery card becomes due. The card then
+  // waited on some unrelated navigation or plan change to appear. This is the
+  // same `status !== "exited"` liveness the rest of the app uses, so the two
+  // sides agree on when a lane is occupied.
   const liveSessionSignature = threadId == null
     ? ""
     : (directionsByThread[threadId] ?? [])
-        .filter((d) => sessions[d.id] !== undefined)
+        .filter((d) => {
+          const session = sessions[d.id];
+          return session !== undefined && session.status !== "exited";
+        })
         .map((d) => d.id)
         .join(",");
 
