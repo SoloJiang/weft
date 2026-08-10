@@ -2502,6 +2502,18 @@ pub async fn create_authority_policy(
         .await;
         match attempt {
             Ok(inserted) => {
+                // The pre-insert fence alone leaves a window: a deletion can set
+                // its marker after that check and finish its cascade before this
+                // insert lands, so the row would outlive the workspace. Re-check
+                // and remove what we just wrote if it did.
+                if scope == "workspace" {
+                    if let Err(error) = ensure_workspace_accepts_writes(db, scope_id).await {
+                        let _ = authority_policy::Entity::delete_by_id(inserted.last_insert_id)
+                            .exec(&db.0)
+                            .await;
+                        return Err(error);
+                    }
+                }
                 return authority_policy::Entity::find_by_id(inserted.last_insert_id)
                     .one(&db.0)
                     .await?

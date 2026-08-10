@@ -3756,9 +3756,26 @@ pub async fn collect_with_check_execution(
                 if referenced_direction_ids.contains(&direction.id) {
                     continue;
                 }
+                // A lane no proposal references is usually a standalone task
+                // from `create_direction` — and the policy can gate one of
+                // those (a protected default branch, say), persisting the
+                // direction with `needs_gate` evidence. Assigning
+                // AllowedByPolicy unconditionally reported such a blocked task
+                // as merely in progress instead of NeedsYou, hiding the very
+                // thing the Gate exists to surface. Apply what was actually
+                // recorded; a lane with no verdict keeps the permissive
+                // reading, which is what a pre-policy lane must have.
+                let recorded = recorded_lane_decisions.get(&direction.id).map(String::as_str);
+                let stale = superseded_lanes.contains(&direction.id);
+                let policy = match (decisions_unreadable || stale, recorded) {
+                    (true, _) => PolicyDecision::NeedsGate,
+                    (false, Some("needs_gate")) => PolicyDecision::NeedsGate,
+                    (false, Some("denied")) => PolicyDecision::Denied,
+                    (false, _) => PolicyDecision::AllowedByPolicy,
+                };
                 pending.push(PendingLaneCollection::Direction {
                     direction: direction.clone(),
-                    policy: PolicyDecision::AllowedByPolicy,
+                    policy,
                 });
             }
         }

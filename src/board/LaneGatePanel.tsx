@@ -62,7 +62,7 @@ type GateFetchState = "idle" | "loading" | "resolved" | "rejected";
  */
 export function LaneGatePanel({ threadId }: { threadId: number | null }) {
   const { t } = useTranslation();
-  const { dispatchDirection, directionsByThread, proposal } = useStore();
+  const { dispatchDirection, directionsByThread, proposal, loadThreadChildren } = useStore();
   // Rows are stored WITH the thread they were fetched for. Keeping a bare array
   // left the previous thread's rows on screen for the whole duration of the new
   // thread's fetch — actionable approve/deny buttons that resolve the OLD lane,
@@ -159,6 +159,14 @@ export function LaneGatePanel({ threadId }: { threadId: number | null }) {
       // later appears, so that stale card would sit there indefinitely.
       // Failures inside dispatchDirection are already handled there; settling
       // is all this needs.
+      // The approval materialized the lane, but nothing merged the returned
+      // worktrees into store state — so the task card kept `writes = []`, its
+      // name and Open Session action disabled and its branch hidden, while a
+      // worker ran happily in a checkout the UI did not know about. Reload the
+      // thread's children before dispatching so the card is whole.
+      if (resolution.worktrees.length > 0) {
+        await loadThreadChildren(gate.thread_id);
+      }
       await Promise.allSettled(
         resolution.dispatch_direction_ids.map((id) => dispatchDirection(id)),
       );

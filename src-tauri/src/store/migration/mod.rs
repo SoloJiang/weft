@@ -2712,15 +2712,23 @@ impl MigrationTrait for M0056AuthorityPolicy {
         // migration here tolerates one) must not duplicate the snapshots. An
         // already-populated history means the backfill has happened or real
         // revisions exist; either way there is nothing to reconstruct.
-        let history_empty = plan_revision::Entity::find()
-            .one(manager.get_connection())
-            .await?
-            .is_none();
-        let plans = match manager.has_table("plan").await? && history_empty {
+        // Per PLAN, not per database. A database-wide "history is empty" guard
+        // makes an interrupted run skip every remaining plan on retry, dropping
+        // their provenance permanently.
+        let plans = match manager.has_table("plan").await? {
             true => plan::Entity::find().all(manager.get_connection()).await?,
             false => Vec::new(),
         };
         for row in plans {
+            use sea_orm::{ColumnTrait, QueryFilter};
+            let already = plan_revision::Entity::find()
+                .filter(plan_revision::Column::ThreadId.eq(row.thread_id))
+                .one(manager.get_connection())
+                .await?
+                .is_some();
+            if already {
+                continue;
+            }
             plan_revision::Entity::insert(plan_revision::ActiveModel {
                 id: sea_orm::NotSet,
                 thread_id: sea_orm::Set(row.thread_id),

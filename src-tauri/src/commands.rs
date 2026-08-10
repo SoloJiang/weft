@@ -3269,12 +3269,24 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
     // reviewed scope no longer contains. Empty means the plan records no ids
     // yet (nothing confirmed), in which case there is nothing to filter
     // against and every lane stays eligible.
-    let current_lanes: Option<Vec<serde_json::Value>> = crate::store::repo::get_plan(&db, thread_id)
-        .await
-        .map_err(e)?
-        .and_then(|plan| serde_json::from_str::<serde_json::Value>(&plan.proposal).ok())
-        .and_then(|value| value.get("directions").cloned())
-        .and_then(|dirs| dirs.as_array().cloned());
+    // A plan that exists but will not parse is NOT "no plan": reading it that
+    // way switches scope filtering off, which is the permissive direction — an
+    // obsolete planner-owned Gate would become displayable and approvable. Fail
+    // the command instead; the card is unreachable either way, and an error is
+    // recoverable where a silently widened scope is not.
+    let stored_plan = crate::store::repo::get_plan(&db, thread_id).await.map_err(e)?;
+    let current_lanes: Option<Vec<serde_json::Value>> = match stored_plan {
+        None => None,
+        Some(plan) => {
+            let parsed: serde_json::Value = serde_json::from_str(&plan.proposal)
+                .map_err(|error| format!("stored proposal is unreadable: {error}"))?;
+            let dirs = parsed
+                .get("directions")
+                .and_then(|dirs| dirs.as_array())
+                .ok_or_else(|| "stored proposal has no directions array".to_string())?;
+            Some(dirs.clone())
+        }
+    };
     let in_scope: std::collections::HashSet<i32> = current_lanes
         .iter()
         .flatten()
@@ -3573,15 +3585,18 @@ pub async fn resolve_lane_gate(
 /// unchanged, so nothing else would stop the approval from materializing and
 /// dispatching work the user removed.
 async fn lane_is_in_current_scope(db: &Db, thread_id: i32, direction_id: i32) -> anyhow::Result<bool> {
-    let current_lanes: Option<Vec<serde_json::Value>> = crate::store::repo::get_plan(db, thread_id)
-        .await?
-        .and_then(|plan| serde_json::from_str::<serde_json::Value>(&plan.proposal).ok())
-        .and_then(|value| value.get("directions").cloned())
-        .and_then(|dirs| dirs.as_array().cloned());
-    // No plan at all: nothing to be out of scope against.
-    let Some(current_lanes) = current_lanes else {
+    // Same fail-closed reading as `list_lane_gates`: an unparseable stored plan
+    // must not be treated as "no plan", which would let an obsolete lane resolve.
+    let Some(plan) = crate::store::repo::get_plan(db, thread_id).await? else {
         return Ok(true);
     };
+    let parsed: serde_json::Value = serde_json::from_str(&plan.proposal)
+        .map_err(|error| anyhow::anyhow!("stored proposal is unreadable: {error}"))?;
+    let current_lanes: Vec<serde_json::Value> = parsed
+        .get("directions")
+        .and_then(|dirs| dirs.as_array())
+        .ok_or_else(|| anyhow::anyhow!("stored proposal has no directions array"))?
+        .clone();
     let in_scope: std::collections::HashSet<i32> = current_lanes
         .iter()
         .filter_map(|d| d.get("direction_id").and_then(|v| v.as_i64()))
@@ -3658,24 +3673,34 @@ async fn lane_is_runnable(db: &Db, direction_id: i32) -> anyhow::Result<bool> {
     if !allowed {
         return Ok(false);
     }
-    // Each producer must be BOTH materialized and currently allowed. A checkout
-    // alone is not enough: one policy tighten can gate several producers at
-    // once, and they keep their valid worktrees while paused — approving one of
-    // them would otherwise release a shared dependent while the other's Gate is
-    // still pending and its own worker still stopped.
-    for upstream in crate::store::repo::upstream_direction_ids(db, direction_id).await? {
-        if !crate::materialize::lane_has_valid_checkout(db, upstream).await? {
-            return Ok(false);
-        }
-        let upstream_verdict = crate::materialize::readjudicate_lane(db, upstream).await?;
-        let upstream_allowed = match upstream_verdict {
-            None => true,
-            Some(verdict) => {
-                matches!(verdict.decision, crate::authority::LaneDecision::AllowedByPolicy)
+    // The WHOLE prerequisite chain, not just the direct producers. Confirm
+    // materializes a gated lane's dependents and withholds only their dispatch,
+    // so in C → B → A with A gated, B has a valid, policy-allowed checkout and
+    // was never started — checking one hop would call C runnable and start it
+    // behind a producer that never ran. Each ancestor must be materialized AND
+    // currently allowed. `seen` also makes a cyclic edge set terminate rather
+    // than recurse forever.
+    let mut seen: std::collections::HashSet<i32> = [direction_id].into_iter().collect();
+    let mut frontier = vec![direction_id];
+    while let Some(current) = frontier.pop() {
+        for upstream in crate::store::repo::upstream_direction_ids(db, current).await? {
+            if !seen.insert(upstream) {
+                continue;
             }
-        };
-        if !upstream_allowed {
-            return Ok(false);
+            if !crate::materialize::lane_has_valid_checkout(db, upstream).await? {
+                return Ok(false);
+            }
+            let upstream_verdict = crate::materialize::readjudicate_lane(db, upstream).await?;
+            let upstream_allowed = match upstream_verdict {
+                None => true,
+                Some(verdict) => {
+                    matches!(verdict.decision, crate::authority::LaneDecision::AllowedByPolicy)
+                }
+            };
+            if !upstream_allowed {
+                return Ok(false);
+            }
+            frontier.push(upstream);
         }
     }
     Ok(true)
