@@ -38,6 +38,7 @@ import { EvidencePanel } from "../components/EvidencePanel";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { ReadinessChip } from "../components/ReadinessChip";
 import { ScopeReview } from "./ScopeReview";
+import { LaneGatePanel } from "./LaneGatePanel";
 import { DeleteWorktreeDialog, RenameDialog } from "../nav/dialogs";
 import { LeadTab } from "../session/LeadTab";
 import { cn } from "../lib/cn";
@@ -324,6 +325,16 @@ export function ThreadBoard() {
           className="max-w-[min(60%,28rem)]"
         />
       </header>
+      {/* Issue #172: Lanes a policy sent to Gate instead of auto-materializing.
+          Mounted on the persistent board, NOT inside the scope-review dialog:
+          a Gate is raised by materialize, which runs during confirm, and that
+          dialog unmounts the moment confirm succeeds — so a card rendered
+          there could never be seen by the person who has to act on it. A
+          policy-allowed lane never appears here; the panel renders nothing
+          when there is nothing pending. */}
+      <div className="shrink-0 px-5 empty:hidden">
+        <LaneGatePanel threadId={activeThreadId} />
+      </div>
       <div className="flex min-h-0 flex-1 flex-col">{renderTabBody()}</div>
 
       {/* Scope review, in place: a dialog over the chat rather than a tab swap.

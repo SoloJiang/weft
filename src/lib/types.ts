@@ -394,6 +394,10 @@ export interface AuthorityPolicyRevision {
   source: string;
   created_at: string;
   revoked_at: string;
+  /** The stored rules JSON did not parse, so `rules` above is the empty default
+   *  and NOT what the user configured — the backend is gating every Lane in
+   *  this scope. Never present an empty rule set as if it were theirs. */
+  rules_unreadable: boolean;
 }
 
 /** A Lane currently blocked on a Gate — mirrors Rust `commands::LaneGateDto`. */
