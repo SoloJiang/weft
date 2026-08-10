@@ -3080,9 +3080,21 @@ pub async fn set_authority_policy(
     // auto-allow to deny would auto-approve the very action it was written to
     // forbid. Suspended, the bridge defers to a human card for that window.
     asks.suspend_authority_snapshot(workspace_id);
-    let row = crate::store::repo::create_authority_policy(&db, "workspace", workspace_id, &rules_json, "user")
-        .await
-        .map_err(e)?;
+    let created =
+        crate::store::repo::create_authority_policy(&db, "workspace", workspace_id, &rules_json, "user")
+            .await;
+    // A FAILED mutation must not leave the cache suspended: the database still
+    // holds the previous policy and materialization keeps enforcing it, while
+    // CLI asks would stop applying its `deny_actions` and fall through to a
+    // human card until a restart. Reinstall what is actually active before
+    // surfacing the error.
+    let row = match created {
+        Ok(row) => row,
+        Err(error) => {
+            refresh_authority_bridge_snapshot(&db, &asks, workspace_id).await;
+            return Err(e(error));
+        }
+    };
     refresh_authority_bridge_snapshot(&db, &asks, workspace_id).await;
     Ok(authority_policy_dto(row))
 }
@@ -3103,9 +3115,13 @@ pub async fn revoke_authority_policy(
     let _write_guard = workspace_lock.lock().await;
     // See `set_authority_policy` — the same commit-to-refresh window applies.
     asks.suspend_authority_snapshot(workspace_id);
-    crate::store::repo::revoke_authority_policy(&db, "workspace", workspace_id)
-        .await
-        .map_err(e)?;
+    let revoked = crate::store::repo::revoke_authority_policy(&db, "workspace", workspace_id).await;
+    // See `set_authority_policy` — a failed revoke leaves the old policy active
+    // in the database, so the cache has to come back rather than stay suspended.
+    if let Err(error) = revoked {
+        refresh_authority_bridge_snapshot(&db, &asks, workspace_id).await;
+        return Err(e(error));
+    }
     refresh_authority_bridge_snapshot(&db, &asks, workspace_id).await;
     Ok(())
 }
@@ -3370,7 +3386,13 @@ pub async fn list_lane_gates(db: State<'_, Db>, thread_id: i32) -> R<Vec<LaneGat
             .map_err(e)?
             .iter()
             .any(|session| matches!(session.status.as_str(), "running" | "idle" | "starting"));
-        let stranded = verdict == "allowed_by_policy" && (!checkout_ok || never_started);
+        // A COMPLETED lane is not stranded, whatever its session looks like now:
+        // its worker exits by design, so "allowed, nothing running" describes
+        // every finished task. Offering it a resume card would invite starting
+        // a second worker in a worktree whose work is already done.
+        let finished = dir.status == "done";
+        let stranded =
+            !finished && verdict == "allowed_by_policy" && (!checkout_ok || never_started);
         if verdict != "needs_gate" && !stranded {
             continue;
         }

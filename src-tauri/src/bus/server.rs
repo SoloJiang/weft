@@ -215,7 +215,19 @@ async fn handle_ask(
         // hook. Only Deny is decisive here — a policy ALLOW must still fall
         // through to the allowlist and the human flow below, so this cannot
         // widen anything.
-        if matches!(asks.authority_bridge_decision(thread, &action_key), Some(Decision::Deny)) {
+        //
+        // Standing grants (Dangerous mode, Full access, an exact Always grant)
+        // are consulted FIRST, so this check sits between them and the builtin
+        // allowlist. That ordering is deliberate: whether a policy deny should
+        // outrank a human's existing grant is an open product question (a test
+        // still codifies grants-win), and answering it only on this route would
+        // make one workspace policy behave differently per engine — the exact
+        // incongruence this check was added to remove. When that question is
+        // settled, it belongs in `auto_decision` where all three routes meet,
+        // not here.
+        if asks.auto_decision_exact(thread, &dir, &action_key).is_none()
+            && matches!(asks.authority_bridge_decision(thread, &action_key), Some(Decision::Deny))
+        {
             return hook_decision("deny", "Denied by the workspace policy");
         }
 
