@@ -2466,6 +2466,14 @@ pub async fn create_authority_policy(
         .order_by_desc(authority_policy::Column::Id)
         .one(&db.0)
         .await?;
+    // `authority_policy` has no workspace foreign key, and the deletion cascade
+    // is not coordinated by `workspace_write_lock`, so a call racing (or
+    // arriving just after) a workspace deletion would otherwise leave that
+    // workspace's policy JSON orphaned in the database and in backups. Only a
+    // workspace scope can be fenced this way; other scopes fall through.
+    if scope == "workspace" {
+        ensure_workspace_accepts_writes(db, scope_id).await?;
+    }
     let mut next_revision = previous
         .and_then(|p| p.revision.parse::<i64>().ok())
         .unwrap_or(0)
@@ -9112,7 +9120,18 @@ pub async fn append_evidence(db: &Db, write: EvidenceWrite<'_>) -> Result<eviden
 /// once, and asking per lane would be an N+1 on a path that already runs on a
 /// poll. Rows arrive newest-first, so the FIRST row seen for a direction is its
 /// current verdict and later (older) rows are skipped.
-pub async fn latest_lane_decisions(db: &Db, thread_id: i32) -> Result<HashMap<i32, String>> {
+/// A lane's newest decision was computed under a SUPERSEDED policy revision, so
+/// it was dropped from the map. Distinct from a lane that was never adjudicated
+/// at all: the first is a lane whose verdict the current policy has invalidated
+/// and which nothing has re-judged yet; the second predates any policy and must
+/// keep reading from the proposal shape, or every already-materialized lane in
+/// an upgraded install would suddenly report as gated.
+pub type SupersededLanes = std::collections::HashSet<i32>;
+
+pub async fn latest_lane_decisions(
+    db: &Db,
+    thread_id: i32,
+) -> Result<(HashMap<i32, String>, SupersededLanes)> {
     // The revision these verdicts have to have been computed under. A policy
     // change writes no replacement evidence for lanes nobody re-materializes,
     // so without this an old `allowed_by_policy` keeps readiness green under a
@@ -9149,6 +9168,7 @@ pub async fn latest_lane_decisions(db: &Db, thread_id: i32) -> Result<HashMap<i3
     // Lanes whose newest decision was rejected above. Tracked separately from
     // `out` so an older row cannot answer for them.
     let mut seen_without_verdict: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    let mut superseded: SupersededLanes = SupersededLanes::new();
     for row in rows {
         if row.direction_id == 0
             || out.contains_key(&row.direction_id)
@@ -9166,6 +9186,7 @@ pub async fn latest_lane_decisions(db: &Db, thread_id: i32) -> Result<HashMap<i3
                 // policy was revoked — and resurrect a stale allow or Gate that
                 // nothing has re-adjudicated.
                 seen_without_verdict.insert(row.direction_id);
+                superseded.insert(row.direction_id);
                 continue;
             }
         }
@@ -9177,7 +9198,7 @@ pub async fn latest_lane_decisions(db: &Db, thread_id: i32) -> Result<HashMap<i3
             out.insert(row.direction_id, decision.to_string());
         }
     }
-    Ok(out)
+    Ok((out, superseded))
 }
 
 /// The newest `decision` evidence row for one lane, or `None` if it never had
@@ -9306,16 +9327,25 @@ mod tests {
     #[tokio::test]
     async fn concurrent_policy_writes_get_distinct_revisions() {
         let db = mem().await;
-        let a = create_authority_policy(&db, "workspace", 1, "{}", "test").await.unwrap();
-        let b = create_authority_policy(&db, "workspace", 1, "{}", "test").await.unwrap();
-        let c = create_authority_policy(&db, "workspace", 1, "{}", "test").await.unwrap();
+        // Real workspaces: policy creation is fenced against a deleted or
+        // non-existent scope, so ids alone are not enough any more.
+        let ws = create_workspace(&db, "ws").await.unwrap();
+        let other_ws = create_workspace(&db, "other").await.unwrap();
+        let a = create_authority_policy(&db, "workspace", ws.id, "{}", "test").await.unwrap();
+        let b = create_authority_policy(&db, "workspace", ws.id, "{}", "test").await.unwrap();
+        let c = create_authority_policy(&db, "workspace", ws.id, "{}", "test").await.unwrap();
         assert_ne!(a.revision, b.revision);
         assert_ne!(b.revision, c.revision);
         assert_ne!(a.revision, c.revision);
 
         // A different scope_id keeps its own independent sequence.
-        let other = create_authority_policy(&db, "workspace", 2, "{}", "test").await.unwrap();
+        let other = create_authority_policy(&db, "workspace", other_ws.id, "{}", "test")
+            .await
+            .unwrap();
         assert_eq!(other.revision, a.revision);
+
+        // …and a scope that does not exist is refused rather than orphaned.
+        assert!(create_authority_policy(&db, "workspace", 9999, "{}", "test").await.is_err());
     }
 
 

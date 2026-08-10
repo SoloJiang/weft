@@ -3673,13 +3673,24 @@ pub async fn collect_with_check_execution(
             // recoverable direction.
             let recorded_lane_decisions = repo::latest_lane_decisions(db, thread_id).await;
             let decisions_unreadable = recorded_lane_decisions.is_err();
-            let recorded_lane_decisions = recorded_lane_decisions.unwrap_or_default();
+            let (recorded_lane_decisions, superseded_lanes) =
+                recorded_lane_decisions.unwrap_or_default();
             let mut materialized_policies = HashMap::new();
             for proposed_lane in &proposal_lanes {
                 if proposed_lane.direction_id == 0 {
                     continue;
                 }
-                let policy = match decisions_unreadable {
+                // A SUPERSEDED verdict is not the same as never having been
+                // judged. The revision filter drops the former, and falling
+                // back to the proposal shape then reads a confirmed lane as
+                // allowed — so tightening a policy onto its branch would leave
+                // the issue ReviewReady until some other surface happened to
+                // re-adjudicate. Gate it now instead. A lane with NO decision
+                // at all predates any policy and must keep the shape reading,
+                // or every already-materialized lane in an upgraded install
+                // would suddenly report as gated.
+                let stale = superseded_lanes.contains(&proposed_lane.direction_id);
+                let policy = match decisions_unreadable || stale {
                     true => PolicyDecision::NeedsGate,
                     false => effective_lane_policy(phase, proposed_lane, &recorded_lane_decisions),
                 };
