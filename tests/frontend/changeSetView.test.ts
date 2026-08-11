@@ -1,0 +1,192 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import type { ChangeSetLane, IssueChangeSet, LaneCheckout } from "../../src/lib/types.ts";
+import {
+  changeSetPanelState,
+  hasEvidence,
+  laneCheckoutView,
+  laneWaves,
+} from "../../src/board/changeSetView.ts";
+
+function lane(overrides: Partial<ChangeSetLane> & { direction_id: number }): ChangeSetLane {
+  return {
+    name: `lane-${overrides.direction_id}`,
+    repo_id: 1,
+    repo_name: "primary",
+    reason: "",
+    checkout: { declared_base: "main", declared_branch: "weft/lane", observed: null },
+    depends_on: [],
+    direction_status: "working",
+    reconciliation: "matched",
+    checks: "not_applicable",
+    upstream: "satisfied",
+    pull_requests: [],
+    evidence: { fresh: 0, stale: 0, unknown: 0, newest_observed_at: null },
+    readiness: "unknown",
+    reasons: [],
+    ...overrides,
+  };
+}
+
+function checkout(branch: string | null, repo = "primary"): LaneCheckout {
+  return {
+    repo_name: repo,
+    path: `/tmp/${repo}`,
+    observed: branch === null ? null : { branch, head_sha: "abcdef1234", dirty: false },
+  };
+}
+
+function changeSet(lanes: ChangeSetLane[]): IssueChangeSet {
+  return { readiness: "unknown", reasons: [], active_lane_count: lanes.length, lanes };
+}
+
+test("waves order lanes by their dependency edges, independents first", () => {
+  const waves = laneWaves([
+    lane({ direction_id: 3, depends_on: [2] }),
+    lane({ direction_id: 1 }),
+    lane({ direction_id: 2, depends_on: [1] }),
+  ]);
+  assert.deepEqual(
+    waves.map((wave) => wave.lanes.map((l) => l.direction_id)),
+    [[1], [2], [3]],
+  );
+});
+
+test("lanes that wait on nothing share one wave and keep their incoming order", () => {
+  const waves = laneWaves([
+    lane({ direction_id: 5 }),
+    lane({ direction_id: 4 }),
+    lane({ direction_id: 9, depends_on: [4, 5] }),
+  ]);
+  assert.deepEqual(
+    waves.map((wave) => wave.lanes.map((l) => l.direction_id)),
+    [[5, 4], [9]],
+  );
+});
+
+test("an edge pointing outside the change set does not hide its consumer", () => {
+  // Lane 7's upstream was excluded from the verdict (inactive or denied).
+  // Treating that edge as unsatisfiable would drop lane 7 from the panel.
+  const waves = laneWaves([lane({ direction_id: 7, depends_on: [404] })]);
+  assert.deepEqual(
+    waves.map((wave) => wave.lanes.map((l) => l.direction_id)),
+    [[7]],
+  );
+});
+
+test("a dependency cycle is shown in one honest block rather than dropped", () => {
+  const waves = laneWaves([
+    lane({ direction_id: 1, depends_on: [2] }),
+    lane({ direction_id: 2, depends_on: [1] }),
+    lane({ direction_id: 3 }),
+  ]);
+  assert.deepEqual(
+    waves.map((wave) => wave.lanes.map((l) => l.direction_id)),
+    [[3], [1, 2]],
+  );
+});
+
+test("every lane appears exactly once across the waves", () => {
+  const lanes = [
+    lane({ direction_id: 1 }),
+    lane({ direction_id: 2, depends_on: [1] }),
+    lane({ direction_id: 3, depends_on: [1, 2] }),
+    lane({ direction_id: 4, depends_on: [9] }),
+    lane({ direction_id: 5, depends_on: [6] }),
+    lane({ direction_id: 6, depends_on: [5] }),
+  ];
+  const seen = laneWaves(lanes).flatMap((wave) => wave.lanes.map((l) => l.direction_id));
+  assert.deepEqual([...seen].sort((a, b) => a - b), [1, 2, 3, 4, 5, 6]);
+  assert.equal(new Set(seen).size, seen.length, "no lane is emitted twice");
+});
+
+test("a self-edge cannot deadlock its own lane", () => {
+  const waves = laneWaves([lane({ direction_id: 8, depends_on: [8] })]);
+  assert.deepEqual(
+    waves.map((wave) => wave.lanes.map((l) => l.direction_id)),
+    [[8]],
+  );
+});
+
+test("not-probed and probed-but-empty stay distinct checkout states", () => {
+  assert.deepEqual(laneCheckoutView(lane({ direction_id: 1 })), { kind: "not_probed" });
+  assert.deepEqual(
+    laneCheckoutView(
+      lane({
+        direction_id: 1,
+        checkout: { declared_base: "main", declared_branch: "weft/lane", observed: [] },
+      }),
+    ),
+    { kind: "none_registered" },
+  );
+});
+
+test("the checkout state comes from the backend verdict, not a re-derived comparison", () => {
+  // Branches agree, but the backend said Unknown (one repo's probe failed).
+  // The panel must show Unknown rather than promoting it to matched.
+  const view = laneCheckoutView(
+    lane({
+      direction_id: 1,
+      reconciliation: "unknown",
+      checkout: {
+        declared_base: "main",
+        declared_branch: "weft/lane",
+        observed: [checkout("weft/lane"), checkout(null, "second")],
+      },
+    }),
+  );
+  assert.equal(view.kind, "unknown");
+  assert.equal(view.kind === "unknown" ? view.rows.length : 0, 2);
+});
+
+test("the declared-branch highlight marks the row that differs and never guesses on an unsampled one", () => {
+  const view = laneCheckoutView(
+    lane({
+      direction_id: 1,
+      reconciliation: "drifted",
+      checkout: {
+        declared_base: "main",
+        declared_branch: "weft/lane",
+        observed: [checkout("weft/lane"), checkout("weft/other", "second"), checkout(null, "third")],
+      },
+    }),
+  );
+  assert.equal(view.kind, "drifted");
+  const rows = view.kind === "drifted" ? view.rows : [];
+  assert.deepEqual(
+    rows.map((row) => row.matchesDeclared),
+    [true, false, null],
+  );
+});
+
+test("panel state is one discriminated value across the fetch lifecycle", () => {
+  assert.deepEqual(changeSetPanelState("loading", null), { kind: "loading" });
+  assert.deepEqual(changeSetPanelState("rejected", null), { kind: "error" });
+  assert.deepEqual(changeSetPanelState("resolved", null), { kind: "empty" });
+  assert.deepEqual(changeSetPanelState("resolved", changeSet([])), { kind: "empty" });
+
+  const ready = changeSetPanelState("resolved", changeSet([lane({ direction_id: 1 })]));
+  assert.equal(ready.kind, "ready");
+  assert.equal(ready.kind === "ready" ? ready.waves.length : 0, 1);
+});
+
+test("a resolved-but-stale payload never leaks through a later rejection", () => {
+  // The panel keeps its last payload while re-fetching; a rejected fetch must
+  // still read as an error rather than silently re-showing old facts.
+  assert.deepEqual(changeSetPanelState("rejected", changeSet([lane({ direction_id: 1 })])), {
+    kind: "error",
+  });
+});
+
+test("no evidence at all is distinct from evidence that is merely untrustworthy", () => {
+  assert.equal(hasEvidence(lane({ direction_id: 1 })), false);
+  assert.equal(
+    hasEvidence(
+      lane({
+        direction_id: 1,
+        evidence: { fresh: 0, stale: 0, unknown: 2, newest_observed_at: "1700000000" },
+      }),
+    ),
+    true,
+  );
+});

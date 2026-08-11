@@ -13,6 +13,7 @@ import type {
   GrantSnapshot,
   ImageAttachment,
   ImRoute,
+  IssueChangeSet,
   IssueReadinessDto,
   LeadMessage,
   LeadStateInfo,
@@ -150,6 +151,11 @@ export const api = {
     invoke<Direction[]>("list_directions", { threadId }),
   issueReadiness: (threadId: number) =>
     invoke<IssueReadinessDto>("issue_readiness", { threadId }),
+  // The whole issue's delivery overview (issue #175). A separate command from
+  // `issueReadiness` on purpose: that one is polled per thread by the board,
+  // and this one's extra store reads belong on the screen that asked for them.
+  issueChangeSet: (threadId: number) =>
+    invoke<IssueChangeSet>("issue_change_set", { threadId }),
   setTaskStatus: (directionId: number, status: string) =>
     invoke<void>("set_task_status", { directionId, status }),
   renameDirection: (directionId: number, name: string) =>

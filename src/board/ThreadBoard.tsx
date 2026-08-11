@@ -37,6 +37,7 @@ import { Tooltip } from "../components/ui/Tooltip";
 import { EvidencePanel } from "../components/EvidencePanel";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { ReadinessChip } from "../components/ReadinessChip";
+import { ChangeSetPanel } from "./ChangeSetPanel";
 import { ScopeReview } from "./ScopeReview";
 import { DeleteWorktreeDialog, RenameDialog } from "../nav/dialogs";
 import { LeadTab } from "../session/LeadTab";
@@ -96,6 +97,7 @@ export function ThreadBoard() {
     checksByDirection,
     worktreesByDirection,
     sessions,
+    viewDirection,
   } = useStore();
   const { t } = useTranslation();
   const thread = threads.find((th) => th.id === activeThreadId);
@@ -280,6 +282,15 @@ export function ThreadBoard() {
   // of these is showing, so confirming a split never yanks you off the chat.
   const renderTabBody = () => {
     if (threadTab === "lead") return <LeadTab />;
+    if (threadTab === "changeset") {
+      return (
+        <ChangeSetPanel
+          threadId={thread.id}
+          refreshKey={`${readinessKey}|poll:${readinessPollRevision}`}
+          onOpenLane={viewDirection}
+        />
+      );
+    }
     if (dirs.length === 0) return <EmptyDiscuss onTalk={() => setThreadTab("lead")} />;
     return (
       <div className="min-h-0 flex-1 overflow-auto">

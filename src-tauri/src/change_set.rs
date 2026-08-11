@@ -82,8 +82,12 @@ pub struct CheckoutFacts {
 pub struct ChangeSetLane {
     pub direction_id: i32,
     pub name: String,
-    /// Which repository this lane writes to, and why it was chosen. `reason` is
-    /// for explanation and audit — it has never gated anything.
+    /// Which repository this lane writes to, and why it was chosen. `repo_id`
+    /// is carried beside the name so the row can open the lane's Session
+    /// without a second lookup that could resolve to a different repo — two
+    /// repos may share a display name, and only the id is unique. `reason` is
+    /// for explanation and audit; it has never gated anything.
+    pub repo_id: i32,
     pub repo_name: String,
     pub reason: String,
     pub checkout: CheckoutFacts,
@@ -191,6 +195,7 @@ async fn project(
         lanes.push(ChangeSetLane {
             direction_id: fact.direction_id,
             name: fact.name.clone(),
+            repo_id: direction.map(|row| row.repo_id).unwrap_or_default(),
             repo_name,
             reason: direction.map(|row| row.reason.clone()).unwrap_or_default(),
             checkout: CheckoutFacts {
@@ -416,6 +421,7 @@ mod tests {
         assert_eq!(change_set.lanes.len(), 1);
         assert_eq!(change_set.lanes[0].readiness, verdict.lanes[0].readiness);
         assert_eq!(change_set.lanes[0].reasons, verdict.lanes[0].reasons);
+        assert_eq!(change_set.lanes[0].repo_id, repo_id);
         assert_eq!(change_set.lanes[0].repo_name, "primary-repo");
         assert_eq!(change_set.lanes[0].reason, "needs the API");
         assert_eq!(change_set.lanes[0].checkout.declared_base, "main");
