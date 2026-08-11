@@ -915,10 +915,30 @@ fn virtual_lane_facts(
 const CHECK_EVIDENCE_TTL: Duration = Duration::from_secs(10 * 60);
 const READINESS_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
 const CHECK_INFERENCE_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long the Git work of ONE signature probe may take, measured from the
+/// moment it actually holds a slot — see `GitSignatureProbe::sample`.
 const GIT_SIGNATURE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a probe may WAIT for one of the `MAX_CONCURRENT_GIT_PROBES` slots
+/// before giving up, kept separate from the execution budget above.
+///
+/// One combined budget is what made readiness assertions depend on machine
+/// load: queueing is not evidence about a worktree, but a sample that spent its
+/// budget in line returned the same error a hung `git` does, `.ok()` turned that
+/// into `None`, and `CheckFlight` read "signature changed" from what was really
+/// "signature unknown" — discarding a valid report and asserting on an empty
+/// `repo_checks`. Splitting them keeps the backlog bound (a probe still cannot
+/// queue forever, and the process fan-out is still capped) while guaranteeing
+/// that a probe which does get scheduled gets its full budget to finish.
+const GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
 const BOUNDED_PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_CONCURRENT_CHECK_RUNNERS: usize = 2;
 const MAX_CONCURRENT_CHECK_INFERENCES: usize = 2;
+/// Bounds concurrent Git probe children, so a large portfolio and a slow
+/// fsmonitor cannot build an unbounded backlog of overlapping readiness
+/// refreshes. Deliberately NOT relaxed under `cfg(test)`: the tests exercise the
+/// bound that ships. Queueing on it no longer costs a probe its execution
+/// budget (see `GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT`), so a saturated machine
+/// makes probes slower, not wrong.
 const MAX_CONCURRENT_GIT_PROBES: usize = 4;
 const MAX_CONCURRENT_MARKER_SWEEPS: usize = 2;
 const MARKER_SWEEP_TIMEOUT: Duration = Duration::from_millis(250);
@@ -1627,7 +1647,11 @@ async fn latest_worker_facts(db: &Db, direction_id: i32) -> Result<WorkerSession
 #[derive(Clone, Debug)]
 struct GitSignatureProbe {
     program: PathBuf,
+    /// How long the Git work may take once this probe holds a slot.
     timeout: Duration,
+    /// How long this probe may wait FOR that slot. Separate from `timeout` on
+    /// purpose — see `GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT`.
+    admission_timeout: Duration,
     /// Production probes share the process-wide cap. Tests that need to prove
     /// a child actually starts may inject an isolated cap so unrelated
     /// parallel tests cannot consume the whole deadline before spawn.
@@ -1639,16 +1663,26 @@ impl GitSignatureProbe {
         Self {
             program: PathBuf::from("git"),
             timeout: GIT_SIGNATURE_PROBE_TIMEOUT,
+            admission_timeout: GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT,
             limit: None,
         }
     }
 
     async fn sample(&self, path: &Path) -> Result<GitWorktreeSignature> {
-        // This is deliberately one total budget, including time queued behind
-        // other board cards, rather than 15 seconds per subcommand. A large
-        // portfolio and a slow fsmonitor therefore cannot create an unbounded
-        // backlog of overlapping readiness refreshes.
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        // Under `cargo test` this probe's Git children share one process-global
+        // `proc_registry` with every other test in a ~2200-test binary —
+        // including the tests that exercise the reaper itself. Those already
+        // serialized against each other; nothing serialized them against THIS,
+        // so a sweep there killed a probe child here. The child exits on a
+        // signal, `.ok()` turns the error into `None`, and readiness reads
+        // "signature unknown" as "the worktree changed": an empty `repo_checks`
+        // and a different readiness test named on macOS CI every run.
+        //
+        // Held across the whole signature — all three commands and the ownership
+        // sweep — because the child is registered for that entire span, not just
+        // during one command. No effect on what ships.
+        #[cfg(test)]
+        let _registry_guard = crate::proc_registry::real_child_test_lock().lock().await;
         // Board cards and multi-lane collection may sample concurrently. Keep
         // the process fan-out globally bounded across every issue rather than
         // multiplying one Git child per card, lane, and worktree.
@@ -1656,11 +1690,20 @@ impl GitSignatureProbe {
             .limit
             .clone()
             .unwrap_or_else(|| Arc::clone(git_probe_limit()));
-        let _permit = match tokio::time::timeout_at(deadline, limit.acquire_owned()).await {
+        // Waiting for a slot is bounded SEPARATELY from doing the work. One
+        // combined budget meant a probe could spend it all in line and then
+        // report the same failure a hung `git` reports — so how busy the machine
+        // was decided what the caller believed about the worktree. See
+        // `GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT`.
+        let admission = self.admission_timeout;
+        let _permit = match tokio::time::timeout(admission, limit.acquire_owned()).await {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => return Err(anyhow!("readiness Git probe semaphore closed")),
             Err(_) => return Err(anyhow!("readiness Git probe deadline elapsed while queued")),
         };
+        // The execution budget starts HERE, with a slot in hand, so it measures
+        // only how long this worktree's Git work takes.
+        let deadline = tokio::time::Instant::now() + self.timeout;
         // One inherited marker spans status/branch/HEAD. A configured
         // fsmonitor hook can daemonize and let Git's direct process exit, so
         // PGID/PPID cleanup alone is not sufficient for signature probes.
@@ -1709,6 +1752,43 @@ impl GitSignatureProbe {
             head_sha,
             dirty: !porcelain.stdout.is_empty(),
         })
+    }
+}
+
+#[cfg(test)]
+impl GitSignatureProbe {
+    /// `readiness()` with a PRIVATE concurrency limit, for tests that drive the
+    /// real `git`.
+    ///
+    /// NOT about the probe's time budget. Queue time no longer costs a probe its
+    /// execution budget (see `GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT`), and that
+    /// fix — not this one — is what made the `tests/readiness.rs` binary stop
+    /// flaking, from a named failure every run to 49/49.
+    ///
+    /// What remains is a residual, load-dependent flake in the LIB binary, where
+    /// these probes spawn real `git` children alongside ~2200 concurrent tests —
+    /// including tests that exercise `proc_registry`'s reaper directly. The
+    /// observed failure is a probe child exiting ON A SIGNAL (`code -1`, empty
+    /// stderr) rather than on any deadline; `.ok()` turns that into `None`, and
+    /// `verification_targets_for_direction` then reports no targets at all,
+    /// which surfaces as an empty `repo_checks`.
+    ///
+    /// A private one-permit gate narrows the window in which one of these probes
+    /// is in flight. Be honest about how much that buys: the flake is
+    /// intermittent in both configurations, and this has NOT been shown to
+    /// eliminate it — the residual coupling is the process reaper, which no
+    /// semaphore can fence. It is kept because it can only reduce overlap and
+    /// because removing it coincided with a macOS CI failure. The real fix is to
+    /// stop letting "the probe did not answer" be indistinguishable from "the
+    /// worktree changed" at the consumer, which is a wider change than the issue
+    /// this shim sits under.
+    fn isolated_readiness() -> Self {
+        Self {
+            program: PathBuf::from("git"),
+            timeout: GIT_SIGNATURE_PROBE_TIMEOUT,
+            admission_timeout: GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT,
+            limit: Some(Arc::new(Semaphore::new(1))),
+        }
     }
 }
 
@@ -2731,6 +2811,11 @@ async fn run_bounded_check(
     check: &crate::check::Check,
     timeout: Duration,
 ) -> Result<BoundedCheckOutcome> {
+    // Deliberately NOT serialized on `real_child_test_lock`, unlike the probe
+    // path. A check runner is what the timeout tests hang on purpose, so a
+    // guard held here is held for the whole deliberate timeout — starving every
+    // other test that needs the registry and breaking the permit/timing
+    // assertions those tests exist for. Tried, measured, reverted.
     let mut command = tokio::process::Command::new(&check.program);
     command
         .args(&check.args)
@@ -2745,13 +2830,29 @@ async fn run_bounded_check(
         crate::proc_registry::configure(&mut command, crate::proc_registry::Owner::probe());
     let mut child = match command.spawn() {
         Ok(child) => child,
+        // A check that never STARTED said nothing about the user's code, so it
+        // cannot be recorded as that code failing. Reporting `Completed{fail}`
+        // here made weft assert someone's tests were red when the truth was
+        // that its own exec failed — a missing binary, a permission, or, most
+        // often, `fork`/`posix_spawn` returning EAGAIN because the machine was
+        // out of process slots.
+        //
+        // That last one is not hypothetical: it is what named a different
+        // readiness test on macOS CI run after run. Under parallel test load a
+        // trivially-passing `exit 0` check would intermittently spawn-fail and
+        // land here, and the suite read `Failing` where it expected `Passed`.
+        // Non-deterministic, macOS-only, and never the same test twice —
+        // because which check loses the spawn is whichever one runs when the
+        // runner is tightest.
+        //
+        // `NotProduced` is the arm that already means "no verdict was
+        // obtained", the same answer a timeout gets. It does not fail open:
+        // readiness reads it as not-ready. Every neighbouring early return in
+        // this function already goes there; this one was the exception.
         Err(error) => {
-            return Ok(BoundedCheckOutcome::Completed(crate::check::CheckResult {
-                name: check.name.clone(),
-                status: "fail".to_string(),
-                code: -1,
+            return Ok(BoundedCheckOutcome::NotProduced {
                 output_tail: format!("could not run {}: {error}", check.program),
-            }));
+            });
         }
     };
     let mut registration = Some(configured.register(&child));
@@ -2847,9 +2948,46 @@ async fn run_bounded_check(
                     },
                 });
             }
+            // Reaching HERE means the child ran to completion on its own. A
+            // signal on this path is the user's check crashing — segfault,
+            // abort, OOM kill — which is a real failure of their code, so it
+            // stays `fail` with `-1` as the established "no numeric code"
+            // sentinel and the reason spelled out in the tail.
+            //
+            // An earlier revision routed every `status.code() == None` to
+            // `NotProduced`, on the premise that weft's own reaper kills these
+            // children and must not bill that to the user. The premise is
+            // right; the generalization was not. Every path where WEFT does
+            // the killing leaves elsewhere: a timeout exits through
+            // `ReapRequired` above, and the process-group cleanup runs only
+            // after this status has already been observed. So the only thing
+            // that arrives here signalled is the check dying on its own, and
+            // calling that "no verdict" would discard the blocking answer a
+            // crashing suite exists to give.
+            //
+            // The observation that motivated the earlier revision — concurrent
+            // reapers killing a probe's child — is a test-harness phenomenon,
+            // fixed in the harness (`proc_registry::real_child_test_lock`).
+            // Production semantics should not be bent to it.
+            let signalled = status.code().is_none();
+            let output_tail = match signalled {
+                true => {
+                    let detail = "check process was terminated by a signal";
+                    match output_tail.is_empty() {
+                        true => detail.to_string(),
+                        false => format!("{output_tail}\n{detail}"),
+                    }
+                }
+                false => output_tail,
+            };
             Ok(BoundedCheckOutcome::Completed(crate::check::CheckResult {
                 name: check.name.clone(),
-                status: if status.success() { "pass" } else { "fail" }.to_string(),
+                status: match status.success() {
+                    true => "pass".to_string(),
+                    false => "fail".to_string(),
+                },
+                // `-1` is the established sentinel for "no numeric code", kept
+                // so the reason is visible alongside the tail above.
                 code: status.code().unwrap_or(-1),
                 output_tail,
             }))
@@ -3701,6 +3839,54 @@ mod tests {
         Arc,
     };
 
+    /// Time spent QUEUED must not come out of the Git budget.
+    ///
+    /// This is the flake that made a different `readiness` test fail on macOS CI
+    /// each run while `--test-threads=1` always passed: one combined budget let
+    /// an unrelated test's queue consume this probe's whole deadline, the sample
+    /// failed, `.ok()` turned it into `None`, and `CheckFlight` read "signature
+    /// changed" from what was really "signature unknown". The probe here is
+    /// given a slot-less semaphore held just past its own execution budget, so
+    /// it MUST have waited longer than that budget by the time it runs — and it
+    /// still has to produce a signature.
+    #[tokio::test]
+    async fn queue_time_does_not_consume_the_probe_execution_budget() {
+        let root = tempfile::tempdir().expect("tempdir");
+        crate::git::init_repo(root.path()).expect("init repo");
+
+        let limit = Arc::new(Semaphore::new(1));
+        let execution = Duration::from_millis(150);
+        let held = Arc::clone(&limit)
+            .acquire_owned()
+            .await
+            .expect("hold the only slot");
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(execution * 3).await;
+            drop(held);
+        });
+
+        let probe = GitSignatureProbe {
+            program: PathBuf::from("git"),
+            timeout: execution,
+            admission_timeout: Duration::from_secs(30),
+            limit: Some(limit),
+        };
+        let started = std::time::Instant::now();
+        let signature = probe.sample(root.path()).await;
+        let waited = started.elapsed();
+        releaser.await.expect("releaser");
+
+        assert!(
+            waited > execution,
+            "the probe must have queued longer than its own execution budget, waited {waited:?}"
+        );
+        assert!(
+            signature.is_ok(),
+            "a probe that queued past its execution budget must still sample: {:?}",
+            signature.err()
+        );
+    }
+
     struct ReaderTaskDropMarker {
         dropped: Arc<AtomicUsize>,
     }
@@ -3876,7 +4062,7 @@ mod tests {
         let error = verification_targets_for_direction(
             &db,
             direction.id,
-            &GitSignatureProbe::readiness(),
+            &GitSignatureProbe::isolated_readiness(),
             VerificationTargetPurpose::ReadinessCollection,
         )
         .await
@@ -3927,7 +4113,7 @@ mod tests {
             let error = verification_targets_for_direction(
                 &db,
                 direction.id,
-                &GitSignatureProbe::readiness(),
+                &GitSignatureProbe::isolated_readiness(),
                 VerificationTargetPurpose::ReadinessCollection,
             )
             .await
@@ -4024,7 +4210,7 @@ mod tests {
             "an idle worker does not occupy the verification target"
         );
 
-        let probe = GitSignatureProbe::readiness();
+        let probe = GitSignatureProbe::isolated_readiness();
         for active_status in ["starting", "running", "stopped"] {
             repo::set_session_status(&db, worker.id, active_status)
                 .await
@@ -4258,7 +4444,7 @@ mod tests {
             &open_asks,
             open_pr_snapshot_freshness(1_000, 60),
             CheckExecution::RunAllowed,
-            &GitSignatureProbe::readiness(),
+            &GitSignatureProbe::isolated_readiness(),
         )
         .await
         .expect("worker failure must preempt lane collection");
@@ -4390,7 +4576,7 @@ mod tests {
     }
 
     async fn sampled_check_target(path: &Path, stored_path: String) -> CheckTarget {
-        let signature = GitSignatureProbe::readiness()
+        let signature = GitSignatureProbe::isolated_readiness()
             .sample(path)
             .await
             .expect("sample test worktree signature");
@@ -4400,6 +4586,45 @@ mod tests {
             branch: signature.branch,
             head_sha: signature.head_sha,
             dirty: signature.dirty,
+        }
+    }
+
+    /// A check that CRASHES is a failing check.
+    ///
+    /// `status.code()` is `None` when a child dies on a signal, and on THIS
+    /// path — ran to completion, no timeout, no reap — the signal came from
+    /// the check itself: a segfault, an abort, an OOM kill. That is a genuine
+    /// red verdict about the user's code and must survive as one rather than
+    /// being softened into "no verdict was obtained". Weft's own kills never
+    /// arrive here; they leave through `ReapRequired`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_check_that_crashes_on_a_signal_is_reported_as_failing() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let outcome = run_bounded_check(
+            root.path(),
+            &shell_check("self-terminated", "kill -TERM $$; sleep 5"),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("the runner itself does not error");
+
+        match outcome {
+            BoundedCheckOutcome::Completed(result) => {
+                assert_eq!(
+                    result.status, "fail",
+                    "a crashing check is a failing check, not an unknown one"
+                );
+                assert!(
+                    result.output_tail.contains("terminated by a signal"),
+                    "…and the tail says why it has no exit code: {}",
+                    result.output_tail
+                );
+            }
+            BoundedCheckOutcome::NotProduced { output_tail } => panic!(
+                "a crash on the normal completed path is a real failure of the \
+                 user's code, not a missing verdict: {output_tail}"
+            ),
         }
     }
 
@@ -5484,7 +5709,7 @@ mod tests {
         let stored_path = root.path().display().to_string();
         let pre_targets = vec![sampled_check_target(root.path(), stored_path).await];
         let changed_path = root.path().join("README.md");
-        let probe = GitSignatureProbe::readiness();
+        let probe = GitSignatureProbe::isolated_readiness();
         let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
 
         let evidence = checks_for_targets_with_runner_and_post_targets(
@@ -5530,7 +5755,7 @@ mod tests {
         let pre_head = pre_targets[0].head_sha.clone();
         let pre_branch = pre_targets[0].branch.clone();
         let switched_path = root.path().to_path_buf();
-        let probe = GitSignatureProbe::readiness();
+        let probe = GitSignatureProbe::isolated_readiness();
         let flight = CheckFlight::new(CHECK_EVIDENCE_TTL, 1);
 
         let evidence = checks_for_targets_with_runner_and_post_targets(
@@ -5547,7 +5772,7 @@ mod tests {
         .await
         .expect("same-HEAD branch-switch result");
 
-        let after = GitSignatureProbe::readiness()
+        let after = GitSignatureProbe::isolated_readiness()
             .sample(root.path())
             .await
             .expect("sample switched branch");
@@ -5744,6 +5969,7 @@ mod tests {
         let git_probe = GitSignatureProbe {
             program: git_stub,
             timeout: Duration::from_secs(1),
+            admission_timeout: GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT,
             limit: Some(Arc::new(Semaphore::new(1))),
         };
 
@@ -6064,6 +6290,7 @@ mod tests {
         let git_probe = GitSignatureProbe {
             program: git_stub,
             timeout: Duration::from_secs(1),
+            admission_timeout: GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT,
             limit: Some(Arc::new(Semaphore::new(1))),
         };
         // The app prewarms this cached PATH at startup. Do the same before the
@@ -6210,6 +6437,7 @@ mod tests {
         let probe = GitSignatureProbe {
             program: git_stub,
             timeout: Duration::from_secs(2),
+            admission_timeout: GIT_SIGNATURE_PROBE_ADMISSION_TIMEOUT,
             limit: Some(Arc::new(Semaphore::new(1))),
         };
         let error = probe
@@ -6832,6 +7060,41 @@ mod tests {
         assert_eq!(evidence, CheckEvidence::NotProduced);
     }
 
+    /// A check weft could not START is not a failing check.
+    ///
+    /// The distinction against the crash case above is the whole point: there,
+    /// a child ran and died, which IS a verdict about the user's code. Here no
+    /// child exists at all, so calling it `fail` invents one. In production
+    /// that misreports a missing binary or a permission error as red tests; on
+    /// a loaded macOS CI runner it is `posix_spawn` returning EAGAIN, which is
+    /// what named a different readiness test almost every run.
+    #[tokio::test]
+    async fn a_check_that_could_not_be_started_is_not_produced_rather_than_failing() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let outcome = run_bounded_check(
+            root.path(),
+            &crate::check::Check {
+                name: "missing".to_string(),
+                program: "weft-no-such-program-exists".to_string(),
+                args: Vec::new(),
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the runner itself does not error");
+
+        match outcome {
+            BoundedCheckOutcome::NotProduced { output_tail } => assert!(
+                output_tail.contains("could not run"),
+                "the reason must say the check never started: {output_tail}"
+            ),
+            BoundedCheckOutcome::Completed(result) => panic!(
+                "a check that never ran must not become a verdict about the user's code: \
+                 {result:?}"
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn bounded_check_evidence_keeps_observed_failures_sticky() {
         let root = tempfile::tempdir().expect("temporary check fixture");
@@ -6915,19 +7178,63 @@ mod tests {
         assert_eq!(released, CheckEvidence::Passed);
     }
 
+    /// The truncation MARKER, proven without a process or a clock.
+    ///
+    /// `noisy_check_streams_a_bounded_tail_before_its_deadline` used to be the
+    /// only coverage of this, and it could only observe a marker if the child
+    /// emitted past the budget before the deadline — a race against process
+    /// spawn, not a statement about the buffer. The semantics belong here,
+    /// where they are decided by arithmetic.
+    #[test]
+    fn output_tail_buffer_marks_only_the_writes_that_actually_discarded_bytes() {
+        let mut exact = OutputTailBuffer::new(8);
+        exact.append(b"12345678");
+        assert_eq!(exact.render(), "12345678", "a tail at the budget is whole");
+
+        let mut under = OutputTailBuffer::new(8);
+        under.append(b"abc");
+        under.append(b"de");
+        assert_eq!(under.render(), "abcde", "two writes still under the budget");
+
+        // Ring overflow across writes: the marker appears and the partial
+        // first line is dropped, so no leading fragment is ever surfaced.
+        let mut rolled = OutputTailBuffer::new(8);
+        rolled.append(b"aaaa\nbbb");
+        rolled.append(b"b\ncccc");
+        assert_eq!(rolled.render(), "…\ncccc");
+
+        // A single write larger than the whole budget keeps only its end.
+        let mut oversized = OutputTailBuffer::new(6);
+        oversized.append(b"xxxxxxxx\nyz");
+        assert_eq!(oversized.render(), "…\nyz");
+
+        // A zero budget retains nothing but must still admit it dropped data.
+        let mut none = OutputTailBuffer::new(0);
+        none.append(b"anything");
+        assert_eq!(none.render(), "…\n");
+    }
+
     #[tokio::test]
     async fn noisy_check_streams_a_bounded_tail_before_its_deadline() {
         let root = tempfile::tempdir().expect("temporary noisy check fixture");
         let started = Instant::now();
+        // The deadline is deliberately far larger than the ~1ms this loop needs
+        // to pass a 2 KB budget, because what it has to clear is not the
+        // writing — it is `sh` being spawned and scheduled at all. At 50ms this
+        // test was racing process-spawn latency on a loaded macOS runner and
+        // failing with an empty tail while the code was correct. The margin is
+        // against the machine; the loop never exits, so the deadline is still
+        // what ends the process.
+        let deadline = Duration::from_millis(1_500);
         let outcome = tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(20),
             run_bounded_check(
                 root.path(),
                 &shell_check(
                     "noisy",
                     "while :; do printf 'readiness-output-readiness-output-readiness-output\\n'; done",
                 ),
-                Duration::from_millis(50),
+                deadline,
             ),
         )
         .await
@@ -6938,7 +7245,7 @@ mod tests {
             BoundedCheckOutcome::Completed(_) => panic!("noisy check unexpectedly completed"),
         };
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(20),
             "noisy process must be killed by the bounded deadline"
         );
         assert!(
@@ -6948,7 +7255,11 @@ mod tests {
         );
         assert!(
             output_tail.starts_with("…\n"),
-            "large output must report that its retained tail was truncated"
+            "an unbroken printf loop given {deadline:?} must overrun a \
+             {CHECK_OUTPUT_TAIL_BYTES}-byte budget and say so; a tail this \
+             short means the streaming path fed the buffer nothing, got {} \
+             bytes: {output_tail:?}",
+            output_tail.as_bytes().len()
         );
     }
 

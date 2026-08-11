@@ -1368,6 +1368,28 @@ fn snapshot() -> Vec<(i32, i32, i32)> {
         .collect()
 }
 
+
+/// Serializes every test that puts a REAL child process into this registry.
+///
+/// The registry is process-global and its tests assert on "live processes for
+/// this instance", so two such tests running concurrently pollute each other's
+/// counts — that much was already true of `proc_registry`'s own tests, which is
+/// why they took a private lock. What that private lock could not cover is the
+/// other module that registers real children: `readiness`'s Git signature
+/// probes. A probe's child sits in this registry while a reaping test sweeps
+/// it, and the child dies on a signal; the probe reports failure, `.ok()` turns
+/// it into `None`, and readiness reads "signature unknown" as "worktree
+/// changed" — an empty `repo_checks`, and a different readiness test named on
+/// macOS CI every run.
+///
+/// Async, so a guard can be held across the awaits a probe needs. Poison is not
+/// a concern for `tokio::sync::Mutex`; a panicking test simply releases it.
+#[cfg(test)]
+pub(crate) fn real_child_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 // ── 测试(合成子进程,不依赖 codex)──────────────────────────────────────────
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
@@ -1380,11 +1402,11 @@ mod tests {
     /// 并行跑测试会让彼此的 spawn/reap 互相污染计数。用一把串行锁保证同一时刻只有一个
     /// 进程测试在登记表里有条目 → 计数与不变量确定可复现。poison 容错:某测试 panic 也
     /// 不连累其余(拿回 inner guard 继续)。
-    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+    /// Delegates to the crate-wide [`real_child_test_lock`] so these tests are
+    /// serialized against `readiness`'s probe tests too, not merely against
+    /// each other — a reap here would otherwise kill a probe's Git child there.
+    async fn test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        super::real_child_test_lock().lock().await
     }
 
     fn null_cmd(program: &str) -> Command {
@@ -1417,7 +1439,7 @@ mod tests {
 
     #[tokio::test]
     async fn configure_puts_child_in_its_own_process_group() {
-        let _g = test_guard();
+        let _g = test_guard().await;
         let mut cmd = null_cmd("sh");
         cmd.arg("-c").arg("sleep 30");
         let cfg = configure(&mut cmd, Owner::other("test-a"));
@@ -1436,7 +1458,7 @@ mod tests {
 
     #[tokio::test]
     async fn count_includes_descendants() {
-        let _g = test_guard();
+        let _g = test_guard().await;
         // sh(登记的直接子进程)+ 后台 sleep + 前台 sleep,两个 sleep 是 sh 的后代。
         let mut cmd = null_cmd("sh");
         cmd.arg("-c").arg("sleep 30 & sleep 30");
@@ -1453,7 +1475,7 @@ mod tests {
 
     #[tokio::test]
     async fn reap_kills_descendants_even_when_they_escape_into_their_own_group() {
-        let _g = test_guard();
+        let _g = test_guard().await;
         // 复现 codex 的隔离:一个直接子进程(perl)fork 出一个**在自己独立进程组里**的
         // 亲儿(POSIX::setpgid),正如 codex 把每个 MCP server 隔离进独立组。亲儿仍是
         // perl 的 child(ppid 链完好)但 pgid 不同 —— 朴素的 killpg(perl 组) 会漏掉它,
@@ -1513,7 +1535,7 @@ mod tests {
 
     #[tokio::test]
     async fn inherited_fd_marker_reaps_a_background_child_after_its_parent_exits() {
-        let _g = test_guard();
+        let _g = test_guard().await;
         let marker = InheritedProcessMarker::create("proc-registry-test")
             .expect("create inherited process marker");
         let root = tempfile::tempdir().expect("marker fixture directory");
@@ -1569,7 +1591,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_inherited_fd_marker_queues_reparented_child_cleanup() {
-        let _g = test_guard();
+        let _g = test_guard().await;
         let marker = InheritedProcessMarker::create("proc-registry-drop-test")
             .expect("create Drop cleanup marker");
         let root = tempfile::tempdir().expect("Drop cleanup fixture directory");
@@ -1668,7 +1690,7 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_reap_zero_budget_kills_root_but_keeps_registration_until_owner_teardown() {
-        let _g = test_guard();
+        let _g = test_guard().await;
         let mut cmd = null_cmd("sh");
         cmd.arg("-c").arg("sleep 30");
         let configured = configure(&mut cmd, Owner::other("bounded-reap-zero-budget"));
@@ -1693,7 +1715,7 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_reap_reports_completed_when_its_child_wait_wins_the_deadline() {
-        let _g = test_guard();
+        let _g = test_guard().await;
         let mut cmd = null_cmd("sh");
         cmd.arg("-c").arg("sleep 30");
         let configured = configure(&mut cmd, Owner::other("bounded-reap-completed"));
@@ -1711,7 +1733,7 @@ mod tests {
 
     #[tokio::test]
     async fn is_ours_tracks_descendant_criterion() {
-        let _g = test_guard();
+        let _g = test_guard().await;
         let mut cmd = null_cmd("sh");
         cmd.arg("-c").arg("sleep 30");
         let cfg = configure(&mut cmd, Owner::other("test-d"));
@@ -1736,7 +1758,7 @@ mod tests {
     /// 口径漂移,此断言破 —— 计数口径与孤儿判定口径分家。
     #[tokio::test]
     async fn count_is_exactly_filter_is_ours() {
-        let _g = test_guard();
+        let _g = test_guard().await;
         let mut cmd = null_cmd("sh");
         cmd.arg("-c").arg("sleep 30 & sleep 30");
         let cfg = configure(&mut cmd, Owner::other("test-e"));
@@ -1790,7 +1812,7 @@ mod tests {
     /// 杀掉 —— 强信号。
     #[tokio::test]
     async fn kill_group_never_signals_weft_or_init_group() {
-        let _g = test_guard();
+        let _g = test_guard().await;
         let mut cmd = null_cmd("sh");
         cmd.arg("-c").arg("sleep 30").kill_on_drop(true);
         // 故意不 configure:哨兵留在 Weft 自己的进程组里。
@@ -1834,7 +1856,7 @@ mod tests {
     /// 死条目。
     #[tokio::test]
     async fn drop_without_reap_deregisters() {
-        let _g = test_guard();
+        let _g = test_guard().await;
         let mut cmd = null_cmd("sh");
         cmd.arg("-c").arg("sleep 30").kill_on_drop(true);
         let cfg = configure(&mut cmd, Owner::other("test-drop"));
@@ -1892,7 +1914,7 @@ mod tests {
     /// 仪表盘的内存读数必须反映真实 owned 子树:起一个子进程后,合计 RSS 应 > 0。
     #[tokio::test]
     async fn instance_memory_bytes_reflects_owned_subtree() {
-        let _g = test_guard();
+        let _g = test_guard().await;
         let mut cmd = null_cmd("sh");
         cmd.arg("-c").arg("sleep 30");
         let cfg = configure(&mut cmd, Owner::other("test-mem"));
@@ -1909,7 +1931,7 @@ mod tests {
     /// 悄悄改了语义。
     #[tokio::test]
     async fn instance_usage_matches_the_two_separate_functions_it_replaces() {
-        let _g = test_guard();
+        let _g = test_guard().await;
         let mut cmd = null_cmd("sh");
         cmd.arg("-c").arg("sleep 30");
         let cfg = configure(&mut cmd, Owner::other("test-usage"));
@@ -1941,7 +1963,7 @@ mod tests {
     /// 的分类(前端渲染只关心「实际存在」的分类)。
     #[tokio::test]
     async fn owner_counts_group_by_kind_and_skip_zero() {
-        let _g = test_guard();
+        let _g = test_guard().await;
         let mut cmd = null_cmd("sh");
         cmd.arg("-c").arg("sleep 30");
         let cfg = configure(&mut cmd, Owner::session("s1"));
