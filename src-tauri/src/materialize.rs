@@ -315,10 +315,24 @@ async fn judge_materialize(
                 authority::GateOverride::Denied
             }
         });
+    // Whether this repository's display NAME identifies it uniquely in its
+    // workspace. `add_repo_ref` deduplicates on local path or remote URL only,
+    // so two different checkouts can both be called `api` — and a rule written
+    // against that name would then cover both. Adjudication is pure and cannot
+    // count rows, so the fact is established here.
+    let repo_name_is_ambiguous = repo::workspace_repo_name_is_shared(
+        db,
+        repo_ref.workspace_id,
+        &repo_ref.name,
+        repo_ref.id,
+    )
+    .await?;
     let lane = authority::LaneCandidate {
         lane_id: &dir.slug,
         repo_known: true,
         repo_name: &repo_ref.name,
+        repo_slug: &repo_ref.slug,
+        repo_name_is_ambiguous,
         reason: &dir.reason,
         base_branch: effective_base,
         base_is_named: base_branch_is_named(repo_ref, dir),

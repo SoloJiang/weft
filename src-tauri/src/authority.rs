@@ -244,6 +244,25 @@ pub struct LaneCandidate<'a> {
     pub lane_id: &'a str,
     pub repo_known: bool,
     pub repo_name: &'a str,
+    /// The workspace-UNIQUE identity of the same repository (`repo_ref.slug`,
+    /// allocated by `slug::unique_slug`).
+    ///
+    /// `repo_name` is a display name and nothing guarantees it is unique:
+    /// `add_repo_ref` deduplicates on local path or remote URL only, so a
+    /// workspace can hold two entirely different checkouts both called `api`.
+    /// A rule written against that name then covers both, and an allowlist
+    /// meant for one repository authorizes work in the other.
+    ///
+    /// So the allowlist matches this, and accepts `repo_name` only when the
+    /// name is not ambiguous. Slugs are what disambiguate a duplicate pair
+    /// (`api`, `api-2`), which is what makes such a workspace configurable at
+    /// all rather than merely refused.
+    pub repo_slug: &'a str,
+    /// Whether ANOTHER repository in the same workspace shares `repo_name`.
+    ///
+    /// Adjudication is pure and cannot count rows, so the caller establishes
+    /// this the same way it establishes `base_is_named`.
+    pub repo_name_is_ambiguous: bool,
     pub reason: &'a str,
     pub base_branch: &'a str,
     /// Whether `base_branch` is a branch that actually EXISTS, as opposed to a
@@ -347,16 +366,27 @@ fn now_unix_string() -> String {
 
 /// Does this rule list NAME this repo — the test used where a match GRANTS.
 ///
-/// Exact, because that is precisely how `planner::resolve` binds a lane to a
-/// workspace repo (`*n == dir.repo`), and the two have to agree on what "this
-/// repository" means. Repos are deduplicated by local path or remote URL and
-/// never by name (`store::repo::add_repo_ref`), so one workspace can hold
-/// genuinely distinct repositories called `api` and `API`. Folding case here
-/// made `allowed_repos: ["api"]` authorize a lane targeting `API` — an
-/// allowlist permitting a repository it had never named, and a scope rule
-/// silently covering work in the wrong checkout.
-fn allowlist_names_repo(list: &[String], name: &str) -> bool {
-    list.iter().any(|entry| entry == name)
+/// A grant may only ever land on the repository the rule actually identified,
+/// so this matches on identity, exactly, in two steps:
+///
+/// - the workspace-unique **slug** always counts;
+/// - the **display name** counts only when it is not shared with another
+///   repository in the same workspace.
+///
+/// Both halves came from real holes. Folding case made `allowed_repos: ["api"]`
+/// authorize a lane targeting the distinct repo `API` — `planner::resolve`
+/// binds by exact name (`*n == dir.repo`), so the matcher has to agree with it.
+/// And exactness alone was not enough: `add_repo_ref` deduplicates on local
+/// path or remote URL and never on name, so two entirely different checkouts
+/// can both be called `api` and an exact match still covers both. Only the slug
+/// is unique by construction (`slug::unique_slug`).
+///
+/// Accepting the slug is what keeps such a workspace configurable rather than
+/// simply refused: `api` and `api-2` can be allowed separately.
+fn allowlist_names_repo(list: &[String], lane: &LaneCandidate<'_>) -> bool {
+    list.iter().any(|entry| {
+        entry == lane.repo_slug || (!lane.repo_name_is_ambiguous && entry == lane.repo_name)
+    })
 }
 
 /// Does this rule list CATCH this repo — the test used where a match REFUSES.
@@ -365,9 +395,12 @@ fn allowlist_names_repo(list: &[String], name: &str) -> bool {
 /// point: each list matches in whichever direction fails CLOSED. A denial that
 /// misses because someone wrote `API` for a repo named `api` is a hole; an
 /// allowance that hits for the same reason authorizes a different repository.
-/// So the denylist is generous and the allowlist is exact.
-fn denylist_catches_repo(list: &[String], name: &str) -> bool {
-    list.iter().any(|entry| entry.eq_ignore_ascii_case(name))
+/// So the denylist is generous — either identity, either casing, ambiguous or
+/// not — and the allowlist is exact.
+fn denylist_catches_repo(list: &[String], lane: &LaneCandidate<'_>) -> bool {
+    list.iter().any(|entry| {
+        entry.eq_ignore_ascii_case(lane.repo_name) || entry.eq_ignore_ascii_case(lane.repo_slug)
+    })
 }
 
 /// The bare branch name behind any spelling git accepts for it:
@@ -601,7 +634,7 @@ pub fn adjudicate_lane(
         };
     }
 
-    if denylist_catches_repo(&policy.rules.denied_repos, lane.repo_name) {
+    if denylist_catches_repo(&policy.rules.denied_repos, lane) {
         return build(
             LaneDecision::Denied,
             VerdictReason::RepoDeniedByPolicy,
@@ -609,7 +642,7 @@ pub fn adjudicate_lane(
         );
     }
     if !policy.rules.allowed_repos.is_empty()
-        && !allowlist_names_repo(&policy.rules.allowed_repos, lane.repo_name)
+        && !allowlist_names_repo(&policy.rules.allowed_repos, lane)
     {
         return build(
             LaneDecision::Denied,
@@ -794,6 +827,8 @@ mod tests {
             lane_id: "lane-a",
             repo_known: true,
             repo_name: "svc",
+            repo_slug: "svc",
+            repo_name_is_ambiguous: false,
             reason: "fix the bug",
             base_branch: "",
             base_is_named: true,
@@ -1074,6 +1109,12 @@ mod tests {
         assert_eq!(verdict.reason, VerdictReason::ProtectedBranch);
     }
 
+    fn policy_allowing(entries: &[&str]) -> PolicySnapshot {
+        let mut policy = default_policy(PolicyScope::Workspace(1));
+        policy.rules.allowed_repos = entries.iter().map(|e| e.to_string()).collect();
+        policy
+    }
+
     /// An allowlist may only authorize the repository it NAMED, and a denylist
     /// may not be dodged by spelling.
     ///
@@ -1106,6 +1147,35 @@ mod tests {
         assert_eq!(
             adjudicate_lane(&scoped, "rev-1", &named).decision,
             LaneDecision::AllowedByPolicy
+        );
+
+        // AMBIGUOUS: two different repositories can share a display name, so a
+        // rule naming it identifies neither and must grant to neither. Only the
+        // workspace-unique slug can single one out.
+        let mut shared = base_lane();
+        shared.repo_name = "api";
+        shared.repo_slug = "api-2";
+        shared.repo_name_is_ambiguous = true;
+        let by_name = policy_allowing(&["api"]);
+        assert_eq!(
+            adjudicate_lane(&by_name, "rev-1", &shared).decision,
+            LaneDecision::Denied,
+            "a shared display name identifies no single repository, so it grants to none"
+        );
+        assert_eq!(
+            adjudicate_lane(&by_name, "rev-1", &shared).reason,
+            VerdictReason::RepoOutsideProjectScope
+        );
+        // …and the slug is what makes such a workspace configurable at all.
+        assert_eq!(
+            adjudicate_lane(&policy_allowing(&["api-2"]), "rev-1", &shared).decision,
+            LaneDecision::AllowedByPolicy,
+            "the unique slug singles this repository out"
+        );
+        assert_eq!(
+            adjudicate_lane(&policy_allowing(&["api"]), "rev-1", &named).decision,
+            LaneDecision::AllowedByPolicy,
+            "an UNambiguous name still works, so the common case is untouched"
         );
 
         // DENY: a spelling difference must not slip past a refusal.
@@ -1212,6 +1282,8 @@ mod tests {
                 lane_id: "l1",
                 repo_known: true,
                 repo_name: "repo",
+                repo_slug: "repo",
+                repo_name_is_ambiguous: false,
                 reason: "why",
                 base_branch: base,
                 base_is_named: true,

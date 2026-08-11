@@ -1995,6 +1995,31 @@ pub async fn get_repo(db: &Db, repo_id: i32) -> Result<Option<repo_ref::Model>> 
     Ok(repo_ref::Entity::find_by_id(repo_id).one(&db.0).await?)
 }
 
+/// Whether another repository in the same workspace shares this display NAME.
+///
+/// Registration deduplicates on local path or remote URL and never on name, so
+/// a workspace can hold two entirely different checkouts both called `api`.
+/// Only `slug` is unique (`slug::unique_slug`). An AuthorityPolicy rule written
+/// against a shared name identifies neither repository, and `authority`'s
+/// allowlist refuses to grant on one — this is how that side learns the fact,
+/// since adjudication is pure and cannot count rows itself.
+///
+/// Compared case-insensitively so `api` and `API` count as sharing: the point
+/// is whether a human reading the rule could tell which repository it meant.
+pub async fn workspace_repo_name_is_shared(
+    db: &Db,
+    workspace_id: i32,
+    name: &str,
+    excluding_repo_id: i32,
+) -> Result<bool> {
+    Ok(repo_ref::Entity::find()
+        .filter(repo_ref::Column::WorkspaceId.eq(workspace_id))
+        .all(&db.0)
+        .await?
+        .into_iter()
+        .any(|row| row.id != excluding_repo_id && row.name.eq_ignore_ascii_case(name)))
+}
+
 pub async fn get_thread(db: &Db, thread_id: i32) -> Result<Option<thread::Model>> {
     Ok(thread::Entity::find_by_id(thread_id).one(&db.0).await?)
 }
