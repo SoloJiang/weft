@@ -9,6 +9,7 @@ import {
   changeSetPanelState,
   hasEvidence,
   laneCheckoutView,
+  laneStatusView,
   laneWaves,
 } from "../../src/board/changeSetView.ts";
 
@@ -41,7 +42,14 @@ function checkout(branch: string | null, repo = "primary"): LaneCheckout {
 }
 
 function changeSet(lanes: ChangeSetLane[]): IssueChangeSet {
-  return { readiness: "unknown", reasons: [], active_lane_count: lanes.length, lanes };
+  return {
+    readiness: "unknown",
+    reasons: [],
+    active_lane_count: lanes.length,
+    lanes,
+    issue_evidence: { fresh: 0, stale: 0, unknown: 0, newest_observed_at: null },
+    evidence_scan_truncated: false,
+  };
 }
 
 test("waves order lanes by their dependency edges, independents first", () => {
@@ -274,4 +282,36 @@ test("no evidence at all is distinct from evidence that is merely untrustworthy"
     ),
     true,
   );
+});
+
+test("a blank declared branch is not something a checkout can differ from", () => {
+  // `reconciliation_for` returns Unknown for an empty declared branch rather
+  // than judging it. Marking a row "differs" here would invent a comparison
+  // the backend declined to make.
+  const view = laneCheckoutView(
+    lane({
+      direction_id: 1,
+      reconciliation: "unknown",
+      checkout: {
+        declared_base: "main",
+        declared_branch: "   ",
+        observed: [checkout("weft/whatever")],
+      },
+    }),
+  );
+  assert.equal(view.kind, "unknown");
+  assert.deepEqual(
+    view.kind === "unknown" ? view.rows.map((r) => r.matchesDeclared) : [],
+    [null],
+  );
+});
+
+test("every stored lane status maps to a translatable value, unknown tokens included", () => {
+  for (const status of ["queued", "planning", "working", "review", "done"]) {
+    assert.equal(laneStatusView(status), status);
+  }
+  // Free text in the store must never reach the screen untranslated.
+  assert.equal(laneStatusView("some-future-status"), "unknown");
+  assert.equal(laneStatusView(""), "unknown");
+  assert.equal(laneStatusView("  review  "), "review");
 });

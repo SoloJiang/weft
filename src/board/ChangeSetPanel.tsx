@@ -14,9 +14,11 @@ import {
   changeSetPanelState,
   hasEvidence,
   laneCheckoutView,
+  laneStatusView,
   type ChangeSetPanelState,
   type CheckoutRowView,
   type LaneCheckoutView,
+  type LaneStatusView,
 } from "./changeSetView";
 
 /**
@@ -119,6 +121,15 @@ const CHECKS_KEYS: Record<CheckEvidence, string> = {
   failing: "changeSet.checks.failing",
 };
 
+const STATUS_KEYS: Record<LaneStatusView, string> = {
+  queued: "changeSet.status.queued",
+  planning: "changeSet.status.planning",
+  working: "changeSet.status.working",
+  review: "changeSet.status.review",
+  done: "changeSet.status.done",
+  unknown: "changeSet.status.unknown",
+};
+
 const UPSTREAM_KEYS: Record<UpstreamEvidence, string> = {
   satisfied: "changeSet.upstream.satisfied",
   unmet: "changeSet.upstream.unmet",
@@ -147,7 +158,9 @@ function LaneRow({
           </span>
         )}
         <ReadinessChip state={{ kind: "ready", dto: lane }} className="max-w-[20rem]" />
-        <span className="ml-auto shrink-0 text-[10.5px] text-ink-faint">{lane.direction_status}</span>
+        <span className="ml-auto shrink-0 text-[10.5px] text-ink-faint">
+          {t(STATUS_KEYS[laneStatusView(lane.direction_status)])}
+        </span>
         {openable && (
           <button
             type="button"

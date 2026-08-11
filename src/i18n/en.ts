@@ -1148,6 +1148,14 @@ export const en = {
       dirty: "uncommitted changes",
       differsFromDeclared: "differs from the declared branch",
     },
+    status: {
+      queued: "queued",
+      planning: "planning",
+      working: "building",
+      review: "in review",
+      done: "done",
+      unknown: "status unknown",
+    },
     reconciliation: {
       matched: "checkout matches",
       drifted: "checkout drifted",

@@ -1104,6 +1104,14 @@ export const zh = {
       dirty: "有未提交改动",
       differsFromDeclared: "与声明分支不一致",
     },
+    status: {
+      queued: "排队中",
+      planning: "规划中",
+      working: "构建中",
+      review: "评审中",
+      done: "已完成",
+      unknown: "状态未知",
+    },
     reconciliation: {
       matched: "工作区一致",
       drifted: "工作区已漂移",

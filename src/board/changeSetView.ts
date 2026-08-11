@@ -147,11 +147,14 @@ export function laneCheckoutView(lane: ChangeSetLane): LaneCheckoutView {
   const observed = lane.checkout.observed;
   if (observed === null) return { kind: "not_probed" };
   if (observed.length === 0) return { kind: "none_registered" };
+  // A blank declared branch is not a branch to differ FROM. The backend
+  // refuses to judge that case at all (`reconciliation_for` returns Unknown
+  // for an empty `direction.branch`), so pointing at a row as "differs" here
+  // would be this file inventing a comparison readiness declined to make.
+  const declared = lane.checkout.declared_branch.trim();
   const rows: CheckoutRowView[] = observed.map((checkout) => ({
     checkout,
-    matchesDeclared: checkout.observed
-      ? checkout.observed.branch === lane.checkout.declared_branch
-      : null,
+    matchesDeclared: matchesDeclaredBranch(checkout, declared),
   }));
   switch (lane.reconciliation) {
     case "matched":
@@ -163,9 +166,37 @@ export function laneCheckoutView(lane: ChangeSetLane): LaneCheckoutView {
   }
 }
 
+function matchesDeclaredBranch(checkout: LaneCheckout, declaredBranch: string): boolean | null {
+  if (!declaredBranch) return null;
+  if (!checkout.observed) return null;
+  return checkout.observed.branch === declaredBranch;
+}
+
 /** Whether a lane has any evidence rows at all — `0/0/0` is "none recorded",
  *  which is not the same as "recorded and untrustworthy". */
 export function hasEvidence(lane: ChangeSetLane): boolean {
   const { fresh, stale, unknown } = lane.evidence;
   return fresh + stale + unknown > 0;
+}
+
+/**
+ * The lane's stored lifecycle status as ONE discriminated value.
+ *
+ * `direction_status` is free text in the store, so an unrecognized token must
+ * still render: it maps to `unknown` rather than being printed raw, which
+ * would put an untranslated backend token on screen (CLAUDE.md: user-facing
+ * strings go only through the i18n files).
+ */
+export type LaneStatusView = "queued" | "planning" | "working" | "review" | "done" | "unknown";
+
+const LANE_STATUSES: Record<string, LaneStatusView> = {
+  queued: "queued",
+  planning: "planning",
+  working: "working",
+  review: "review",
+  done: "done",
+};
+
+export function laneStatusView(directionStatus: string): LaneStatusView {
+  return LANE_STATUSES[directionStatus.trim()] ?? "unknown";
 }

@@ -116,15 +116,24 @@ pub struct IssueChangeSet {
     pub reasons: Vec<ReadinessReason>,
     pub active_lane_count: usize,
     pub lanes: Vec<ChangeSetLane>,
+    /// Evidence recorded against the ISSUE rather than any one lane
+    /// (`direction_id == 0`): unbound PR rows, issue-wide asks. Reported here
+    /// instead of being folded into a lane that did not produce it.
+    pub issue_evidence: EvidenceSummary,
+    /// The evidence scan hit [`EVIDENCE_SCAN_LIMIT`]. Counts then describe the
+    /// newest rows for the issue, not all of them, and a lane whose rows all
+    /// fell past the cut reads as having none.
+    pub evidence_scan_truncated: bool,
 }
 
-/// How many Evidence rows one scan may return per issue.
+/// How many Evidence rows one scan may return, for the WHOLE issue.
 ///
-/// The summary only needs counts, and an issue that has produced more rows than
-/// this has long since answered "is there evidence here". Bounded so a
-/// long-running issue cannot make the first screen slow. `list_evidence` orders
-/// newest-first, so a truncated scan drops the OLDEST rows — the ones least
-/// likely to change what the reader does.
+/// Bounded so a long-running issue cannot make the first screen slow. The bound
+/// is per issue while the summaries are per lane, so a busy lane can push a
+/// quiet one's rows past the cut entirely and leave it reading as having no
+/// evidence at all. That is why hitting the bound is reported
+/// (`IssueChangeSet::evidence_scan_truncated`) rather than passed off as a
+/// complete count.
 const EVIDENCE_SCAN_LIMIT: u64 = 200;
 
 /// Collect one issue's Change Set, running verification the same way the
@@ -159,7 +168,7 @@ async fn project(
     let directions = repo::list_directions(db, thread_id).await?;
     let directions_by_id: HashMap<i32, &crate::store::entities::direction::Model> =
         directions.iter().map(|row| (row.id, row)).collect();
-    let evidence = evidence_by_direction(db, thread_id, facts).await?;
+    let evidence = evidence_scan(db, thread_id, facts).await?;
 
     // `issue_readiness` builds its lane list by filtering these same facts in
     // order, so its rows are an ordered SUBSEQUENCE of `facts` and a cursor
@@ -211,10 +220,16 @@ async fn project(
             checks: fact.checks,
             upstream: fact.upstream,
             pull_requests: fact.pull_requests.clone(),
-            evidence: evidence
-                .get(&fact.direction_id)
-                .cloned()
-                .unwrap_or_default(),
+            // A virtual lane has no direction and so produces no evidence of
+            // its own; the issue's rows belong to the issue, not to it.
+            evidence: match fact.direction_id {
+                0 => EvidenceSummary::default(),
+                direction_id => evidence
+                    .by_direction
+                    .get(&direction_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            },
             readiness: lane_verdict.readiness,
             reasons: lane_verdict.reasons.clone(),
         });
@@ -225,6 +240,8 @@ async fn project(
         reasons: verdict.reasons,
         active_lane_count: verdict.active_lane_count,
         lanes,
+        issue_evidence: evidence.issue,
+        evidence_scan_truncated: evidence.truncated,
     })
 }
 
@@ -257,7 +274,7 @@ async fn upstream_direction_ids(db: &Db, direction_id: i32) -> Result<Vec<i32>> 
         .collect())
 }
 
-/// One scan of the issue's Evidence, bucketed per lane.
+/// One issue-wide Evidence scan, split into per-lane buckets and the issue's own.
 ///
 /// Read once for the whole issue rather than per lane: an issue with many lanes
 /// would otherwise re-query the same table once per row on the path that paints
@@ -269,13 +286,29 @@ async fn upstream_direction_ids(db: &Db, direction_id: i32) -> Result<Vec<i32>> 
 /// `evidence_freshness` then fails closed to `unknown` for its
 /// revision-anchored rows — the same answer `list_evidence` gives when it
 /// cannot probe.
-async fn evidence_by_direction(
-    db: &Db,
-    thread_id: i32,
-    facts: &[LaneFacts],
-) -> Result<HashMap<i32, EvidenceSummary>> {
+///
+/// `direction_id == 0` rows are the ISSUE's own evidence, never a lane's. They
+/// are kept separately rather than bucketed with the rest, because every
+/// virtual lane also carries `direction_id == 0`: bucketing by that id would
+/// hand the unbound-PR row, the issue-wide ask row and each unmaterialized
+/// proposed lane one shared summary of evidence none of them produced — the
+/// same collision the verdict join above is written to avoid.
+struct EvidenceScan {
+    by_direction: HashMap<i32, EvidenceSummary>,
+    issue: EvidenceSummary,
+    /// The scan hit its bound, so these counts are of the newest
+    /// [`EVIDENCE_SCAN_LIMIT`] rows for the ISSUE, not of everything. A lane
+    /// whose rows all fell past the cut then reads as having none, which is a
+    /// different claim from the truth; the flag lets the reader know.
+    truncated: bool,
+}
+
+async fn evidence_scan(db: &Db, thread_id: i32, facts: &[LaneFacts]) -> Result<EvidenceScan> {
     let mut head_shas_by_direction: HashMap<i32, HashMap<&str, &str>> = HashMap::new();
     for fact in facts {
+        if fact.direction_id == 0 {
+            continue;
+        }
         let entry = head_shas_by_direction.entry(fact.direction_id).or_default();
         for checkout in fact.checkouts.iter().flatten() {
             if let Some(observed) = checkout.observed.as_ref() {
@@ -285,9 +318,11 @@ async fn evidence_by_direction(
     }
 
     let rows = repo::list_evidence(db, thread_id, None, EVIDENCE_SCAN_LIMIT).await?;
+    let truncated = rows.len() as u64 >= EVIDENCE_SCAN_LIMIT;
     let now_secs = now_unix_secs();
     let host_max_age_secs = repo::evidence_host_max_age_secs();
-    let mut out: HashMap<i32, EvidenceSummary> = HashMap::new();
+    let mut by_direction: HashMap<i32, EvidenceSummary> = HashMap::new();
+    let mut issue = EvidenceSummary::default();
     for row in rows {
         let current_revision = head_shas_by_direction
             .get(&row.direction_id)
@@ -295,19 +330,49 @@ async fn evidence_by_direction(
             .copied();
         let freshness =
             repo::evidence_freshness(&row, current_revision, now_secs, host_max_age_secs);
-        let entry = out.entry(row.direction_id).or_default();
+        let entry = match row.direction_id {
+            0 => &mut issue,
+            direction_id => by_direction.entry(direction_id).or_default(),
+        };
         match freshness {
             repo::EvidenceFreshness::Fresh => entry.fresh += 1,
             repo::EvidenceFreshness::Stale => entry.stale += 1,
             repo::EvidenceFreshness::Unknown => entry.unknown += 1,
         }
-        // Rows arrive newest-first, so the first one seen for a lane is its
-        // newest and must not be overwritten by the older ones behind it.
-        if entry.newest_observed_at.is_none() {
-            entry.newest_observed_at = Some(row.observed_at.clone());
-        }
+        note_newest_observation(entry, &row.observed_at);
     }
-    Ok(out)
+    Ok(EvidenceScan {
+        by_direction,
+        issue,
+        truncated,
+    })
+}
+
+/// Keep the greatest `observed_at`, comparing as the unix seconds the column
+/// stores.
+///
+/// Deliberately NOT "the first row wins": `list_evidence` orders by id, and
+/// `append_evidence` refreshes an existing row's `observed_at` in place on a
+/// dedupe hit without changing its id. Id order is therefore not observation
+/// order, and taking the first row would report a re-confirmed fact as older
+/// than it is. A value that does not parse cannot be compared, so it is only
+/// used when nothing else has been recorded.
+fn note_newest_observation(summary: &mut EvidenceSummary, observed_at: &str) {
+    let Some(current) = summary.newest_observed_at.as_deref() else {
+        summary.newest_observed_at = Some(observed_at.to_string());
+        return;
+    };
+    let candidate = observed_at.trim().parse::<i64>().ok();
+    let held = current.trim().parse::<i64>().ok();
+    let replace = match (candidate, held) {
+        (Some(candidate), Some(held)) => candidate > held,
+        // A comparable observation always beats one we cannot place in time.
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if replace {
+        summary.newest_observed_at = Some(observed_at.to_string());
+    }
 }
 
 /// A clock read that cannot fail. A system clock before the epoch would make
@@ -665,5 +730,109 @@ mod tests {
             .expect("project");
         assert_eq!(change_set.lanes[0].evidence, EvidenceSummary::default());
         assert_eq!(change_set.lanes[0].evidence.newest_observed_at, None);
+    }
+}
+
+#[cfg(test)]
+mod evidence_attribution_tests {
+    use super::*;
+    use crate::readiness::{issue_readiness, ExecutionReconciliation, OpenPrSnapshotFreshness, PolicyDecision};
+
+    fn virtual_lane(name: &str) -> LaneFacts {
+        LaneFacts {
+            direction_id: 0,
+            name: name.to_string(),
+            active: true,
+            policy: PolicyDecision::AllowedByPolicy,
+            worker_failed: false,
+            worker_active: false,
+            has_open_ask: false,
+            reconciliation: ExecutionReconciliation::Matched,
+            checks: CheckEvidence::NotApplicable,
+            upstream: UpstreamEvidence::Satisfied,
+            open_pr_snapshot_freshness: OpenPrSnapshotFreshness::MaxAge {
+                now_secs: 1_000,
+                max_age_secs: 180,
+            },
+            pull_requests: Vec::new(),
+            direction_status: "working".to_string(),
+            checkouts: None,
+        }
+    }
+
+    /// The issue's own rows belong to the issue. Bucketing them by
+    /// `direction_id` would hand every virtual lane the same summary of
+    /// evidence none of them produced.
+    #[tokio::test]
+    async fn issue_level_evidence_is_never_charged_to_a_virtual_lane() {
+        let db = Db::connect("sqlite::memory:").await.expect("memory db");
+        let workspace = repo::create_workspace(&db, "issue evidence attribution")
+            .await
+            .expect("workspace");
+        let thread = repo::create_thread(&db, workspace.id, "attribution", "feature/x", "claude")
+            .await
+            .expect("thread");
+        repo::append_evidence(
+            &db,
+            repo::EvidenceWrite {
+                thread_id: thread.id,
+                direction_id: 0,
+                kind: repo::EVIDENCE_KIND_DECISION,
+                source: "test",
+                source_ref: "",
+                revision: "",
+                policy_revision: "",
+                summary: "issue-wide decision",
+                payload: "{}",
+                collection_state: repo::EVIDENCE_COLLECTION_OK,
+            },
+        )
+        .await
+        .expect("issue evidence");
+
+        let facts = vec![virtual_lane("unbound pr"), virtual_lane("issue ask")];
+        let verdict = issue_readiness(&facts);
+        let change_set = project(&db, thread.id, verdict, &facts)
+            .await
+            .expect("project");
+
+        assert_eq!(change_set.lanes.len(), 2);
+        for lane in &change_set.lanes {
+            assert_eq!(
+                lane.evidence,
+                EvidenceSummary::default(),
+                "a virtual lane produces no evidence of its own"
+            );
+        }
+        assert_eq!(change_set.issue_evidence.fresh, 1);
+        assert_eq!(change_set.issue_evidence.newest_observed_at.is_some(), true);
+        assert!(!change_set.evidence_scan_truncated);
+    }
+
+    /// `list_evidence` orders by id, but `append_evidence` refreshes
+    /// `observed_at` in place on a dedupe hit without moving the id. Taking the
+    /// first row would report a re-confirmed fact as older than it is.
+    #[test]
+    fn newest_observation_compares_time_not_scan_order() {
+        let mut summary = EvidenceSummary::default();
+        note_newest_observation(&mut summary, "1000");
+        note_newest_observation(&mut summary, "3000");
+        note_newest_observation(&mut summary, "2000");
+        assert_eq!(summary.newest_observed_at.as_deref(), Some("3000"));
+    }
+
+    #[test]
+    fn an_uncomparable_timestamp_never_displaces_a_comparable_one() {
+        let mut summary = EvidenceSummary::default();
+        note_newest_observation(&mut summary, "not-a-time");
+        assert_eq!(summary.newest_observed_at.as_deref(), Some("not-a-time"));
+        note_newest_observation(&mut summary, "1000");
+        assert_eq!(
+            summary.newest_observed_at.as_deref(),
+            Some("1000"),
+            "a comparable observation beats one that cannot be placed in time"
+        );
+        note_newest_observation(&mut summary, "garbage");
+        assert_eq!(summary.newest_observed_at.as_deref(), Some("1000"));
     }
 }
