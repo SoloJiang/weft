@@ -51,36 +51,56 @@ export interface ChangeSetWave {
  * order: showing them in one honest block beats dropping them or inventing an
  * order the edges do not support. Ordering is otherwise stable — ties keep
  * their incoming order, so a refresh never reshuffles the panel.
+ *
+ * Lanes are tracked by POSITION, never by `direction_id`. Virtual lanes — the
+ * unbound-PR row, the issue-wide ask row, every proposed lane not yet
+ * materialized — all carry `direction_id === 0`, so an id-keyed collection
+ * would collapse them into one and drop the rest off the screen entirely.
  */
 export function laneWaves(lanes: ChangeSetLane[]): ChangeSetWave[] {
-  const present = new Set(lanes.map((lane) => lane.direction_id));
-  const pending = new Map<number, ChangeSetLane>();
+  // Only a materialized lane can be depended ON: `direction_id === 0` names no
+  // lane, and the backend already drops those edges, so nothing points here.
+  const positionsById = new Map<number, number[]>();
+  lanes.forEach((lane, position) => {
+    if (lane.direction_id === 0) return;
+    const existing = positionsById.get(lane.direction_id);
+    if (existing) {
+      existing.push(position);
+      return;
+    }
+    positionsById.set(lane.direction_id, [position]);
+  });
+
+  const pending = new Set<number>(lanes.map((_lane, position) => position));
   const blockers = new Map<number, Set<number>>();
-  for (const lane of lanes) {
-    pending.set(lane.direction_id, lane);
-    blockers.set(
-      lane.direction_id,
-      new Set(lane.depends_on.filter((id) => id !== lane.direction_id && present.has(id))),
-    );
-  }
+  lanes.forEach((lane, position) => {
+    const blocking = new Set<number>();
+    for (const upstreamId of lane.depends_on) {
+      for (const upstreamPosition of positionsById.get(upstreamId) ?? []) {
+        // A self-edge would deadlock a lane against itself forever.
+        if (upstreamPosition !== position) blocking.add(upstreamPosition);
+      }
+    }
+    blockers.set(position, blocking);
+  });
 
   const waves: ChangeSetWave[] = [];
   while (pending.size > 0) {
-    const ready = [...pending.values()].filter(
-      (lane) => (blockers.get(lane.direction_id)?.size ?? 0) === 0,
+    const ready = [...pending].filter(
+      (position) => (blockers.get(position)?.size ?? 0) === 0,
     );
     if (ready.length === 0) {
       // Every lane left is in or behind a cycle. Emit them as one wave.
-      waves.push({ lanes: [...pending.values()] });
+      waves.push({ lanes: [...pending].map((position) => lanes[position]) });
       break;
     }
-    waves.push({ lanes: ready });
-    for (const lane of ready) {
-      pending.delete(lane.direction_id);
+    waves.push({ lanes: ready.map((position) => lanes[position]) });
+    for (const position of ready) {
+      pending.delete(position);
     }
     for (const remaining of blockers.values()) {
-      for (const lane of ready) {
-        remaining.delete(lane.direction_id);
+      for (const position of ready) {
+        remaining.delete(position);
       }
     }
   }

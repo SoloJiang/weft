@@ -108,6 +108,46 @@ test("a self-edge cannot deadlock its own lane", () => {
   );
 });
 
+test("virtual lanes sharing direction_id 0 all survive the layout", () => {
+  // The unbound-PR row, the issue-wide ask row and every unmaterialized
+  // proposed lane ALL carry direction_id 0. Tracking lanes by id would collapse
+  // them into one and silently drop the rest off the panel.
+  const waves = laneWaves([
+    lane({ direction_id: 0, name: "unbound pr" }),
+    lane({ direction_id: 0, name: "issue ask" }),
+    lane({ direction_id: 0, name: "proposed api" }),
+  ]);
+  assert.deepEqual(
+    waves.map((wave) => wave.lanes.map((l) => l.name)),
+    [["unbound pr", "issue ask", "proposed api"]],
+  );
+});
+
+test("virtual lanes still lay out beside real dependent lanes", () => {
+  const waves = laneWaves([
+    lane({ direction_id: 0, name: "unbound pr" }),
+    lane({ direction_id: 4, name: "api" }),
+    lane({ direction_id: 0, name: "issue ask" }),
+    lane({ direction_id: 5, name: "ui", depends_on: [4] }),
+  ]);
+  assert.deepEqual(
+    waves.map((wave) => wave.lanes.map((l) => l.name)),
+    [["unbound pr", "api", "issue ask"], ["ui"]],
+  );
+});
+
+test("a cycle among lanes that share direction_id 0 still emits each one once", () => {
+  const waves = laneWaves([
+    lane({ direction_id: 0, name: "virtual a" }),
+    lane({ direction_id: 1, name: "x", depends_on: [2] }),
+    lane({ direction_id: 0, name: "virtual b" }),
+    lane({ direction_id: 2, name: "y", depends_on: [1] }),
+  ]);
+  const names = waves.flatMap((wave) => wave.lanes.map((l) => l.name));
+  assert.deepEqual(names.sort(), ["virtual a", "virtual b", "x", "y"]);
+  assert.equal(new Set(names).size, 4);
+});
+
 test("not-probed and probed-but-empty stay distinct checkout states", () => {
   assert.deepEqual(laneCheckoutView(lane({ direction_id: 1 })), { kind: "not_probed" });
   assert.deepEqual(

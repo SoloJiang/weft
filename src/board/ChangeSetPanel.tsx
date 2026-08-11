@@ -109,15 +109,21 @@ function ChangeSetBody({
             </span>
           </header>
           {state.waves.map((wave, index) => (
-            <section key={wave.lanes.map((lane) => lane.direction_id).join("-")} className="flex flex-col gap-2">
+            // Keyed by position: several lanes can share direction_id 0, so an
+            // id-derived key is not unique among siblings.
+            <section key={`wave-${index}`} className="flex flex-col gap-2">
               <div className="flex items-center gap-2 text-[10.5px] font-semibold uppercase tracking-wider text-ink-faint">
                 <span>{t("changeSet.wave", { index: index + 1 })}</span>
                 {index > 0 && <ArrowRight size={11} aria-hidden="true" />}
                 {index > 0 && <span className="normal-case tracking-normal font-normal">{t("changeSet.waveWaits")}</span>}
               </div>
               <div className="flex flex-col gap-2">
-                {wave.lanes.map((lane) => (
-                  <LaneRow key={`${lane.direction_id}:${lane.name}`} lane={lane} onOpenLane={onOpenLane} />
+                {wave.lanes.map((lane, position) => (
+                  <LaneRow
+                    key={`${lane.direction_id}:${lane.name}:${position}`}
+                    lane={lane}
+                    onOpenLane={onOpenLane}
+                  />
                 ))}
               </div>
             </section>
