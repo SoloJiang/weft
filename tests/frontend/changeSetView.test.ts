@@ -2,6 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { ChangeSetLane, IssueChangeSet, LaneCheckout } from "../../src/lib/types.ts";
 import {
+  deliveryFromChangeSet,
+  deliveryFromReadiness,
+} from "../../src/board/issueDelivery.ts";
+import {
   changeSetPanelState,
   hasEvidence,
   laneCheckoutView,
@@ -200,22 +204,63 @@ test("the declared-branch highlight marks the row that differs and never guesses
 });
 
 test("panel state is one discriminated value across the fetch lifecycle", () => {
-  assert.deepEqual(changeSetPanelState("loading", null), { kind: "loading" });
-  assert.deepEqual(changeSetPanelState("rejected", null), { kind: "error" });
-  assert.deepEqual(changeSetPanelState("resolved", null), { kind: "empty" });
-  assert.deepEqual(changeSetPanelState("resolved", changeSet([])), { kind: "empty" });
+  assert.deepEqual(changeSetPanelState({ kind: "loading" }), { kind: "loading" });
+  assert.deepEqual(changeSetPanelState({ kind: "failed" }), { kind: "error" });
+  assert.deepEqual(
+    changeSetPanelState({ kind: "ready", dto: deliveryFromChangeSet(changeSet([])) }),
+    { kind: "empty" },
+  );
 
-  const ready = changeSetPanelState("resolved", changeSet([lane({ direction_id: 1 })]));
+  const ready = changeSetPanelState({
+    kind: "ready",
+    dto: deliveryFromChangeSet(changeSet([lane({ direction_id: 1 })])),
+  });
   assert.equal(ready.kind, "ready");
   assert.equal(ready.kind === "ready" ? ready.waves.length : 0, 1);
 });
 
-test("a resolved-but-stale payload never leaks through a later rejection", () => {
-  // The panel keeps its last payload while re-fetching; a rejected fetch must
-  // still read as an error rather than silently re-showing old facts.
-  assert.deepEqual(changeSetPanelState("rejected", changeSet([lane({ direction_id: 1 })])), {
-    kind: "error",
+test("a readiness-only read reads as loading, never as an empty change set", () => {
+  // The board issues ONE command per refresh. Right after the tab opens, the
+  // read in hand may still be the readiness one, which carries no change set.
+  // Calling that "empty" would claim this issue writes nothing.
+  const readinessOnly = deliveryFromReadiness({
+    readiness: "blocked",
+    reasons: [{ code: "upstream_unmet", direction_id: 2 }],
+    active_lane_count: 2,
+    lanes: [
+      { direction_id: 1, name: "api", readiness: "unknown", reasons: [] },
+      { direction_id: 2, name: "ui", readiness: "blocked", reasons: [] },
+    ],
   });
+  assert.equal(readinessOnly.changeSet, null);
+  assert.deepEqual(changeSetPanelState({ kind: "ready", dto: readinessOnly }), { kind: "loading" });
+});
+
+test("both reads feed the readiness chip identically, so chip and panel cannot disagree", () => {
+  const cs = changeSet([lane({ direction_id: 1, readiness: "blocked" })]);
+  cs.readiness = "blocked";
+  cs.reasons = [{ code: "upstream_unmet", direction_id: 1 }];
+  const fromChangeSet = deliveryFromChangeSet(cs);
+  const fromReadiness = deliveryFromReadiness({
+    readiness: cs.readiness,
+    reasons: cs.reasons,
+    active_lane_count: cs.active_lane_count,
+    lanes: cs.lanes.map((l) => ({
+      direction_id: l.direction_id,
+      name: l.name,
+      readiness: l.readiness,
+      reasons: l.reasons,
+    })),
+  });
+  assert.equal(fromChangeSet.readiness, fromReadiness.readiness);
+  assert.deepEqual(fromChangeSet.reasons, fromReadiness.reasons);
+  assert.deepEqual(fromChangeSet.lanes, fromReadiness.lanes);
+});
+
+test("a rejected read never re-shows the last payload as current", () => {
+  // readinessKey.ts contract: a refresh never presents a prior verdict as
+  // current evidence.
+  assert.deepEqual(changeSetPanelState({ kind: "failed" }), { kind: "error" });
 });
 
 test("no evidence at all is distinct from evidence that is merely untrustworthy", () => {

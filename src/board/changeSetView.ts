@@ -1,8 +1,6 @@
-import type {
-  ChangeSetLane,
-  IssueChangeSet,
-  LaneCheckout,
-} from "../lib/types";
+import type { ChangeSetLane, IssueChangeSet, LaneCheckout } from "../lib/types";
+import type { ReadinessFetchState } from "../lib/readinessKey";
+import type { IssueDelivery } from "./issueDelivery";
 
 /**
  * Pure derivations for the Issue Change Set panel (issue #175).
@@ -12,8 +10,9 @@ import type {
  * each multi-way state is derived ONCE here as a discriminated value rather
  * than as booleans re-tested at each call site (CLAUDE.md).
  *
- * The fetch lives in the panel component; this stays a pure function of its
- * input, the same split `ReadinessChip`/`EvidenceBody` already use.
+ * The fetch lives in `ThreadBoard` — ONE per refresh, see `issueDelivery.ts` —
+ * so this stays a pure function of its input, the same split
+ * `ReadinessChip`/`EvidenceBody` already use.
  */
 
 /** One discriminated read state for the whole panel. */
@@ -23,13 +22,23 @@ export type ChangeSetPanelState =
   | { kind: "empty" }
   | { kind: "ready"; changeSet: IssueChangeSet; waves: ChangeSetWave[] };
 
+/**
+ * Collapse the board's ONE delivery read into the panel's state.
+ *
+ * A `ready` read whose `changeSet` is `null` came from the readiness command,
+ * not the Change Set command — the tab was not open when it was issued. That
+ * is a refresh still in flight, not an empty issue, so it reads `loading`:
+ * calling it `empty` would tell the user this issue writes nothing, which is a
+ * different and wrong claim.
+ */
 export function changeSetPanelState(
-  fetchStatus: "loading" | "resolved" | "rejected",
-  changeSet: IssueChangeSet | null,
+  read: ReadinessFetchState<IssueDelivery>,
 ): ChangeSetPanelState {
-  if (fetchStatus === "loading") return { kind: "loading" };
-  if (fetchStatus === "rejected") return { kind: "error" };
-  if (!changeSet || changeSet.lanes.length === 0) return { kind: "empty" };
+  if (read.kind === "loading") return { kind: "loading" };
+  if (read.kind === "failed") return { kind: "error" };
+  const changeSet = read.dto.changeSet;
+  if (!changeSet) return { kind: "loading" };
+  if (changeSet.lanes.length === 0) return { kind: "empty" };
   return { kind: "ready", changeSet, waves: laneWaves(changeSet.lanes) };
 }
 

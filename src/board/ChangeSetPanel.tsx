@@ -1,15 +1,14 @@
-import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ArrowRight, GitBranch, GitPullRequest, ScanEye } from "lucide-react";
 import type {
   ChangeSetLane,
   CheckEvidence,
   ExecutionReconciliation,
-  IssueChangeSet,
   UpstreamEvidence,
 } from "../lib/types";
-import { api } from "../lib/api";
+import type { ReadinessFetchState } from "../lib/readinessKey";
 import { ReadinessChip } from "../components/ReadinessChip";
+import type { IssueDelivery } from "./issueDelivery";
 import { cn } from "../lib/cn";
 import {
   changeSetPanelState,
@@ -25,55 +24,29 @@ import {
  * issue — write scope and why, dependency order, declared-vs-observed
  * checkout, evidence trust, host state, and what is left.
  *
- * Every verdict shown here was decided by the backend. This component fetches
- * and renders; `changeSetView` does the derivations. It never recomputes a
- * readiness boolean from the facts beside it.
+ * A pure function of the board's single delivery read — the same split
+ * `ReadinessChip` and `EvidenceBody` use. It deliberately does NOT fetch:
+ * `issue_change_set` and `issue_readiness` run the same collection and the same
+ * Git probes, so a second fetch here would contend with the board's own and
+ * make this panel disagree with the chip above it (see `issueDelivery.ts`).
+ * Every verdict shown was decided by the backend; `changeSetView` only shapes
+ * it. Nothing here recomputes a readiness boolean.
  */
 export function ChangeSetPanel({
-  threadId,
-  refreshKey,
+  state,
   onOpenLane,
 }: {
-  threadId: number;
-  /**
-   * The board's readiness refresh key. Re-reading on exactly the signals that
-   * invalidate readiness — a lane status, a worktree row, a worker session, the
-   * plan, a host PR change, the poll tick — keeps this view consistent with the
-   * chip beside it instead of inventing a second, divergent invalidation rule.
-   */
-  refreshKey: string;
+  state: ReadinessFetchState<IssueDelivery>;
   onOpenLane: (directionId: number, repoId: number) => void;
 }) {
   const { t } = useTranslation();
-  const [fetchStatus, setFetchStatus] = useState<"loading" | "resolved" | "rejected">("loading");
-  const [changeSet, setChangeSet] = useState<IssueChangeSet | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    setFetchStatus("loading");
-    api
-      .issueChangeSet(threadId)
-      .then((result) => {
-        if (cancelled) return;
-        setChangeSet(result);
-        setFetchStatus("resolved");
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setFetchStatus("rejected");
-      });
-    return () => {
-      cancelled = true;
-    };
-    // A refresh never presents a prior verdict as current evidence
-    // (`readinessKey.ts`), so a key change blanks back to loading rather than
-    // leaving the last read on screen labelled as now.
-  }, [threadId, refreshKey]);
-
-  const state = changeSetPanelState(fetchStatus, changeSet);
   return (
     <div className="min-h-0 flex-1 overflow-auto px-5 py-4">
-      <ChangeSetBody state={state} onOpenLane={onOpenLane} emptyLabel={t("changeSet.empty")} />
+      <ChangeSetBody
+        state={changeSetPanelState(state)}
+        onOpenLane={onOpenLane}
+        emptyLabel={t("changeSet.empty")}
+      />
     </div>
   );
 }
