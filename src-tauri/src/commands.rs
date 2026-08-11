@@ -2723,6 +2723,26 @@ pub async fn issue_readiness(
     collect_issue_readiness(&db, &bus, &asks, thread_id).await
 }
 
+/// The whole issue's delivery overview (issue #175): the same verdict
+/// `issue_readiness` returns, plus the facts it was derived from — write
+/// scope, why each repo, dependency order, declared-vs-observed checkout,
+/// evidence trust and remaining work.
+///
+/// A separate command rather than a widening of `issue_readiness`: that one is
+/// polled per thread by the board surfaces, and the extra store reads here
+/// belong on the screen that asked for them, not on every poll.
+#[tauri::command]
+pub async fn issue_change_set(
+    db: State<'_, Db>,
+    bus: State<'_, crate::bus::BusRegistry>,
+    asks: State<'_, crate::ask::AskRegistry>,
+    thread_id: i32,
+) -> R<crate::change_set::IssueChangeSet> {
+    crate::change_set::collect(&db, &bus, &asks, thread_id)
+        .await
+        .map_err(e)
+}
+
 /// The lead's proposed decomposition for a thread, resolved against the
 /// workspace repos (ARCHITECTURE §4.10, §5.1). None if nothing proposed yet.
 #[tauri::command]

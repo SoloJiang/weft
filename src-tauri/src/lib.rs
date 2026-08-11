@@ -14,6 +14,7 @@ mod auth_persist;
 pub mod backup;
 mod brief;
 pub mod bus;
+pub mod change_set;
 mod check;
 mod checkpoint;
 mod claude;
@@ -294,6 +295,7 @@ pub fn run() {
             commands::update_repo_profile,
             commands::list_directions,
             commands::issue_readiness,
+            commands::issue_change_set,
             commands::set_task_status,
             commands::worktree_diff,
             commands::worktree_diff_target,
