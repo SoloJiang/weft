@@ -270,6 +270,18 @@ export type LaneEvidenceView =
   | { kind: "unscanned" }
   | { kind: "counts"; fresh: number; stale: number; unknown: number };
 
+/**
+ * The issue's own evidence, under the same rule as a lane's: an all-zero count
+ * from a TRUNCATED scan is not a complete zero, so it must not be presented as
+ * "there is none" — nor silently hidden, which asserts the same thing.
+ */
+export function issueEvidenceView(changeSet: IssueChangeSet): LaneEvidenceView {
+  const { fresh, stale, unknown } = changeSet.issue_evidence;
+  if (fresh + stale + unknown > 0) return { kind: "counts", fresh, stale, unknown };
+  if (changeSet.evidence_scan_truncated) return { kind: "unscanned" };
+  return { kind: "none" };
+}
+
 export function laneEvidenceView(
   lane: ChangeSetLane,
   scanTruncated: boolean,

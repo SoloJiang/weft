@@ -15,6 +15,7 @@ import { cn } from "../lib/cn";
 import {
   changeSetPanelState,
   laneCheckoutView,
+  issueEvidenceView,
   laneEvidenceView,
   laneStatusView,
   type ChangeSetPanelState,
@@ -248,12 +249,25 @@ function LaneRow({
  */
 function IssueEvidence({ changeSet }: { changeSet: IssueChangeSet }) {
   const { t } = useTranslation();
-  const { fresh, stale, unknown } = changeSet.issue_evidence;
-  if (fresh + stale + unknown === 0) return null;
+  // Same three-way distinction the lane rows make: zero counts under a
+  // truncated scan is "we did not see it all", not "there is none". Hiding the
+  // row entirely in that case would be the stronger, wrong claim.
+  const view = issueEvidenceView(changeSet);
+  if (view.kind === "none") return null;
   return (
     <div className="flex flex-wrap items-center gap-2 text-[10.5px] text-ink-faint">
       <span className="font-medium text-ink-muted">{t("changeSet.issueEvidence")}</span>
-      <span>{t("changeSet.evidenceCounts", { fresh, stale, unknown })}</span>
+      {view.kind === "unscanned" ? (
+        <span>{t("changeSet.evidenceUnscanned")}</span>
+      ) : (
+        <span>
+          {t("changeSet.evidenceCounts", {
+            fresh: view.fresh,
+            stale: view.stale,
+            unknown: view.unknown,
+          })}
+        </span>
+      )}
     </div>
   );
 }

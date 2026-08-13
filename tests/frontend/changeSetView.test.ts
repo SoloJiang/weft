@@ -7,6 +7,7 @@ import {
 } from "../../src/board/issueDelivery.ts";
 import {
   changeSetPanelState,
+  issueEvidenceView,
   laneCheckoutView,
   laneEvidenceView,
   laneStatusView,
@@ -394,4 +395,27 @@ test("an issue with no lanes still carries its issue-level evidence", () => {
     state.kind === "empty" ? state.changeSet.issue_evidence : null,
     { fresh: 2, stale: 1, unknown: 0, newest_observed_at: "1700000000" },
   );
+});
+
+test("issue-level evidence uses the same three-way rule as a lane", () => {
+  const complete = changeSet([]);
+  assert.deepEqual(issueEvidenceView(complete), { kind: "none" });
+
+  const truncated = changeSet([]);
+  truncated.evidence_scan_truncated = true;
+  assert.deepEqual(
+    issueEvidenceView(truncated),
+    { kind: "unscanned" },
+    "an all-zero count under a truncated scan is not a complete zero",
+  );
+
+  const counted = changeSet([]);
+  counted.evidence_scan_truncated = true;
+  counted.issue_evidence = { fresh: 1, stale: 2, unknown: 0, newest_observed_at: "1700000000" };
+  assert.deepEqual(issueEvidenceView(counted), {
+    kind: "counts",
+    fresh: 1,
+    stale: 2,
+    unknown: 0,
+  });
 });

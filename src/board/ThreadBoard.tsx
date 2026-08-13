@@ -205,13 +205,23 @@ export function ThreadBoard() {
       deliveryView === "changeSet"
         ? api.issueChangeSet(request.threadId).then(deliveryFromChangeSet)
         : api.issueReadiness(request.threadId).then(deliveryFromReadiness);
-    // Chain off whatever is still running so two collections never overlap. The
-    // previous read's own failure is not this one's, hence the swallow.
-    const read = deliveryReadChainRef.current.catch(() => {}).then(issue);
+    // Chain off whatever is still running so two collections never overlap, but
+    // re-check cancellation at the FRONT of the turn: an effect invalidated
+    // while queued must become a no-op, not a backend call nobody is waiting
+    // for. Without that, rapid tab/issue switching (or a collection outliving
+    // the 60s poll) would queue an obsolete command per refresh, and the newest
+    // visible request would wait behind all of them. The previous read's own
+    // failure is not this one's, hence the swallow.
+    const read = deliveryReadChainRef.current.catch(() => {}).then(() => {
+      if (cancelled) {
+        return null;
+      }
+      return issue();
+    });
     deliveryReadChainRef.current = read.catch(() => {});
     void read
       .then((delivery) => {
-        if (cancelled) {
+        if (cancelled || delivery === null) {
           return;
         }
         storeResponse(completeReadinessRefresh(delivery));
