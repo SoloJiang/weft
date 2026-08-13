@@ -18,6 +18,7 @@ import {
   issueEvidenceView,
   laneEvidenceView,
   laneStatusView,
+  waveStepNumbers,
   type ChangeSetPanelState,
   type CheckoutRowView,
   type ChangeSetWave,
@@ -80,7 +81,8 @@ function ChangeSetBody({
           <IssueEvidence changeSet={state.changeSet} />
         </div>
       );
-    case "ready":
+    case "ready": {
+      const stepNumbers = waveStepNumbers(state.waves);
       return (
         <div className="flex flex-col gap-4">
           <header className="flex flex-wrap items-center gap-2">
@@ -98,7 +100,7 @@ function ChangeSetBody({
             // Keyed by position: several lanes can share direction_id 0, so an
             // id-derived key is not unique among siblings.
             <section key={`wave-${index}`} className="flex flex-col gap-2">
-              <WaveHeader wave={wave} index={index} />
+              <WaveHeader wave={wave} step={stepNumbers[index]} />
               <div className="flex flex-col gap-2">
                 {wave.lanes.map((lane, position) => (
                   <LaneRow
@@ -113,13 +115,14 @@ function ChangeSetBody({
           ))}
         </div>
       );
+    }
   }
 }
 
 /** A cycle is not a step, so it never gets a step number or the
  *  "waits on the step above" caption — both would describe an order that does
  *  not exist. */
-function WaveHeader({ wave, index }: { wave: ChangeSetWave; index: number }) {
+function WaveHeader({ wave, step }: { wave: ChangeSetWave; step: number | null }) {
   const { t } = useTranslation();
   if (wave.kind === "cycle") {
     return (
@@ -133,9 +136,9 @@ function WaveHeader({ wave, index }: { wave: ChangeSetWave; index: number }) {
   }
   return (
     <div className="flex items-center gap-2 text-[10.5px] font-semibold uppercase tracking-wider text-ink-faint">
-      <span>{t("changeSet.wave", { index: index + 1 })}</span>
-      {index > 0 && <ArrowRight size={11} aria-hidden="true" />}
-      {index > 0 && (
+      <span>{t("changeSet.wave", { index: step ?? 1 })}</span>
+      {(step ?? 1) > 1 && <ArrowRight size={11} aria-hidden="true" />}
+      {(step ?? 1) > 1 && (
         <span className="normal-case tracking-normal font-normal">{t("changeSet.waveWaits")}</span>
       )}
     </div>

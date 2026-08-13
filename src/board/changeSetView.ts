@@ -275,6 +275,22 @@ export type LaneEvidenceView =
  * from a TRUNCATED scan is not a complete zero, so it must not be presented as
  * "there is none" — nor silently hidden, which asserts the same thing.
  */
+/**
+ * Display ordinals for a wave list. A cycle has no step number — it is not a
+ * step anyone can take — so it must not consume one either, or the executable
+ * wave after an A<->B cycle reads "step 2, waits on the step above" when no
+ * step 1 was ever shown. Returns null for cycles, 1-based counting over the
+ * parallel waves only.
+ */
+export function waveStepNumbers(waves: ChangeSetWave[]): (number | null)[] {
+  let step = 0;
+  return waves.map((wave) => {
+    if (wave.kind === "cycle") return null;
+    step += 1;
+    return step;
+  });
+}
+
 export function issueEvidenceView(changeSet: IssueChangeSet): LaneEvidenceView {
   const { fresh, stale, unknown } = changeSet.issue_evidence;
   if (fresh + stale + unknown > 0) return { kind: "counts", fresh, stale, unknown };

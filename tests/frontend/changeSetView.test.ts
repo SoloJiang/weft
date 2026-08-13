@@ -8,6 +8,7 @@ import {
 import {
   changeSetPanelState,
   issueEvidenceView,
+  waveStepNumbers,
   laneCheckoutView,
   laneEvidenceView,
   laneStatusView,
@@ -418,4 +419,25 @@ test("issue-level evidence uses the same three-way rule as a lane", () => {
     stale: 2,
     unknown: 0,
   });
+});
+
+test("a cycle consumes no step number", () => {
+  // An A<->B cycle followed by an executable wave must not render that wave as
+  // "step 2 ... waits on the step above" when no step 1 was ever shown.
+  assert.deepEqual(
+    waveStepNumbers([
+      { kind: "cycle", lanes: [] },
+      { kind: "parallel", lanes: [] },
+    ] as never),
+    [null, 1],
+  );
+  assert.deepEqual(
+    waveStepNumbers([
+      { kind: "parallel", lanes: [] },
+      { kind: "cycle", lanes: [] },
+      { kind: "parallel", lanes: [] },
+    ] as never),
+    [1, null, 2],
+    "an independent first wave must not make the wave after a cycle skip to step 3",
+  );
 });
