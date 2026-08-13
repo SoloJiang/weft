@@ -114,6 +114,13 @@ export function ThreadBoard() {
   const [readinessPollRevision, setReadinessPollRevision] = useState(0);
   const activeThreadIdRef = useRef<number | null>(activeThreadId);
   const readinessRequestRevisionRef = useRef(0);
+  // Serializes delivery reads. Cancelling an effect only discards the RESPONSE;
+  // the backend collection keeps running, so starting the next one immediately
+  // (a tab switch mid-flight, or a poll tick landing on a long collection) puts
+  // two collections on the same worktrees and brings back the probe contention
+  // the single-read design exists to remove. Each read waits for the previous
+  // to settle before issuing.
+  const deliveryReadChainRef = useRef<Promise<unknown>>(Promise.resolve());
   activeThreadIdRef.current = activeThreadId;
   const activeDirections = activeThreadId == null ? [] : directionsByThread[activeThreadId] ?? [];
   // Include issue/lead attention too. It has no materialized direction card,
@@ -194,10 +201,14 @@ export function ThreadBoard() {
     };
     // ONE command per refresh. See `issueDelivery.ts`: running both against the
     // same thread makes their Git probes contend and the two surfaces disagree.
-    const read =
+    const issue = () =>
       deliveryView === "changeSet"
         ? api.issueChangeSet(request.threadId).then(deliveryFromChangeSet)
         : api.issueReadiness(request.threadId).then(deliveryFromReadiness);
+    // Chain off whatever is still running so two collections never overlap. The
+    // previous read's own failure is not this one's, hence the swallow.
+    const read = deliveryReadChainRef.current.catch(() => {}).then(issue);
+    deliveryReadChainRef.current = read.catch(() => {});
     void read
       .then((delivery) => {
         if (cancelled) {

@@ -19,7 +19,7 @@ import type { IssueDelivery } from "./issueDelivery";
 export type ChangeSetPanelState =
   | { kind: "loading" }
   | { kind: "error" }
-  | { kind: "empty" }
+  | { kind: "empty"; changeSet: IssueChangeSet }
   | { kind: "ready"; changeSet: IssueChangeSet; waves: ChangeSetWave[] };
 
 /**
@@ -38,7 +38,10 @@ export function changeSetPanelState(
   if (read.kind === "failed") return { kind: "error" };
   const changeSet = read.dto.changeSet;
   if (!changeSet) return { kind: "loading" };
-  if (changeSet.lanes.length === 0) return { kind: "empty" };
+  // Still carries the change set: an issue with no lanes can hold issue-level
+  // evidence, and dropping it here would make the panel claim there is nothing
+  // to show while records exist.
+  if (changeSet.lanes.length === 0) return { kind: "empty", changeSet };
   return { kind: "ready", changeSet, waves: laneWaves(changeSet.lanes) };
 }
 

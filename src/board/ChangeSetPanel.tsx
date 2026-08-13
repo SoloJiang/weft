@@ -4,6 +4,7 @@ import type {
   ChangeSetLane,
   ChangeSetPullRequest,
   CheckEvidence,
+  IssueChangeSet,
   ExecutionReconciliation,
   UpstreamEvidence,
 } from "../lib/types";
@@ -72,7 +73,12 @@ function ChangeSetBody({
     case "error":
       return <div className="text-[12px] text-danger">{t("changeSet.loadFailed")}</div>;
     case "empty":
-      return <div className="text-[12px] text-ink-faint">{emptyLabel}</div>;
+      return (
+        <div className="flex flex-col gap-2">
+          <div className="text-[12px] text-ink-faint">{emptyLabel}</div>
+          <IssueEvidence changeSet={state.changeSet} />
+        </div>
+      );
     case "ready":
       return (
         <div className="flex flex-col gap-4">
@@ -86,6 +92,7 @@ function ChangeSetBody({
               {t("changeSet.laneCount", { count: state.changeSet.active_lane_count })}
             </span>
           </header>
+          <IssueEvidence changeSet={state.changeSet} />
           {state.waves.map((wave, index) => (
             // Keyed by position: several lanes can share direction_id 0, so an
             // id-derived key is not unique among siblings.
@@ -232,6 +239,25 @@ function LaneRow({
   );
 }
 
+/**
+ * Evidence recorded against the ISSUE rather than any lane — host rows for an
+ * unbound PR, issue-wide asks. The backend keeps these out of the lane
+ * summaries on purpose (no lane produced them), so without a home here they
+ * would vanish from the overview entirely, and an issue with no lanes would
+ * report as empty while still holding records.
+ */
+function IssueEvidence({ changeSet }: { changeSet: IssueChangeSet }) {
+  const { t } = useTranslation();
+  const { fresh, stale, unknown } = changeSet.issue_evidence;
+  if (fresh + stale + unknown === 0) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-[10.5px] text-ink-faint">
+      <span className="font-medium text-ink-muted">{t("changeSet.issueEvidence")}</span>
+      <span>{t("changeSet.evidenceCounts", { fresh, stale, unknown })}</span>
+    </div>
+  );
+}
+
 /** Evidence trust, mapped exhaustively — "none recorded" is only ever claimed
  *  when the scan was complete enough to support it. */
 function EvidenceCounts({ view }: { view: LaneEvidenceView }) {
@@ -276,6 +302,12 @@ const THREADS_KEYS: Record<string, string> = {
   unresolved: "changeSet.pr.threadsUnresolved",
 };
 
+const LIFECYCLE_KEYS: Record<string, string> = {
+  open: "changeSet.pr.lifecycleOpen",
+  closed: "changeSet.pr.lifecycleClosed",
+  merged: "changeSet.pr.lifecycleMerged",
+};
+
 const CONFLICT_KEYS: Record<string, string> = {
   unknown: "changeSet.pr.conflictUnknown",
   clean: "changeSet.pr.conflictClean",
@@ -305,6 +337,11 @@ function PullRequestRow({ pr }: { pr: ChangeSetPullRequest }) {
           {pr.title}
         </span>
       )}
+      {/* Lifecycle first: a PR closed without merging drives the lane verdict
+          on its own, and without it that row can read entirely green. */}
+      <span className={pr.lifecycle === "closed" ? "text-danger" : undefined}>
+        {t(pr.lifecycle ? LIFECYCLE_KEYS[pr.lifecycle] ?? "changeSet.pr.lifecycleUnknown" : "changeSet.pr.lifecycleUnknown")}
+      </span>
       <span>{axis(CI_KEYS, pr.ci.state)}</span>
       <span>{axis(REVIEW_KEYS, pr.review.state)}</span>
       <span>{axis(THREADS_KEYS, pr.threads.state)}</span>

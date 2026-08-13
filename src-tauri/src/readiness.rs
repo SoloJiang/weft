@@ -3604,7 +3604,9 @@ pub async fn collect_with_check_execution(
     thread_id: i32,
     check_execution: CheckExecution,
 ) -> Result<IssueReadinessDto> {
-    Ok(collect_facts_and_readiness(db, bus, asks, thread_id, check_execution).await?.0)
+    Ok(collect_facts_and_readiness(db, bus, asks, thread_id, check_execution)
+        .await?
+        .verdict)
 }
 
 /// The verdict AND the facts it was derived from.
@@ -3614,13 +3616,29 @@ pub async fn collect_with_check_execution(
 /// #175) wants exactly those discarded facts, and re-deriving them in a second
 /// pass would mean two answers that can disagree — the drift this module
 /// exists to prevent. One collection, two projections.
+/// One collection's verdict, the facts behind it, and the rows it was built
+/// from.
+///
+/// `directions` is returned rather than left for a caller to re-read because a
+/// second read is a SECOND GENERATION: a proposal confirmed or a lane deleted
+/// between the two would let a projection attach a freshly created direction's
+/// repo, branch and dependencies to a lane whose facts were collected when it
+/// did not exist — a row half from each generation, which is exactly the drift
+/// this module exists to prevent.
+pub struct CollectedIssue {
+    pub verdict: IssueReadinessDto,
+    pub facts: Vec<LaneFacts>,
+    /// Sorted by id, exactly as the collection consumed them.
+    pub directions: Vec<direction::Model>,
+}
+
 pub async fn collect_facts_and_readiness(
     db: &Db,
     bus: &BusRegistry,
     asks: &AskRegistry,
     thread_id: i32,
     check_execution: CheckExecution,
-) -> Result<(IssueReadinessDto, Vec<LaneFacts>)> {
+) -> Result<CollectedIssue> {
     if repo::get_thread(db, thread_id).await?.is_none() {
         return Err(anyhow!("thread {thread_id} not found"));
     }
@@ -3769,7 +3787,11 @@ pub async fn collect_facts_and_readiness(
     if has_issue_open_ask {
         facts.push(virtual_issue_ask_lane(open_pr_snapshot_freshness));
     }
-    Ok((issue_readiness(&facts), facts))
+    Ok(CollectedIssue {
+        verdict: issue_readiness(&facts),
+        facts,
+        directions,
+    })
 }
 
 #[cfg(test)]

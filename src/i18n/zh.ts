@@ -1115,7 +1115,12 @@ export const zh = {
     evidenceUnscanned: "证据未完整扫描",
     cycle: "循环依赖",
     cycleBody: "这些任务互相等待——没有任何顺序能满足",
+    issueEvidence: "Issue 级证据",
     pr: {
+      lifecycleOpen: "开启中",
+      lifecycleClosed: "已关闭（未合并）",
+      lifecycleMerged: "已合并",
+      lifecycleUnknown: "生命周期未知",
       unidentified: "PR（记录缺失）",
       probeFailed: "host 探测失败",
       stateUnknown: "状态未知",

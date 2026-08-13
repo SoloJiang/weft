@@ -162,7 +162,7 @@ pub struct IssueChangeSet {
     pub evidence_scan_truncated: bool,
 }
 
-/// How many Evidence rows one scan may return, for the WHOLE issue.
+/// How many Evidence rows one scan SUMMARIZES, for the WHOLE issue.
 ///
 /// Bounded so a long-running issue cannot make the first screen slow. The bound
 /// is per issue while the summaries are per lane, so a busy lane can push a
@@ -180,7 +180,7 @@ pub async fn collect(
     asks: &crate::ask::AskRegistry,
     thread_id: i32,
 ) -> Result<IssueChangeSet> {
-    let (verdict, facts) = crate::readiness::collect_facts_and_readiness(
+    let collected = crate::readiness::collect_facts_and_readiness(
         db,
         bus,
         asks,
@@ -188,20 +188,34 @@ pub async fn collect(
         CheckExecution::RunAllowed,
     )
     .await?;
-    project(db, thread_id, verdict, &facts).await
+    project(
+        db,
+        thread_id,
+        collected.verdict,
+        &collected.facts,
+        &collected.directions,
+    )
+    .await
 }
 
 /// Join the collected facts with the rows that describe WHERE each lane writes.
 ///
 /// Split out from [`collect`] so the projection can be exercised against
 /// constructed facts without standing up a real collection.
+///
+/// Takes the collection's own `directions` snapshot; see [`CollectedIssue`].
 async fn project(
     db: &Db,
     thread_id: i32,
     verdict: IssueReadinessDto,
     facts: &[LaneFacts],
+    directions: &[crate::store::entities::direction::Model],
 ) -> Result<IssueChangeSet> {
-    let directions = repo::list_directions(db, thread_id).await?;
+    // The SAME direction rows the collection consumed, never a second read.
+    // Re-reading here would be a second generation: a proposal confirmed or a
+    // lane deleted in between would let this attach a freshly created
+    // direction's repo, branch and dependencies to a lane whose facts were
+    // collected when it did not exist — half of each generation in one row.
     let directions_by_id: HashMap<i32, &crate::store::entities::direction::Model> =
         directions.iter().map(|row| (row.id, row)).collect();
     let evidence = evidence_scan(db, thread_id, facts).await?;
@@ -408,8 +422,14 @@ async fn evidence_scan(db: &Db, thread_id: i32, facts: &[LaneFacts]) -> Result<E
         }
     }
 
-    let rows = repo::list_evidence(db, thread_id, None, EVIDENCE_SCAN_LIMIT).await?;
-    let truncated = rows.len() as u64 >= EVIDENCE_SCAN_LIMIT;
+    // Read ONE row past the bound purely as a sentinel: an issue with exactly
+    // EVIDENCE_SCAN_LIMIT rows was scanned completely, and calling that
+    // truncated would make every quiet lane read "not fully scanned" when the
+    // count is in fact exact. Only the first EVIDENCE_SCAN_LIMIT rows are
+    // summarized.
+    let mut rows = repo::list_evidence(db, thread_id, None, EVIDENCE_SCAN_LIMIT + 1).await?;
+    let truncated = rows.len() as u64 > EVIDENCE_SCAN_LIMIT;
+    rows.truncate(EVIDENCE_SCAN_LIMIT as usize);
     let now_secs = now_unix_secs();
     let host_max_age_secs = repo::evidence_host_max_age_secs();
     let mut by_direction: HashMap<i32, EvidenceSummary> = HashMap::new();
@@ -569,7 +589,7 @@ mod tests {
         let facts = vec![fact];
         let verdict = issue_readiness(&facts);
 
-        let change_set = project(&db, thread_id, verdict.clone(), &facts)
+        let change_set = project(&db, thread_id, verdict.clone(), &facts, &repo::list_directions(&db, thread_id).await.expect("directions"))
             .await
             .expect("project");
         assert_eq!(change_set.readiness, verdict.readiness);
@@ -603,7 +623,7 @@ mod tests {
             "fixture must produce two DIFFERENT verdicts for the join to be observable"
         );
 
-        let change_set = project(&db, thread_id, verdict.clone(), &facts)
+        let change_set = project(&db, thread_id, verdict.clone(), &facts, &repo::list_directions(&db, thread_id).await.expect("directions"))
             .await
             .expect("project");
         assert_eq!(change_set.lanes.len(), 2);
@@ -626,7 +646,7 @@ mod tests {
         let facts = vec![lane_facts(kept.id, "impl"), inactive];
         let verdict = issue_readiness(&facts);
 
-        let change_set = project(&db, thread_id, verdict, &facts)
+        let change_set = project(&db, thread_id, verdict, &facts, &repo::list_directions(&db, thread_id).await.expect("directions"))
             .await
             .expect("project");
         assert_eq!(change_set.lanes.len(), 1);
@@ -651,7 +671,7 @@ mod tests {
         let facts = vec![fact];
         let verdict = issue_readiness(&facts);
 
-        let change_set = project(&db, thread_id, verdict, &facts)
+        let change_set = project(&db, thread_id, verdict, &facts, &repo::list_directions(&db, thread_id).await.expect("directions"))
             .await
             .expect("project");
         let lane = &change_set.lanes[0];
@@ -679,7 +699,7 @@ mod tests {
         let facts = vec![lane_facts(unprobed.id, "unprobed"), probed_empty];
         let verdict = issue_readiness(&facts);
 
-        let change_set = project(&db, thread_id, verdict, &facts)
+        let change_set = project(&db, thread_id, verdict, &facts, &repo::list_directions(&db, thread_id).await.expect("directions"))
             .await
             .expect("project");
         assert_eq!(change_set.lanes[0].checkout.observed, None);
@@ -707,7 +727,7 @@ mod tests {
 
         let facts = vec![lane_facts(upstream.id, "api"), lane_facts(consumer.id, "ui")];
         let verdict = issue_readiness(&facts);
-        let change_set = project(&db, thread_id, verdict, &facts)
+        let change_set = project(&db, thread_id, verdict, &facts, &repo::list_directions(&db, thread_id).await.expect("directions"))
             .await
             .expect("project");
         assert_eq!(change_set.lanes[0].depends_on, Vec::<i32>::new());
@@ -761,7 +781,7 @@ mod tests {
 
         let facts = vec![lane_facts(direction.id, "impl")];
         let verdict = issue_readiness(&facts);
-        let change_set = project(&db, thread.id, verdict, &facts)
+        let change_set = project(&db, thread.id, verdict, &facts, &repo::list_directions(&db, thread.id).await.expect("directions"))
             .await
             .expect("project");
 
@@ -810,7 +830,7 @@ mod tests {
         let facts = vec![matching_fact, drifted_fact];
         let verdict = issue_readiness(&facts);
 
-        let change_set = project(&db, thread_id, verdict, &facts)
+        let change_set = project(&db, thread_id, verdict, &facts, &repo::list_directions(&db, thread_id).await.expect("directions"))
             .await
             .expect("project");
         assert_eq!(change_set.lanes[0].evidence.fresh, 1);
@@ -832,7 +852,7 @@ mod tests {
         assert_eq!(facts[0].checkouts, None, "this lane must be unprobed");
         let verdict = issue_readiness(&facts);
 
-        let change_set = project(&db, thread_id, verdict, &facts)
+        let change_set = project(&db, thread_id, verdict, &facts, &repo::list_directions(&db, thread_id).await.expect("directions"))
             .await
             .expect("project");
         assert_eq!(change_set.lanes[0].evidence.unknown, 1);
@@ -858,7 +878,7 @@ mod tests {
 
         let facts = vec![lane_facts(direction.id, "impl")];
         let verdict = issue_readiness(&facts);
-        let change_set = project(&db, thread_id, verdict, &facts)
+        let change_set = project(&db, thread_id, verdict, &facts, &repo::list_directions(&db, thread_id).await.expect("directions"))
             .await
             .expect("project");
         assert_eq!(
@@ -877,7 +897,7 @@ mod tests {
 
         let facts = vec![lane_facts(direction.id, "impl")];
         let verdict = issue_readiness(&facts);
-        let change_set = project(&db, thread_id, verdict, &facts)
+        let change_set = project(&db, thread_id, verdict, &facts, &repo::list_directions(&db, thread_id).await.expect("directions"))
             .await
             .expect("project");
         assert_eq!(change_set.lanes[0].evidence, EvidenceSummary::default());
@@ -945,7 +965,7 @@ mod evidence_attribution_tests {
 
         let facts = vec![virtual_lane("unbound pr"), virtual_lane("issue ask")];
         let verdict = issue_readiness(&facts);
-        let change_set = project(&db, thread.id, verdict, &facts)
+        let change_set = project(&db, thread.id, verdict, &facts, &repo::list_directions(&db, thread.id).await.expect("directions"))
             .await
             .expect("project");
 

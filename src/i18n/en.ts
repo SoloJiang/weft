@@ -1158,7 +1158,12 @@ export const en = {
     evidenceUnscanned: "evidence not fully scanned",
     cycle: "Circular dependency",
     cycleBody: "these lanes wait on each other — no order can satisfy them",
+    issueEvidence: "Issue-level evidence",
     pr: {
+      lifecycleOpen: "open",
+      lifecycleClosed: "closed without merging",
+      lifecycleMerged: "merged",
+      lifecycleUnknown: "lifecycle unknown",
       unidentified: "PR (record missing)",
       probeFailed: "host probe failed",
       stateUnknown: "state unknown",

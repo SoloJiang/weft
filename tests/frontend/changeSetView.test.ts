@@ -245,10 +245,11 @@ test("the declared-branch highlight marks the row that differs and never guesses
 test("panel state is one discriminated value across the fetch lifecycle", () => {
   assert.deepEqual(changeSetPanelState({ kind: "loading" }), { kind: "loading" });
   assert.deepEqual(changeSetPanelState({ kind: "failed" }), { kind: "error" });
-  assert.deepEqual(
-    changeSetPanelState({ kind: "ready", dto: deliveryFromChangeSet(changeSet([])) }),
-    { kind: "empty" },
-  );
+  const emptyState = changeSetPanelState({
+    kind: "ready",
+    dto: deliveryFromChangeSet(changeSet([])),
+  });
+  assert.equal(emptyState.kind, "empty");
 
   const ready = changeSetPanelState({
     kind: "ready",
@@ -379,4 +380,18 @@ test("an unmaterialized lane never presents readiness sentinel as a lifecycle", 
     direction_status: "working",
   });
   assert.equal(laneStatusView(virtualLane), "not_materialized");
+});
+
+test("an issue with no lanes still carries its issue-level evidence", () => {
+  // Host rows for an unbound PR and issue-wide asks are recorded against the
+  // issue, not a lane. Dropping the change set on the empty branch would make
+  // the panel claim there is nothing to show while records exist.
+  const cs = changeSet([]);
+  cs.issue_evidence = { fresh: 2, stale: 1, unknown: 0, newest_observed_at: "1700000000" };
+  const state = changeSetPanelState({ kind: "ready", dto: deliveryFromChangeSet(cs) });
+  assert.equal(state.kind, "empty");
+  assert.deepEqual(
+    state.kind === "empty" ? state.changeSet.issue_evidence : null,
+    { fresh: 2, stale: 1, unknown: 0, newest_observed_at: "1700000000" },
+  );
 });
