@@ -332,7 +332,8 @@ pub struct ReadinessReason {
 }
 
 /// The verification evidence available for one direction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CheckEvidence {
     /// Checks are intentionally not run until a lane claims completion.
     NotApplicable,
@@ -353,7 +354,8 @@ pub enum CheckExecution {
 }
 
 /// The durable single-predecessor result normalized for lane readiness.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UpstreamEvidence {
     Satisfied,
     Unmet,
@@ -391,7 +393,7 @@ impl OpenPrSnapshotFreshness {
 /// The PR facts consumed by the pure readiness function. `probe_failed` is
 /// true whenever the latest host probe failed; stored axes from a previous
 /// success are not treated as fresh evidence after that failure.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestFacts {
     /// Persisted primary key, used only to make multi-PR ties deterministic.
     pub id: i32,
@@ -404,6 +406,34 @@ pub struct PullRequestFacts {
     /// Parsed unix-seconds probe timestamp. Empty or invalid stored text is
     /// deliberately `None` so an open row cannot become fresh by accident.
     pub last_checked_at: Option<i64>,
+}
+
+/// What the shared signature probe actually found in one registered worktree.
+///
+/// `None` means the probe could not sample the checkout at all — the directory
+/// is gone, or it is no longer a Git worktree. That is a different situation
+/// from a checkout that IS there and merely disagrees with what the lane
+/// declared, and collapsing the two would hide the more urgent one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckoutSignature {
+    pub branch: String,
+    pub head_sha: String,
+    pub dirty: bool,
+}
+
+/// One registered worktree of a lane, as observed.
+///
+/// `reconciliation_for` reduces the whole set of these to a single word. The
+/// rows behind that word are kept on the facts rather than re-probed by a
+/// second reader: a second probe is a second answer that can disagree with the
+/// first, and it pays for the same `git` calls twice. `repo_name` is keyed the
+/// same way evidence rows key `source_ref`, so a reader can judge
+/// revision-anchored evidence against `head_sha` without probing again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneCheckout {
+    pub repo_name: String,
+    pub path: String,
+    pub observed: Option<CheckoutSignature>,
 }
 
 /// All non-I/O facts required to decide one direction.
@@ -422,6 +452,15 @@ pub struct LaneFacts {
     pub open_pr_snapshot_freshness: OpenPrSnapshotFreshness,
     pub pull_requests: Vec<PullRequestFacts>,
     pub direction_status: String,
+    /// The samples `reconciliation` was reduced from.
+    ///
+    /// `None` on every path that returned before the probe ran (inactive or
+    /// denied lane, a verdict already decided by a preempting gate,
+    /// `CachedOnly`); `Some(vec![])` when the probe DID run and the lane has no
+    /// registered worktree yet. `reconciliation` reads `Unknown` for both, so
+    /// without this distinction a reader cannot tell "we did not look" from
+    /// "there is nothing there yet" — and those need different next actions.
+    pub checkouts: Option<Vec<LaneCheckout>>,
 }
 
 /// The DTO for one included lane.
@@ -909,6 +948,9 @@ fn virtual_lane_facts(
         // policy-allowed virtual lane must therefore land at InProgress after
         // all explicit gates have passed.
         direction_status: "working".to_string(),
+        // A virtual lane has no persisted direction and so no registered
+        // worktree to sample: not-sampled is the truthful state, not "none".
+        checkouts: None,
     }
 }
 
@@ -1729,6 +1771,23 @@ struct ProbedWorktree {
     repo: String,
     stored_path: String,
     signature: Option<GitWorktreeSignature>,
+}
+
+/// The public projection of one probe sample, for readers that need the rows
+/// `reconciliation_for` reduced away.
+fn lane_checkout(probed: &ProbedWorktree) -> LaneCheckout {
+    LaneCheckout {
+        repo_name: probed.repo.clone(),
+        path: probed.stored_path.clone(),
+        observed: probed
+            .signature
+            .as_ref()
+            .map(|signature| CheckoutSignature {
+                branch: signature.branch.clone(),
+                head_sha: signature.head_sha.clone(),
+                dirty: signature.dirty,
+            }),
+    }
 }
 
 async fn probe_worktrees_for_direction(
@@ -3353,6 +3412,7 @@ async fn collect_lane(
             open_pr_snapshot_freshness,
             pull_requests: Vec::new(),
             direction_status: direction.status.clone(),
+            checkouts: None,
         });
     }
     let worker = latest_worker_facts(db, direction.id).await?;
@@ -3375,6 +3435,9 @@ async fn collect_lane(
         open_pr_snapshot_freshness,
         pull_requests: Vec::new(),
         direction_status: direction.status.clone(),
+        // Set only once the shared probe below has actually sampled, for the
+        // same reason `reconciliation` starts Unknown.
+        checkouts: None,
     };
 
     // Match lane_readiness's first-match order before touching local Git. At
@@ -3412,6 +3475,7 @@ async fn collect_lane(
 
     let worktrees = probe_worktrees_for_direction(db, direction.id, git_probe).await?;
     facts.reconciliation = reconciliation_for(direction, &worktrees);
+    facts.checkouts = Some(worktrees.iter().map(lane_checkout).collect());
     // Evidence write site 2 (issue #174 R1-04). Only reached on the
     // `RunAllowed` path (`CachedOnly` already returned above without
     // probing) — the CachedOnly global/tool status reader stays read-only in
@@ -3540,6 +3604,41 @@ pub async fn collect_with_check_execution(
     thread_id: i32,
     check_execution: CheckExecution,
 ) -> Result<IssueReadinessDto> {
+    Ok(collect_facts_and_readiness(db, bus, asks, thread_id, check_execution)
+        .await?
+        .verdict)
+}
+
+/// The verdict AND the facts it was derived from.
+///
+/// `collect_with_check_execution` computes a full set of `LaneFacts` and then
+/// discards everything the verdict did not need. The Change Set view (issue
+/// #175) wants exactly those discarded facts, and re-deriving them in a second
+/// pass would mean two answers that can disagree — the drift this module
+/// exists to prevent. One collection, two projections.
+/// One collection's verdict, the facts behind it, and the rows it was built
+/// from.
+///
+/// `directions` is returned rather than left for a caller to re-read because a
+/// second read is a SECOND GENERATION: a proposal confirmed or a lane deleted
+/// between the two would let a projection attach a freshly created direction's
+/// repo, branch and dependencies to a lane whose facts were collected when it
+/// did not exist — a row half from each generation, which is exactly the drift
+/// this module exists to prevent.
+pub struct CollectedIssue {
+    pub verdict: IssueReadinessDto,
+    pub facts: Vec<LaneFacts>,
+    /// Sorted by id, exactly as the collection consumed them.
+    pub directions: Vec<direction::Model>,
+}
+
+pub async fn collect_facts_and_readiness(
+    db: &Db,
+    bus: &BusRegistry,
+    asks: &AskRegistry,
+    thread_id: i32,
+    check_execution: CheckExecution,
+) -> Result<CollectedIssue> {
     if repo::get_thread(db, thread_id).await?.is_none() {
         return Err(anyhow!("thread {thread_id} not found"));
     }
@@ -3688,7 +3787,11 @@ pub async fn collect_with_check_execution(
     if has_issue_open_ask {
         facts.push(virtual_issue_ask_lane(open_pr_snapshot_freshness));
     }
-    Ok(issue_readiness(&facts))
+    Ok(CollectedIssue {
+        verdict: issue_readiness(&facts),
+        facts,
+        directions,
+    })
 }
 
 #[cfg(test)]
@@ -3726,6 +3829,7 @@ mod tests {
             open_pr_snapshot_freshness: open_pr_snapshot_freshness(1_000, 60),
             pull_requests: Vec::new(),
             direction_status: "review".to_string(),
+            checkouts: None,
         }
     }
 

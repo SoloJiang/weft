@@ -7934,6 +7934,19 @@ pub async fn list_pull_requests_for_direction(
         .await?)
 }
 
+/// Every tracked PR/MR row for one issue, across all its Lanes — including
+/// rows whose `direction_id` no longer names a live Lane, which is the same
+/// survives-Lane-removal posture `list_evidence` takes.
+pub async fn list_pull_requests_for_thread(
+    db: &Db,
+    thread_id: i32,
+) -> Result<Vec<pull_request::Model>> {
+    Ok(pull_request::Entity::find()
+        .filter(pull_request::Column::ThreadId.eq(thread_id))
+        .all(&db.0)
+        .await?)
+}
+
 pub async fn list_pull_requests_for_workspace(
     db: &Db,
     workspace_id: i32,

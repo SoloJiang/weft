@@ -5,6 +5,7 @@ import {
   Info,
   Languages,
   LayoutGrid,
+  ListChecks,
   MessagesSquare,
   Monitor,
   Moon,
@@ -98,6 +99,12 @@ export function AppTopBar() {
       dot: proposalPending ? "bg-accent" : null,
     },
     { key: "board" as const, label: t("thread.tabBoard"), icon: LayoutGrid, dot: null as string | null },
+    {
+      key: "changeset" as const,
+      label: t("changeSet.tab"),
+      icon: ListChecks,
+      dot: null as string | null,
+    },
   ];
   return (
     <>

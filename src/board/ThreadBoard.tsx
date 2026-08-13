@@ -23,7 +23,6 @@ import {
 import { attentionDirectionId, attentionThreadId, useStore } from "../state/store";
 import type {
   Direction,
-  IssueReadinessDto,
   LaneReadiness,
   RepoChecks,
   SessionStatus,
@@ -37,6 +36,13 @@ import { Tooltip } from "../components/ui/Tooltip";
 import { EvidencePanel } from "../components/EvidencePanel";
 import { ToolIcon, toolFullName } from "../components/ToolIcon";
 import { ReadinessChip } from "../components/ReadinessChip";
+import { ChangeSetPanel } from "./ChangeSetPanel";
+import {
+  deliveryFromChangeSet,
+  deliveryFromReadiness,
+  type IssueDelivery,
+  type IssueDeliveryView,
+} from "./issueDelivery";
 import { ScopeReview } from "./ScopeReview";
 import { DeleteWorktreeDialog, RenameDialog } from "../nav/dialogs";
 import { LeadTab } from "../session/LeadTab";
@@ -96,17 +102,25 @@ export function ThreadBoard() {
     checksByDirection,
     worktreesByDirection,
     sessions,
+    viewDirection,
   } = useStore();
   const { t } = useTranslation();
   const thread = threads.find((th) => th.id === activeThreadId);
   const [renamingDirectionId, setRenamingDirectionId] = useState<number | null>(null);
   const [storedIssueReadiness, setStoredIssueReadiness] = useState<
-    StoredReadiness<IssueReadinessDto> | null
+    StoredReadiness<IssueDelivery> | null
   >(null);
   const [prReadinessRevision, setPrReadinessRevision] = useState(0);
   const [readinessPollRevision, setReadinessPollRevision] = useState(0);
   const activeThreadIdRef = useRef<number | null>(activeThreadId);
   const readinessRequestRevisionRef = useRef(0);
+  // Serializes delivery reads. Cancelling an effect only discards the RESPONSE;
+  // the backend collection keeps running, so starting the next one immediately
+  // (a tab switch mid-flight, or a poll tick landing on a long collection) puts
+  // two collections on the same worktrees and brings back the probe contention
+  // the single-read design exists to remove. Each read waits for the previous
+  // to settle before issuing.
+  const deliveryReadChainRef = useRef<Promise<unknown>>(Promise.resolve());
   activeThreadIdRef.current = activeThreadId;
   const activeDirections = activeThreadId == null ? [] : directionsByThread[activeThreadId] ?? [];
   // Include issue/lead attention too. It has no materialized direction card,
@@ -125,6 +139,10 @@ export function ThreadBoard() {
   if (proposal) {
     planReadinessSignature = `${proposal.status}:${proposal.created_at}`;
   }
+  // The open tab decides WHICH command the single refresh issues, so it is part
+  // of the refresh identity: switching to the Change Set must re-read, and
+  // switching away must not keep re-reading the heavier command.
+  const deliveryView: IssueDeliveryView = threadTab === "changeset" ? "changeSet" : "readiness";
   const readinessKey = buildReadinessKey({
     directions: activeDirections,
     attentionIds,
@@ -138,12 +156,13 @@ export function ThreadBoard() {
     planStatus: planReadinessSignature,
     prRevision: prReadinessRevision,
   });
+  const deliveryKey = `${readinessKey}|view:${deliveryView}`;
   const visibleReadiness = selectVisibleReadiness(
     storedIssueReadiness,
     activeThreadId,
-    readinessKey,
+    deliveryKey,
   );
-  let issueReadiness: IssueReadinessDto | null = null;
+  let issueReadiness: IssueDelivery | null = null;
   if (visibleReadiness.kind === "ready") {
     issueReadiness = visibleReadiness.dto;
   }
@@ -158,7 +177,7 @@ export function ThreadBoard() {
       threadId: activeThreadId,
       revision: readinessRequestRevisionRef.current + 1,
     };
-    const requestKey = readinessKey;
+    const requestKey = deliveryKey;
     readinessRequestRevisionRef.current = request.revision;
     setStoredIssueReadiness({
       threadId: request.threadId,
@@ -166,7 +185,7 @@ export function ThreadBoard() {
       state: beginReadinessRefresh(),
     });
     let cancelled = false;
-    const storeResponse = (state: ReadinessFetchState<IssueReadinessDto>) => {
+    const storeResponse = (state: ReadinessFetchState<IssueDelivery>) => {
       setStoredIssueReadiness((current) => {
         if (
           !isReadinessResponseApplicable(
@@ -180,13 +199,32 @@ export function ThreadBoard() {
         return { threadId: request.threadId, key: requestKey, state };
       });
     };
-    void api
-      .issueReadiness(request.threadId)
-      .then((readiness) => {
-        if (cancelled) {
+    // ONE command per refresh. See `issueDelivery.ts`: running both against the
+    // same thread makes their Git probes contend and the two surfaces disagree.
+    const issue = () =>
+      deliveryView === "changeSet"
+        ? api.issueChangeSet(request.threadId).then(deliveryFromChangeSet)
+        : api.issueReadiness(request.threadId).then(deliveryFromReadiness);
+    // Chain off whatever is still running so two collections never overlap, but
+    // re-check cancellation at the FRONT of the turn: an effect invalidated
+    // while queued must become a no-op, not a backend call nobody is waiting
+    // for. Without that, rapid tab/issue switching (or a collection outliving
+    // the 60s poll) would queue an obsolete command per refresh, and the newest
+    // visible request would wait behind all of them. The previous read's own
+    // failure is not this one's, hence the swallow.
+    const read = deliveryReadChainRef.current.catch(() => {}).then(() => {
+      if (cancelled) {
+        return null;
+      }
+      return issue();
+    });
+    deliveryReadChainRef.current = read.catch(() => {});
+    void read
+      .then((delivery) => {
+        if (cancelled || delivery === null) {
           return;
         }
-        storeResponse(completeReadinessRefresh(readiness));
+        storeResponse(completeReadinessRefresh(delivery));
       })
       .catch(() => {
         if (cancelled) {
@@ -197,7 +235,7 @@ export function ThreadBoard() {
     return () => {
       cancelled = true;
     };
-  }, [activeThreadId, readinessKey, readinessPollRevision]);
+  }, [activeThreadId, deliveryKey, deliveryView, readinessPollRevision]);
 
   useEffect(() => {
     if (activeThreadId == null) {
@@ -280,6 +318,11 @@ export function ThreadBoard() {
   // of these is showing, so confirming a split never yanks you off the chat.
   const renderTabBody = () => {
     if (threadTab === "lead") return <LeadTab />;
+    if (threadTab === "changeset") {
+      return (
+        <ChangeSetPanel state={visibleReadiness} onOpenLane={viewDirection} />
+      );
+    }
     if (dirs.length === 0) return <EmptyDiscuss onTalk={() => setThreadTab("lead")} />;
     return (
       <div className="min-h-0 flex-1 overflow-auto">

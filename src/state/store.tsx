@@ -75,7 +75,7 @@ import type {
 } from "../lib/types";
 
 export type HomeTab = "board" | "repos" | "settings";
-export type ThreadTab = "lead" | "board";
+export type ThreadTab = "lead" | "board" | "changeset";
 export interface NotificationHydration {
   workspaceId: number | null;
   /** Global permission asks have completed one authoritative pull. */

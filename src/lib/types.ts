@@ -338,6 +338,104 @@ export interface IssueReadinessDto {
   lanes: LaneReadinessDto[];
 }
 
+/** Issue Change Set (issue #175) — mirrors Rust `change_set::IssueChangeSet`.
+ *  Every field is either a stored row or a value `readiness` already decided;
+ *  nothing here is re-derived, so the frontend must not recompute a verdict
+ *  from the facts beside it. */
+export type ExecutionReconciliation = "matched" | "drifted" | "unknown";
+export type CheckEvidence = "not_applicable" | "not_produced" | "passed" | "failing";
+export type UpstreamEvidence = "satisfied" | "unmet" | "unknown";
+
+export interface CheckoutSignature {
+  branch: string;
+  head_sha: string;
+  dirty: boolean;
+}
+
+export interface LaneCheckout {
+  repo_name: string;
+  path: string;
+  /** `null` when the probe could not sample this checkout at all — the
+   *  directory is gone, or it is no longer a Git worktree. */
+  observed: CheckoutSignature | null;
+}
+
+export interface ChangeSetCheckout {
+  declared_base: string;
+  declared_branch: string;
+  /** `null` = this collection never probed the lane; `[]` = probed, nothing
+   *  registered yet. Two different situations; never collapse them. */
+  observed: LaneCheckout[] | null;
+}
+
+export interface ChangeSetEvidenceSummary {
+  fresh: number;
+  stale: number;
+  unknown: number;
+  newest_observed_at: string | null;
+}
+
+export interface ChangeSetLane {
+  direction_id: number;
+  name: string;
+  /** `0` when the lane's write repo does not resolve — the row is missing, or
+   *  the direction retained a dangling id. Never hand this to a navigator
+   *  without checking it. Carried beside the name because two repos may share
+   *  a display name; only the id is unique. */
+  repo_id: number;
+  repo_name: string;
+  reason: string;
+  /** `false` for a lane readiness synthesized (unbound PR, issue-wide ask, a
+   *  proposed lane not yet materialized). Its `direction_status` is then a
+   *  fail-closed SENTINEL, not a lifecycle a worker reached. */
+  materialized: boolean;
+  checkout: ChangeSetCheckout;
+  depends_on: number[];
+  direction_status: string;
+  reconciliation: ExecutionReconciliation;
+  checks: CheckEvidence;
+  upstream: UpstreamEvidence;
+  pull_requests: ChangeSetPullRequest[];
+  evidence: ChangeSetEvidenceSummary;
+  readiness: LaneReadiness;
+  reasons: ReadinessReason[];
+}
+
+/** The host axes behind a lane's verdict. Each is `{ state, ... }` tagged by
+ *  the backend so an `unknown` carries its own reason instead of collapsing
+ *  into a pass or a fail. */
+export type HostAxis<TState extends string> = { state: TState } & Record<string, unknown>;
+
+export interface ChangeSetPullRequest {
+  id: number;
+  /** `0` when the stored row behind this verdict no longer resolves — the axes
+   *  are still the verdict's, only the identity is missing. */
+  number: number;
+  url: string;
+  title: string;
+  /** `owner/repo` on the host, which can differ from weft's local repo name. */
+  host_slug: string;
+  lifecycle: "open" | "closed" | "merged" | null;
+  ci: HostAxis<"unknown" | "not_configured" | "pending" | "passing" | "failing">;
+  review: HostAxis<"unknown" | "changes_requested" | "awaiting_approval" | "approved">;
+  threads: HostAxis<"unchecked" | "unknown" | "all_resolved" | "unresolved">;
+  conflict: HostAxis<"unknown" | "clean" | "conflicting">;
+  probe_failed: boolean;
+}
+
+export interface IssueChangeSet {
+  readiness: IssueReadiness;
+  reasons: ReadinessReason[];
+  active_lane_count: number;
+  lanes: ChangeSetLane[];
+  /** Evidence recorded against the ISSUE rather than any one lane. */
+  issue_evidence: ChangeSetEvidenceSummary;
+  /** The evidence scan hit its bound, so a lane reporting zero rows may simply
+   *  have had all of its rows fall past the cut. Never render that as "no
+   *  evidence recorded". */
+  evidence_scan_truncated: boolean;
+}
+
 /** Minimal Evidence ledger (issue #174 R1-04) — mirrors Rust
  *  `commands::EvidenceRowDto` field-for-field. `direction_id === 0` is
  *  issue-level evidence (not owned by any single Lane). */
