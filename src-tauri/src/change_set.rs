@@ -77,6 +77,32 @@ pub struct CheckoutFacts {
     pub observed: Option<Vec<LaneCheckout>>,
 }
 
+/// One tracked PR behind a lane's verdict, with the identity a human needs to
+/// act on it.
+///
+/// `readiness::PullRequestFacts` carries only the axes and a primary key,
+/// because that is all a VERDICT needs. A reader looking at a red lane needs
+/// to know WHICH pull request is red, so the stored row's display identity is
+/// joined back on here. The axes are reproduced verbatim from the facts the
+/// verdict used — not re-read from the store, which could have moved since.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeSetPullRequest {
+    pub id: i32,
+    /// `0` when the row behind this verdict no longer resolves. The axes are
+    /// still the ones the verdict used; only the identity is missing.
+    pub number: i32,
+    pub url: String,
+    pub title: String,
+    /// `owner/repo` on the host, which can differ from weft's local repo name.
+    pub host_slug: String,
+    pub lifecycle: Option<crate::host::PrLifecycle>,
+    pub ci: crate::host::CiStatus,
+    pub review: crate::host::ReviewStatus,
+    pub threads: crate::host::ThreadStatus,
+    pub conflict: crate::host::ConflictStatus,
+    pub probe_failed: bool,
+}
+
 /// One lane's row in the overview.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeSetLane {
@@ -90,6 +116,16 @@ pub struct ChangeSetLane {
     pub repo_id: i32,
     pub repo_name: String,
     pub reason: String,
+    /// Whether a real `direction` row backs this lane.
+    ///
+    /// `false` marks a lane readiness synthesized: the unbound-PR row, the
+    /// issue-wide ask row, a proposed lane not yet materialized. Those carry a
+    /// SENTINEL `direction_status` chosen to make the verdict fail closed, not
+    /// a lifecycle a worker ever reached, so a reader must not present it as
+    /// one. Reported explicitly rather than inferred from `direction_id == 0`,
+    /// because a proposed lane whose direction was deleted keeps a non-zero id
+    /// and is still not materialized.
+    pub materialized: bool,
     pub checkout: CheckoutFacts,
     /// Lanes this one waits on, so the first screen can show the order without
     /// the user reconstructing it lane by lane.
@@ -102,7 +138,7 @@ pub struct ChangeSetLane {
     /// red. Deliberately without the collection's open-PR snapshot TTL: that
     /// is a policy input `readiness` has already applied, and re-exporting it
     /// would invite a second reader to re-judge staleness and disagree.
-    pub pull_requests: Vec<PullRequestFacts>,
+    pub pull_requests: Vec<ChangeSetPullRequest>,
     pub evidence: EvidenceSummary,
     /// Exactly what `issue_readiness` decided for this lane — never recomputed.
     pub readiness: LaneReadiness,
@@ -169,6 +205,14 @@ async fn project(
     let directions_by_id: HashMap<i32, &crate::store::entities::direction::Model> =
         directions.iter().map(|row| (row.id, row)).collect();
     let evidence = evidence_scan(db, thread_id, facts).await?;
+    // One read for the whole issue: the verdict's PR facts carry a primary key
+    // but no display identity, and a reader looking at a red lane needs to know
+    // which pull request is red.
+    let pull_request_rows = repo::list_pull_requests_for_thread(db, thread_id)
+        .await
+        .unwrap_or_default();
+    let pull_request_rows: HashMap<i32, &crate::store::entities::pull_request::Model> =
+        pull_request_rows.iter().map(|row| (row.id, row)).collect();
 
     // `issue_readiness` builds its lane list by filtering these same facts in
     // order, so its rows are an ordered SUBSEQUENCE of `facts` and a cursor
@@ -193,9 +237,15 @@ async fn project(
         // issue-wide ask row) carry a verdict but no direction, so they have no
         // repo, no checkout and no dependencies to look up.
         let direction = directions_by_id.get(&fact.direction_id).copied();
-        let repo_name = match direction {
-            Some(direction) => repo_name_of(db, direction.repo_id).await,
-            None => String::new(),
+        // Resolve the repo ONCE and take both the id and the name from that
+        // one answer. A direction can retain a dangling `repo_id` whose row is
+        // gone; handing the id out while the name comes back empty would let a
+        // caller open a session against a repository that does not exist.
+        // Unresolved is reported as `0`, the same "unset" convention the
+        // direction column itself uses.
+        let resolved_repo = match direction {
+            Some(direction) => resolve_repo(db, direction.repo_id).await,
+            None => None,
         };
         let depends_on = match direction {
             Some(direction) => upstream_direction_ids(db, direction.id).await?,
@@ -204,9 +254,13 @@ async fn project(
         lanes.push(ChangeSetLane {
             direction_id: fact.direction_id,
             name: fact.name.clone(),
-            repo_id: direction.map(|row| row.repo_id).unwrap_or_default(),
-            repo_name,
+            repo_id: resolved_repo.as_ref().map(|(id, _)| *id).unwrap_or_default(),
+            repo_name: resolved_repo
+                .as_ref()
+                .map(|(_, name)| name.clone())
+                .unwrap_or_default(),
             reason: direction.map(|row| row.reason.clone()).unwrap_or_default(),
+            materialized: direction.is_some(),
             checkout: CheckoutFacts {
                 declared_base: direction
                     .map(|row| row.base_branch.clone())
@@ -219,7 +273,11 @@ async fn project(
             reconciliation: fact.reconciliation,
             checks: fact.checks,
             upstream: fact.upstream,
-            pull_requests: fact.pull_requests.clone(),
+            pull_requests: fact
+                .pull_requests
+                .iter()
+                .map(|pr| change_set_pull_request(pr, pull_request_rows.get(&pr.id).copied()))
+                .collect(),
             // A virtual lane has no direction and so produces no evidence of
             // its own; the issue's rows belong to the issue, not to it.
             evidence: match fact.direction_id {
@@ -245,16 +303,49 @@ async fn project(
     })
 }
 
-/// A repo row that no longer resolves yields an empty name rather than an
-/// error: the Change Set is a read of whatever is there, and one dangling
-/// `repo_id` must not blank the whole overview.
-async fn repo_name_of(db: &Db, repo_id: i32) -> String {
-    repo::get_repo(db, repo_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|row| row.name)
-        .unwrap_or_default()
+/// The repo's id and name, or `None` when the row does not resolve.
+///
+/// A dangling `repo_id` yields `None` rather than an error: the Change Set is
+/// a read of whatever is there, and one broken reference must not blank the
+/// whole overview. Returning the pair together is what keeps a caller from
+/// acting on an id whose row is gone.
+async fn resolve_repo(db: &Db, repo_id: i32) -> Option<(i32, String)> {
+    if repo_id == 0 {
+        return None;
+    }
+    let row = repo::get_repo(db, repo_id).await.ok().flatten()?;
+    Some((row.id, row.name))
+}
+
+/// Pair the verdict's PR axes with the stored row's display identity.
+///
+/// The axes come from the facts the verdict actually used; only the identity
+/// is read from the store. A row that has since been deleted still shows its
+/// axes, with `number == 0` marking the missing identity rather than inventing
+/// one.
+fn change_set_pull_request(
+    facts: &PullRequestFacts,
+    row: Option<&crate::store::entities::pull_request::Model>,
+) -> ChangeSetPullRequest {
+    let host_slug = match row {
+        Some(row) if !row.host_owner.is_empty() => {
+            format!("{}/{}", row.host_owner, row.host_repo)
+        }
+        _ => String::new(),
+    };
+    ChangeSetPullRequest {
+        id: facts.id,
+        number: row.map(|row| row.number).unwrap_or_default(),
+        url: row.map(|row| row.url.clone()).unwrap_or_default(),
+        title: row.map(|row| row.title.clone()).unwrap_or_default(),
+        host_slug,
+        lifecycle: facts.lifecycle,
+        ci: facts.ci.clone(),
+        review: facts.review.clone(),
+        threads: facts.threads.clone(),
+        conflict: facts.conflict.clone(),
+        probe_failed: facts.probe_failed,
+    }
 }
 
 /// This lane's upstream lane ids — the resolved edges only.
@@ -393,6 +484,7 @@ mod tests {
         issue_readiness, CheckoutSignature, ExecutionReconciliation, OpenPrSnapshotFreshness,
         PolicyDecision,
     };
+    use sea_orm::ConnectionTrait;
     use crate::store::entities::direction;
 
     fn freshness() -> OpenPrSnapshotFreshness {
@@ -488,6 +580,7 @@ mod tests {
         assert_eq!(change_set.lanes[0].reasons, verdict.lanes[0].reasons);
         assert_eq!(change_set.lanes[0].repo_id, repo_id);
         assert_eq!(change_set.lanes[0].repo_name, "primary-repo");
+        assert!(change_set.lanes[0].materialized);
         assert_eq!(change_set.lanes[0].reason, "needs the API");
         assert_eq!(change_set.lanes[0].checkout.declared_base, "main");
     }
@@ -621,6 +714,65 @@ mod tests {
         assert_eq!(change_set.lanes[1].depends_on, vec![upstream.id]);
     }
 
+    /// A direction can keep a `repo_id` whose row is gone. Handing that id out
+    /// while the name comes back empty would let a caller open a session
+    /// against a repository that does not exist, so the id is reported unset.
+    #[tokio::test]
+    async fn a_dangling_repo_reference_is_reported_as_unset_not_as_an_openable_id() {
+        let db = Db::connect("sqlite::memory:").await.expect("memory db");
+        let workspace = repo::create_workspace(&db, "dangling repo")
+            .await
+            .expect("workspace");
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            workspace.id,
+            "doomed-repo",
+            "/tmp/doomed-repo",
+            "main",
+            "",
+            true,
+        )
+        .await
+        .expect("repo ref");
+        let thread = repo::create_thread(&db, workspace.id, "dangling", "feature/d", "claude")
+            .await
+            .expect("thread");
+        let direction = repo::create_direction(
+            &db,
+            thread.id,
+            "impl",
+            "claude",
+            repo_ref.id,
+            "writes the doomed repo",
+            "impl-only",
+            "main",
+        )
+        .await
+        .expect("direction");
+        // Remove ONLY the repo row, leaving the direction's `repo_id` dangling.
+        // A cascade delete would take the direction with it and prove nothing.
+        db.0.execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "DELETE FROM repo_ref WHERE id = ?",
+            [repo_ref.id.into()],
+        ))
+        .await
+        .expect("drop the repo row out from under the direction");
+
+        let facts = vec![lane_facts(direction.id, "impl")];
+        let verdict = issue_readiness(&facts);
+        let change_set = project(&db, thread.id, verdict, &facts)
+            .await
+            .expect("project");
+
+        assert_eq!(change_set.lanes.len(), 1, "the lane itself still renders");
+        assert_eq!(
+            change_set.lanes[0].repo_id, 0,
+            "an id whose row is gone must not be offered as openable"
+        );
+        assert_eq!(change_set.lanes[0].repo_name, "");
+    }
+
     async fn append(db: &Db, thread_id: i32, direction_id: i32, kind: &str, revision: &str) {
         repo::append_evidence(
             db,
@@ -736,6 +888,7 @@ mod tests {
 #[cfg(test)]
 mod evidence_attribution_tests {
     use super::*;
+    use sea_orm::ConnectionTrait;
     use crate::readiness::{issue_readiness, ExecutionReconciliation, OpenPrSnapshotFreshness, PolicyDecision};
 
     fn virtual_lane(name: &str) -> LaneFacts {
@@ -802,6 +955,10 @@ mod evidence_attribution_tests {
                 lane.evidence,
                 EvidenceSummary::default(),
                 "a virtual lane produces no evidence of its own"
+            );
+            assert!(
+                !lane.materialized,
+                "a lane with no direction row is not materialized"
             );
         }
         assert_eq!(change_set.issue_evidence.fresh, 1);

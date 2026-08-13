@@ -378,11 +378,17 @@ export interface ChangeSetEvidenceSummary {
 export interface ChangeSetLane {
   direction_id: number;
   name: string;
-  /** `0` when the lane's write repo was never resolved. Carried beside the
-   *  name because two repos may share a display name; only the id is unique. */
+  /** `0` when the lane's write repo does not resolve — the row is missing, or
+   *  the direction retained a dangling id. Never hand this to a navigator
+   *  without checking it. Carried beside the name because two repos may share
+   *  a display name; only the id is unique. */
   repo_id: number;
   repo_name: string;
   reason: string;
+  /** `false` for a lane readiness synthesized (unbound PR, issue-wide ask, a
+   *  proposed lane not yet materialized). Its `direction_status` is then a
+   *  fail-closed SENTINEL, not a lifecycle a worker reached. */
+  materialized: boolean;
   checkout: ChangeSetCheckout;
   depends_on: number[];
   direction_status: string;
@@ -402,13 +408,19 @@ export type HostAxis<TState extends string> = { state: TState } & Record<string,
 
 export interface ChangeSetPullRequest {
   id: number;
+  /** `0` when the stored row behind this verdict no longer resolves — the axes
+   *  are still the verdict's, only the identity is missing. */
+  number: number;
+  url: string;
+  title: string;
+  /** `owner/repo` on the host, which can differ from weft's local repo name. */
+  host_slug: string;
   lifecycle: "open" | "closed" | "merged" | null;
   ci: HostAxis<"unknown" | "not_configured" | "pending" | "passing" | "failing">;
   review: HostAxis<"unknown" | "changes_requested" | "awaiting_approval" | "approved">;
   threads: HostAxis<"unchecked" | "unknown" | "all_resolved" | "unresolved">;
   conflict: HostAxis<"unknown" | "clean" | "conflicting">;
   probe_failed: boolean;
-  last_checked_at: number | null;
 }
 
 export interface IssueChangeSet {
@@ -416,6 +428,12 @@ export interface IssueChangeSet {
   reasons: ReadinessReason[];
   active_lane_count: number;
   lanes: ChangeSetLane[];
+  /** Evidence recorded against the ISSUE rather than any one lane. */
+  issue_evidence: ChangeSetEvidenceSummary;
+  /** The evidence scan hit its bound, so a lane reporting zero rows may simply
+   *  have had all of its rows fall past the cut. Never render that as "no
+   *  evidence recorded". */
+  evidence_scan_truncated: boolean;
 }
 
 /** Minimal Evidence ledger (issue #174 R1-04) — mirrors Rust

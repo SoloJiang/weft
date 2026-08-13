@@ -42,8 +42,17 @@ export function changeSetPanelState(
   return { kind: "ready", changeSet, waves: laneWaves(changeSet.lanes) };
 }
 
-/** Lanes that can proceed together, in the order the dependency edges imply. */
+/**
+ * One group in the dependency layout.
+ *
+ * `parallel` is the ordinary case: lanes that can proceed together. `cycle` is
+ * a set of lanes that depend on each other, which has NO valid order — it is
+ * kept as its own kind rather than shown as a parallel step, because calling a
+ * deadlock "these can run together" is the opposite of true, and because the
+ * ordinary "waits on the step above" header would misdescribe it.
+ */
 export interface ChangeSetWave {
+  kind: "parallel" | "cycle";
   lanes: ChangeSetLane[];
 }
 
@@ -55,10 +64,13 @@ export interface ChangeSetWave {
  *
  * Edges pointing outside this Change Set are ignored rather than treated as
  * unsatisfiable — an upstream lane the verdict excluded (inactive, denied) is
- * not a reason to hide its consumer. A dependency CYCLE cannot be laid out in
- * waves at all, so the remaining lanes are emitted together in their original
- * order: showing them in one honest block beats dropping them or inventing an
- * order the edges do not support. Ordering is otherwise stable — ties keep
+ * not a reason to hide its consumer.
+ *
+ * A dependency CYCLE has no valid order. Only the lanes actually ON the cycle
+ * are emitted as a `cycle` group; lanes merely stuck BEHIND it keep their real
+ * position and are laid out normally in later waves, because "A and B deadlock
+ * each other" and "C is waiting for them" are different situations and C is
+ * not free to proceed alongside them. Ordering is otherwise stable — ties keep
  * their incoming order, so a refresh never reshuffles the panel.
  *
  * Lanes are tracked by POSITION, never by `direction_id`. Virtual lanes — the
@@ -99,11 +111,25 @@ export function laneWaves(lanes: ChangeSetLane[]): ChangeSetWave[] {
       (position) => (blockers.get(position)?.size ?? 0) === 0,
     );
     if (ready.length === 0) {
-      // Every lane left is in or behind a cycle. Emit them as one wave.
-      waves.push({ lanes: [...pending].map((position) => lanes[position]) });
-      break;
+      // Stuck: every remaining lane is on a cycle or behind one. Emit only the
+      // lanes ON a cycle, then let the loop continue so their downstream
+      // consumers are ordered after them instead of beside them.
+      const onCycle = [...pending].filter((position) => reachesItself(position, blockers));
+      // Defensive: if no member could be identified the loop would not
+      // progress, so emit what is left rather than spinning forever.
+      const stuck = onCycle.length > 0 ? onCycle : [...pending];
+      waves.push({ kind: "cycle", lanes: stuck.map((position) => lanes[position]) });
+      for (const position of stuck) {
+        pending.delete(position);
+      }
+      for (const remaining of blockers.values()) {
+        for (const position of stuck) {
+          remaining.delete(position);
+        }
+      }
+      continue;
     }
-    waves.push({ lanes: ready.map((position) => lanes[position]) });
+    waves.push({ kind: "parallel", lanes: ready.map((position) => lanes[position]) });
     for (const position of ready) {
       pending.delete(position);
     }
@@ -114,6 +140,27 @@ export function laneWaves(lanes: ChangeSetLane[]): ChangeSetWave[] {
     }
   }
   return waves;
+}
+
+/**
+ * Whether a lane sits on a dependency cycle: can it reach itself by following
+ * "waits on" edges? A lane merely BEHIND a cycle reaches the cycle but never
+ * comes back to itself, which is exactly the distinction the layout needs.
+ */
+function reachesItself(start: number, blockers: Map<number, Set<number>>): boolean {
+  const seen = new Set<number>();
+  const queue = [...(blockers.get(start) ?? [])];
+  while (queue.length > 0) {
+    const next = queue.pop();
+    if (next === undefined) break;
+    if (next === start) return true;
+    if (seen.has(next)) continue;
+    seen.add(next);
+    for (const upstream of blockers.get(next) ?? []) {
+      queue.push(upstream);
+    }
+  }
+  return false;
 }
 
 /** One observed checkout paired with the declared branch it is judged against. */
@@ -172,13 +219,6 @@ function matchesDeclaredBranch(checkout: LaneCheckout, declaredBranch: string): 
   return checkout.observed.branch === declaredBranch;
 }
 
-/** Whether a lane has any evidence rows at all — `0/0/0` is "none recorded",
- *  which is not the same as "recorded and untrustworthy". */
-export function hasEvidence(lane: ChangeSetLane): boolean {
-  const { fresh, stale, unknown } = lane.evidence;
-  return fresh + stale + unknown > 0;
-}
-
 /**
  * The lane's stored lifecycle status as ONE discriminated value.
  *
@@ -187,7 +227,14 @@ export function hasEvidence(lane: ChangeSetLane): boolean {
  * would put an untranslated backend token on screen (CLAUDE.md: user-facing
  * strings go only through the i18n files).
  */
-export type LaneStatusView = "queued" | "planning" | "working" | "review" | "done" | "unknown";
+export type LaneStatusView =
+  | "queued"
+  | "planning"
+  | "working"
+  | "review"
+  | "done"
+  | "unknown"
+  | "not_materialized";
 
 const LANE_STATUSES: Record<string, LaneStatusView> = {
   queued: "queued",
@@ -197,6 +244,35 @@ const LANE_STATUSES: Record<string, LaneStatusView> = {
   done: "done",
 };
 
-export function laneStatusView(directionStatus: string): LaneStatusView {
-  return LANE_STATUSES[directionStatus.trim()] ?? "unknown";
+export function laneStatusView(lane: ChangeSetLane): LaneStatusView {
+  // An unmaterialized lane's `direction_status` is a readiness SENTINEL chosen
+  // to make the verdict fail closed — `virtual_lane_facts` sets "working" so a
+  // policy-allowed virtual lane lands at InProgress. No worker ever reached
+  // that state, so rendering it as "building" would assert work that is not
+  // happening.
+  if (!lane.materialized) return "not_materialized";
+  return LANE_STATUSES[lane.direction_status.trim()] ?? "unknown";
+}
+
+/**
+ * How much of a lane's evidence to believe, as ONE discriminated value.
+ *
+ * `none` is a real claim — this lane recorded nothing. It may only be made
+ * when the scan was complete: a truncated scan can drop every row of a quiet
+ * lane, and reporting that as "no evidence" turns an incomplete read into a
+ * false assertion.
+ */
+export type LaneEvidenceView =
+  | { kind: "none" }
+  | { kind: "unscanned" }
+  | { kind: "counts"; fresh: number; stale: number; unknown: number };
+
+export function laneEvidenceView(
+  lane: ChangeSetLane,
+  scanTruncated: boolean,
+): LaneEvidenceView {
+  const { fresh, stale, unknown } = lane.evidence;
+  if (fresh + stale + unknown > 0) return { kind: "counts", fresh, stale, unknown };
+  if (scanTruncated) return { kind: "unscanned" };
+  return { kind: "none" };
 }

@@ -7,8 +7,8 @@ import {
 } from "../../src/board/issueDelivery.ts";
 import {
   changeSetPanelState,
-  hasEvidence,
   laneCheckoutView,
+  laneEvidenceView,
   laneStatusView,
   laneWaves,
 } from "../../src/board/changeSetView.ts";
@@ -19,6 +19,7 @@ function lane(overrides: Partial<ChangeSetLane> & { direction_id: number }): Cha
     repo_id: 1,
     repo_name: "primary",
     reason: "",
+    materialized: true,
     checkout: { declared_base: "main", declared_branch: "weft/lane", observed: null },
     depends_on: [],
     direction_status: "working",
@@ -86,16 +87,46 @@ test("an edge pointing outside the change set does not hide its consumer", () =>
   );
 });
 
-test("a dependency cycle is shown in one honest block rather than dropped", () => {
+test("a dependency cycle is its own kind, never a parallel step", () => {
   const waves = laneWaves([
     lane({ direction_id: 1, depends_on: [2] }),
     lane({ direction_id: 2, depends_on: [1] }),
     lane({ direction_id: 3 }),
   ]);
   assert.deepEqual(
-    waves.map((wave) => wave.lanes.map((l) => l.direction_id)),
-    [[3], [1, 2]],
+    waves.map((wave) => [wave.kind, wave.lanes.map((l) => l.direction_id)]),
+    [
+      ["parallel", [3]],
+      ["cycle", [1, 2]],
+    ],
   );
+});
+
+test("a lane blocked BEHIND a cycle is ordered after it, not beside it", () => {
+  // A and B deadlock each other; C waits on A. Emitting all three together
+  // would present C as free to proceed alongside its own blocked upstream.
+  const waves = laneWaves([
+    lane({ direction_id: 1, name: "a", depends_on: [2] }),
+    lane({ direction_id: 2, name: "b", depends_on: [1] }),
+    lane({ direction_id: 3, name: "c", depends_on: [1] }),
+  ]);
+  assert.deepEqual(
+    waves.map((wave) => [wave.kind, wave.lanes.map((l) => l.name)]),
+    [
+      ["cycle", ["a", "b"]],
+      ["parallel", ["c"]],
+    ],
+  );
+});
+
+test("an independent wave before a cycle keeps its own step, and the cycle takes none", () => {
+  const waves = laneWaves([
+    lane({ direction_id: 9, name: "independent" }),
+    lane({ direction_id: 1, name: "a", depends_on: [2] }),
+    lane({ direction_id: 2, name: "b", depends_on: [1] }),
+  ]);
+  assert.deepEqual(waves.map((w) => w.kind), ["parallel", "cycle"]);
+  assert.deepEqual(waves[0].lanes.map((l) => l.name), ["independent"]);
 });
 
 test("every lane appears exactly once across the waves", () => {
@@ -272,15 +303,33 @@ test("a rejected read never re-shows the last payload as current", () => {
 });
 
 test("no evidence at all is distinct from evidence that is merely untrustworthy", () => {
-  assert.equal(hasEvidence(lane({ direction_id: 1 })), false);
-  assert.equal(
-    hasEvidence(
+  assert.deepEqual(laneEvidenceView(lane({ direction_id: 1 }), false), { kind: "none" });
+  assert.deepEqual(
+    laneEvidenceView(
       lane({
         direction_id: 1,
         evidence: { fresh: 0, stale: 0, unknown: 2, newest_observed_at: "1700000000" },
       }),
+      false,
     ),
-    true,
+    { kind: "counts", fresh: 0, stale: 0, unknown: 2 },
+  );
+});
+
+test("a truncated scan never lets an empty lane be reported as having no evidence", () => {
+  // The scan bound is per ISSUE; a busy lane can push a quiet one's rows past
+  // the cut. Calling that "no evidence recorded" turns an incomplete read into
+  // a false assertion.
+  assert.deepEqual(laneEvidenceView(lane({ direction_id: 1 }), true), { kind: "unscanned" });
+  assert.deepEqual(
+    laneEvidenceView(
+      lane({
+        direction_id: 1,
+        evidence: { fresh: 3, stale: 1, unknown: 0, newest_observed_at: "1700000000" },
+      }),
+      true,
+    ),
+    { kind: "counts", fresh: 3, stale: 1, unknown: 0 },
   );
 });
 
@@ -308,10 +357,26 @@ test("a blank declared branch is not something a checkout can differ from", () =
 
 test("every stored lane status maps to a translatable value, unknown tokens included", () => {
   for (const status of ["queued", "planning", "working", "review", "done"]) {
-    assert.equal(laneStatusView(status), status);
+    assert.equal(laneStatusView(lane({ direction_id: 1, direction_status: status })), status);
   }
   // Free text in the store must never reach the screen untranslated.
-  assert.equal(laneStatusView("some-future-status"), "unknown");
-  assert.equal(laneStatusView(""), "unknown");
-  assert.equal(laneStatusView("  review  "), "review");
+  assert.equal(
+    laneStatusView(lane({ direction_id: 1, direction_status: "some-future-status" })),
+    "unknown",
+  );
+  assert.equal(laneStatusView(lane({ direction_id: 1, direction_status: "" })), "unknown");
+  assert.equal(laneStatusView(lane({ direction_id: 1, direction_status: "  review  " })), "review");
+});
+
+test("an unmaterialized lane never presents readiness sentinel as a lifecycle", () => {
+  // `virtual_lane_facts` sets direction_status "working" purely so the verdict
+  // fails closed. No worker is building anything, so labelling it "building"
+  // would assert work that is not happening.
+  const virtualLane = lane({
+    direction_id: 0,
+    name: "issue ask",
+    materialized: false,
+    direction_status: "working",
+  });
+  assert.equal(laneStatusView(virtualLane), "not_materialized");
 });

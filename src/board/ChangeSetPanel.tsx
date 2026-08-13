@@ -2,6 +2,7 @@ import { useTranslation } from "react-i18next";
 import { ArrowRight, GitBranch, GitPullRequest, ScanEye } from "lucide-react";
 import type {
   ChangeSetLane,
+  ChangeSetPullRequest,
   CheckEvidence,
   ExecutionReconciliation,
   UpstreamEvidence,
@@ -12,12 +13,14 @@ import type { IssueDelivery } from "./issueDelivery";
 import { cn } from "../lib/cn";
 import {
   changeSetPanelState,
-  hasEvidence,
   laneCheckoutView,
+  laneEvidenceView,
   laneStatusView,
   type ChangeSetPanelState,
   type CheckoutRowView,
+  type ChangeSetWave,
   type LaneCheckoutView,
+  type LaneEvidenceView,
   type LaneStatusView,
 } from "./changeSetView";
 
@@ -87,16 +90,13 @@ function ChangeSetBody({
             // Keyed by position: several lanes can share direction_id 0, so an
             // id-derived key is not unique among siblings.
             <section key={`wave-${index}`} className="flex flex-col gap-2">
-              <div className="flex items-center gap-2 text-[10.5px] font-semibold uppercase tracking-wider text-ink-faint">
-                <span>{t("changeSet.wave", { index: index + 1 })}</span>
-                {index > 0 && <ArrowRight size={11} aria-hidden="true" />}
-                {index > 0 && <span className="normal-case tracking-normal font-normal">{t("changeSet.waveWaits")}</span>}
-              </div>
+              <WaveHeader wave={wave} index={index} />
               <div className="flex flex-col gap-2">
                 {wave.lanes.map((lane, position) => (
                   <LaneRow
                     key={`${lane.direction_id}:${lane.name}:${position}`}
                     lane={lane}
+                    evidenceScanTruncated={state.changeSet.evidence_scan_truncated}
                     onOpenLane={onOpenLane}
                   />
                 ))}
@@ -106,6 +106,32 @@ function ChangeSetBody({
         </div>
       );
   }
+}
+
+/** A cycle is not a step, so it never gets a step number or the
+ *  "waits on the step above" caption — both would describe an order that does
+ *  not exist. */
+function WaveHeader({ wave, index }: { wave: ChangeSetWave; index: number }) {
+  const { t } = useTranslation();
+  if (wave.kind === "cycle") {
+    return (
+      <div className="flex items-center gap-2 text-[10.5px] font-semibold uppercase tracking-wider text-danger">
+        <span>{t("changeSet.cycle")}</span>
+        <span className="normal-case font-normal tracking-normal text-ink-faint">
+          {t("changeSet.cycleBody")}
+        </span>
+      </div>
+    );
+  }
+  return (
+    <div className="flex items-center gap-2 text-[10.5px] font-semibold uppercase tracking-wider text-ink-faint">
+      <span>{t("changeSet.wave", { index: index + 1 })}</span>
+      {index > 0 && <ArrowRight size={11} aria-hidden="true" />}
+      {index > 0 && (
+        <span className="normal-case tracking-normal font-normal">{t("changeSet.waveWaits")}</span>
+      )}
+    </div>
+  );
 }
 
 const RECONCILIATION_KEYS: Record<ExecutionReconciliation, string> = {
@@ -128,6 +154,7 @@ const STATUS_KEYS: Record<LaneStatusView, string> = {
   review: "changeSet.status.review",
   done: "changeSet.status.done",
   unknown: "changeSet.status.unknown",
+  not_materialized: "changeSet.status.not_materialized",
 };
 
 const UPSTREAM_KEYS: Record<UpstreamEvidence, string> = {
@@ -138,9 +165,11 @@ const UPSTREAM_KEYS: Record<UpstreamEvidence, string> = {
 
 function LaneRow({
   lane,
+  evidenceScanTruncated,
   onOpenLane,
 }: {
   lane: ChangeSetLane;
+  evidenceScanTruncated: boolean;
   onOpenLane: (directionId: number, repoId: number) => void;
 }) {
   const { t } = useTranslation();
@@ -159,7 +188,7 @@ function LaneRow({
         )}
         <ReadinessChip state={{ kind: "ready", dto: lane }} className="max-w-[20rem]" />
         <span className="ml-auto shrink-0 text-[10.5px] text-ink-faint">
-          {t(STATUS_KEYS[laneStatusView(lane.direction_status)])}
+          {t(STATUS_KEYS[laneStatusView(lane)])}
         </span>
         {openable && (
           <button
@@ -189,25 +218,99 @@ function LaneRow({
         {lane.depends_on.length > 0 && (
           <span>{t("changeSet.dependsOn", { count: lane.depends_on.length })}</span>
         )}
-        {hasEvidence(lane) ? (
-          <span>
-            {t("changeSet.evidenceCounts", {
-              fresh: lane.evidence.fresh,
-              stale: lane.evidence.stale,
-              unknown: lane.evidence.unknown,
-            })}
-          </span>
-        ) : (
-          <span>{t("changeSet.evidenceNone")}</span>
-        )}
-        {lane.pull_requests.length > 0 && (
-          <span className="inline-flex items-center gap-1">
-            <GitPullRequest size={11} aria-hidden="true" />
-            {t("changeSet.pullRequests", { count: lane.pull_requests.length })}
-          </span>
-        )}
+        <EvidenceCounts view={laneEvidenceView(lane, evidenceScanTruncated)} />
       </div>
+
+      {lane.pull_requests.length > 0 && (
+        <div className="flex flex-col gap-0.5">
+          {lane.pull_requests.map((pr) => (
+            <PullRequestRow key={pr.id} pr={pr} />
+          ))}
+        </div>
+      )}
     </article>
+  );
+}
+
+/** Evidence trust, mapped exhaustively — "none recorded" is only ever claimed
+ *  when the scan was complete enough to support it. */
+function EvidenceCounts({ view }: { view: LaneEvidenceView }) {
+  const { t } = useTranslation();
+  switch (view.kind) {
+    case "none":
+      return <span>{t("changeSet.evidenceNone")}</span>;
+    case "unscanned":
+      return <span>{t("changeSet.evidenceUnscanned")}</span>;
+    case "counts":
+      return (
+        <span>
+          {t("changeSet.evidenceCounts", {
+            fresh: view.fresh,
+            stale: view.stale,
+            unknown: view.unknown,
+          })}
+        </span>
+      );
+  }
+}
+
+const CI_KEYS: Record<string, string> = {
+  unknown: "changeSet.pr.ciUnknown",
+  not_configured: "changeSet.pr.ciNotConfigured",
+  pending: "changeSet.pr.ciPending",
+  passing: "changeSet.pr.ciPassing",
+  failing: "changeSet.pr.ciFailing",
+};
+
+const REVIEW_KEYS: Record<string, string> = {
+  unknown: "changeSet.pr.reviewUnknown",
+  changes_requested: "changeSet.pr.reviewChangesRequested",
+  awaiting_approval: "changeSet.pr.reviewAwaiting",
+  approved: "changeSet.pr.reviewApproved",
+};
+
+const THREADS_KEYS: Record<string, string> = {
+  unchecked: "changeSet.pr.threadsUnchecked",
+  unknown: "changeSet.pr.threadsUnknown",
+  all_resolved: "changeSet.pr.threadsResolved",
+  unresolved: "changeSet.pr.threadsUnresolved",
+};
+
+const CONFLICT_KEYS: Record<string, string> = {
+  unknown: "changeSet.pr.conflictUnknown",
+  clean: "changeSet.pr.conflictClean",
+  conflicting: "changeSet.pr.conflicting",
+};
+
+/**
+ * One PR behind the lane's verdict, named and with its axes shown.
+ *
+ * A count alone ("2 pull requests") cannot tell the reader WHICH one is red,
+ * which is the only thing they can act on. Every axis is a tagged union from
+ * the backend, so each is mapped through a lookup with an explicit fallback —
+ * a state this build does not know renders as unknown, never as a raw token.
+ */
+function PullRequestRow({ pr }: { pr: ChangeSetPullRequest }) {
+  const { t } = useTranslation();
+  const axis = (keys: Record<string, string>, state: string) =>
+    t(keys[state] ?? "changeSet.pr.stateUnknown");
+  const label = pr.number > 0 ? `#${pr.number}` : t("changeSet.pr.unidentified");
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[10.5px] text-ink-faint">
+      <GitPullRequest size={11} aria-hidden="true" />
+      <span className="shrink-0 font-medium text-ink-muted">{label}</span>
+      {pr.host_slug && <span className="shrink-0">{pr.host_slug}</span>}
+      {pr.title && (
+        <span className="min-w-0 truncate" title={pr.title}>
+          {pr.title}
+        </span>
+      )}
+      <span>{axis(CI_KEYS, pr.ci.state)}</span>
+      <span>{axis(REVIEW_KEYS, pr.review.state)}</span>
+      <span>{axis(THREADS_KEYS, pr.threads.state)}</span>
+      <span>{axis(CONFLICT_KEYS, pr.conflict.state)}</span>
+      {pr.probe_failed && <span className="text-waiting">{t("changeSet.pr.probeFailed")}</span>}
+    </div>
   );
 }
 
