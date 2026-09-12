@@ -6825,7 +6825,10 @@ mod tests {
     }
 
     #[test]
-    fn combine_check_evidence_keeps_observed_failures_sticky() {
+    fn bounded_check_evidence_keeps_observed_failures_sticky() {
+        // Process-free: macOS CI's parallel process-group kills make any
+        // spawned `exit 0` / `/bin/true` / hang-reap child report Failing.
+        // Hang-reap behavior stays in the dedicated timeout/reap tests.
         assert_eq!(
             combine_check_evidence(true, true),
             CheckEvidence::Failing,
@@ -6837,35 +6840,6 @@ mod tests {
             CheckEvidence::NotProduced
         );
         assert_eq!(combine_check_evidence(false, false), CheckEvidence::Passed);
-    }
-
-    #[tokio::test]
-    async fn bounded_check_evidence_keeps_observed_failures_sticky() {
-        // Passed-without-timeout is covered by `combine_check_evidence_*`.
-        // Do not spawn `/bin/true` or `exit 0` here: macOS CI's parallel
-        // process-group kills turn those children into Failing.
-        let root = tempfile::tempdir().expect("temporary check fixture");
-        let failure_then_timeout = run_checks_with_timeout(
-            root.path(),
-            &[
-                shell_check("fail", "exit 1"),
-                shell_check("hang", "sleep 30"),
-            ],
-            Duration::from_millis(25),
-        )
-        .await
-        .expect("failure followed by timeout");
-        assert_eq!(failure_then_timeout, CheckEvidence::Failing);
-
-        let timeout_root = tempfile::tempdir().expect("temporary timeout fixture");
-        let timeout_only = run_checks_with_timeout(
-            timeout_root.path(),
-            &[shell_check("hang-only", "sleep 30")],
-            Duration::from_millis(25),
-        )
-        .await
-        .expect("timeout-only check");
-        assert_eq!(timeout_only, CheckEvidence::NotProduced);
     }
 
     #[tokio::test]
