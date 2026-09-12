@@ -51,6 +51,38 @@ jobs:
       - name: Frontend unit tests
         run: pnpm test
 
+  weft-codex-ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: weft-codex/ui
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: 'pnpm'
+          cache-dependency-path: weft-codex/ui/pnpm-lock.yaml
+
+      - name: Install weft-codex UI dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check weft-codex UI
+        run: pnpm typecheck
+
+      - name: Test weft-codex UI
+        run: pnpm test
+
+      - name: Build weft-codex UI
+        run: pnpm build
+
   rust-test:
     strategy:
       fail-fast: false
