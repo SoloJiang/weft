@@ -52,4 +52,3 @@ changes (or when you pass `--force`).
 weft-codex install-skills          # explicit refresh
 weft-codex install-skills --force  # overwrite a local non-managed fork
 ```
-
