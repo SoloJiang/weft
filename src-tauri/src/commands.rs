@@ -2808,7 +2808,7 @@ async fn confirm_proposal_and_propagate_read_only(
     db: &Db,
     asks: &crate::ask::AskRegistry,
     thread_id: i32,
-) -> anyhow::Result<Vec<i32>> {
+) -> anyhow::Result<(Vec<i32>, Vec<weft_scheduler::EnqueueJob>)> {
     confirm_proposal_and_propagate_read_only_with_manual_tool(db, asks, thread_id, None).await
 }
 
@@ -2817,11 +2817,11 @@ async fn confirm_proposal_and_propagate_read_only_with_manual_tool(
     asks: &crate::ask::AskRegistry,
     thread_id: i32,
     manual_tool: Option<&str>,
-) -> anyhow::Result<Vec<i32>> {
+) -> anyhow::Result<(Vec<i32>, Vec<weft_scheduler::EnqueueJob>)> {
     let ids = crate::planner::confirm_with_manual_tool(db, thread_id, manual_tool).await?;
     asks.grant_read_only_issue(thread_id);
-    crate::coordinator::persist_enqueued_or_flag(db, &ids).await?;
-    Ok(ids)
+    let jobs = crate::coordinator::persist_enqueued_or_flag(db, &ids).await?;
+    Ok((ids, jobs))
 }
 
 async fn confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sessions(
@@ -2830,7 +2830,7 @@ async fn confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sess
     thread_id: i32,
     manual_tool: Option<&str>,
     is_session_live: &(dyn Fn(i32) -> bool + Send + Sync),
-) -> anyhow::Result<Vec<i32>> {
+) -> anyhow::Result<(Vec<i32>, Vec<weft_scheduler::EnqueueJob>)> {
     let ids = crate::planner::confirm_with_manual_tool_and_live_sessions(
         db,
         thread_id,
@@ -2848,8 +2848,8 @@ async fn confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sess
     record_confirm_decision_evidence(db, thread_id, &ids).await;
     // Human gate is done. Shared enqueue persists initial_status; spawn is
     // the SessionPort adapter in the tauri command (not lead_chat).
-    crate::coordinator::persist_enqueued_or_flag(db, &ids).await?;
-    Ok(ids)
+    let jobs = crate::coordinator::persist_enqueued_or_flag(db, &ids).await?;
+    Ok((ids, jobs))
 }
 
 async fn record_confirm_decision_evidence(db: &Db, thread_id: i32, direction_ids: &[i32]) {
@@ -2899,7 +2899,7 @@ pub async fn confirm_proposal(
 ) -> R<Vec<i32>> {
     let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
     let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
-    let ids = confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sessions(
+    let (ids, jobs) = confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sessions(
         &db,
         &asks,
         thread_id,
@@ -2908,7 +2908,6 @@ pub async fn confirm_proposal(
     )
     .await
     .map_err(e)?;
-    let jobs = weft_scheduler::enqueue(ids.iter().copied().map(i64::from));
     start_enqueued_workers(&app, &db, &jobs).await;
     use tauri::Emitter;
     let _ = app.emit("needs-you://changed", thread_id);
@@ -2917,7 +2916,8 @@ pub async fn confirm_proposal(
 
 /// Approve one proposed lane, then enqueue it through `weft-scheduler`.
 /// Planner materialize stays status-agnostic; persist + spawn live here,
-/// matching `confirm_proposal`.
+/// matching `confirm_proposal`. Returns the persisted jobs so the command
+/// can start workers without a second enqueue pass.
 async fn approve_direction_and_enqueue(
     db: &Db,
     asks: &crate::ask::AskRegistry,
@@ -2925,7 +2925,7 @@ async fn approve_direction_and_enqueue(
     index: usize,
     manual_tool: Option<&str>,
     is_session_live: Option<&(dyn Fn(i32) -> bool + Send + Sync)>,
-) -> anyhow::Result<i32> {
+) -> anyhow::Result<(i32, Vec<weft_scheduler::EnqueueJob>)> {
     let direction_id = if let Some(is_session_live) = is_session_live {
         crate::planner::approve_direction_with_pin_and_live_sessions(
             db,
@@ -2939,8 +2939,8 @@ async fn approve_direction_and_enqueue(
         crate::planner::approve_direction_with_pin(db, thread_id, index, manual_tool).await?
     };
     asks.grant_read_only_issue(thread_id);
-    crate::coordinator::persist_enqueued_or_flag(db, &[direction_id]).await?;
-    Ok(direction_id)
+    let jobs = crate::coordinator::persist_enqueued_or_flag(db, &[direction_id]).await?;
+    Ok((direction_id, jobs))
 }
 
 #[tauri::command]
@@ -2958,7 +2958,7 @@ pub async fn approve_direction(
     let index = usize::try_from(index).map_err(e)?;
     let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
     let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
-    let direction_id = approve_direction_and_enqueue(
+    let (direction_id, jobs) = approve_direction_and_enqueue(
         &db,
         &asks,
         thread_id,
@@ -2968,7 +2968,6 @@ pub async fn approve_direction(
     )
     .await
     .map_err(e)?;
-    let jobs = weft_scheduler::enqueue(std::iter::once(i64::from(direction_id)));
     start_enqueued_workers(&app, &db, &jobs).await;
     use tauri::Emitter;
     let _ = app.emit("needs-you://changed", thread_id);
@@ -3225,8 +3224,41 @@ async fn create_direction_for_explicit_tool(
     Ok(dir)
 }
 
+/// Materialize then persist through the same enqueue adapter as
+/// `confirm_proposal` / `approve_direction`. Spawn stays in the command.
+async fn create_direction_and_enqueue(
+    db: &Db,
+    thread_id: i32,
+    name: &str,
+    tool: &str,
+    repo_id: i32,
+    reason: &str,
+    mandate: &str,
+    base_branch: &str,
+) -> anyhow::Result<(entities::direction::Model, Vec<weft_scheduler::EnqueueJob>)> {
+    let dir = create_direction_for_explicit_tool(
+        db,
+        thread_id,
+        name,
+        tool,
+        repo_id,
+        reason,
+        mandate,
+        base_branch,
+    )
+    .await?;
+    materialize::materialize_direction(db, dir.id).await?;
+    let jobs = crate::coordinator::persist_enqueued_or_flag(db, &[dir.id]).await?;
+    let updated = match repo::get_direction(db, dir.id).await? {
+        Some(direction) => direction,
+        None => dir,
+    };
+    Ok((updated, jobs))
+}
+
 #[tauri::command]
 pub async fn create_direction(
+    app: tauri::AppHandle,
     db: State<'_, Db>,
     thread_id: i32,
     name: String,
@@ -3236,7 +3268,7 @@ pub async fn create_direction(
     mandate: Option<String>,
     base_branch: Option<String>,
 ) -> R<entities::direction::Model> {
-    let dir = create_direction_for_explicit_tool(
+    let (dir, jobs) = create_direction_and_enqueue(
         &db,
         thread_id,
         &name,
@@ -3248,9 +3280,7 @@ pub async fn create_direction(
     )
     .await
     .map_err(e)?;
-    materialize::materialize_direction(&db, dir.id)
-        .await
-        .map_err(e)?;
+    start_enqueued_workers(&app, &db, &jobs).await;
     Ok(dir)
 }
 
@@ -9435,10 +9465,12 @@ mod tests {
             .unwrap();
 
         let asks = crate::ask::AskRegistry::new();
-        let ids = confirm_proposal_and_propagate_read_only(&db, &asks, t.id)
+        let (ids, jobs) = confirm_proposal_and_propagate_read_only(&db, &asks, t.id)
             .await
             .unwrap();
         assert_eq!(ids.len(), 1, "the single lane should materialize");
+        assert_eq!(jobs.len(), 1, "confirm persist returns the enqueue jobs");
+        assert_eq!(jobs[0].direction_id, i64::from(ids[0]));
         let created = repo::get_direction(&db, ids[0])
             .await
             .unwrap()
@@ -9526,10 +9558,12 @@ mod tests {
             .unwrap();
 
         let asks = crate::ask::AskRegistry::new();
-        let direction_id =
+        let (direction_id, jobs) =
             approve_direction_and_enqueue(&db, &asks, t.id, 0, Some("codex"), None)
                 .await
                 .unwrap();
+        assert_eq!(jobs.len(), 1, "approve persist returns the enqueue jobs");
+        assert_eq!(jobs[0].direction_id, i64::from(direction_id));
         let created = repo::get_direction(&db, direction_id)
             .await
             .unwrap()
@@ -9544,6 +9578,65 @@ mod tests {
             asks.auto_decision(t.id, &direction_id.to_string(), crate::ask::RiskLevel::ReadOnly, "ls"),
             Some(crate::ask::Decision::Allow)
         );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn create_direction_and_enqueue_promotes_queued_to_working() {
+        let _env = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-create-enqueue-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        init_main_repo(&root, "api");
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo_ref = repo::add_repo_ref(
+            &db,
+            ws.id,
+            "api",
+            root.join("api").to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude")
+            .await
+            .unwrap();
+
+        let (created, jobs) = create_direction_and_enqueue(
+            &db,
+            t.id,
+            "manual task",
+            "codex",
+            repo_ref.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(jobs.len(), 1, "create persist returns the enqueue jobs");
+        assert_eq!(jobs[0].direction_id, i64::from(created.id));
+        assert_eq!(
+            created.status,
+            weft_scheduler::initial_status(),
+            "create enqueue promotes queued → working"
+        );
+        assert!(created.attention_reason.is_empty());
+        assert!(created.engine_pinned);
 
         let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
         let _ = materialize::cleanup_worktrees(&db, &removed).await;

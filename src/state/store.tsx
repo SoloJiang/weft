@@ -475,6 +475,8 @@ interface Store {
   refreshProposal: (threadId: number) => Promise<void>;
   saveProposal: (proposal: Proposal) => Promise<void>;
   confirmProposal: (manualTool?: string) => Promise<void>;
+  /** Per-lane approve: same persist/enqueue/hydrate path as confirmProposal. */
+  approveDirection: (index: number, manualTool?: string) => Promise<void>;
   setProposalDirectionBase: (index: number, name: string, repo: string, base: string, expectedOldBase: string, version: string) => Promise<void>;
   /** Approve a plan_card: post `plan_decision` to the lead, then persist the settled
    *  state. Shared by the chat plan_card's own Approve button and the merged
@@ -2962,6 +2964,43 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     void hydrateLiveWorkers(true);
   }, [activeThreadId, loadThreadChildren, hydrateLiveWorkers, refreshProposal]);
 
+  const approveDirection = useCallback(async (index: number, manualTool?: string) => {
+    if (activeThreadId == null) return;
+    const pending = pendingBaseSave.current.get(activeThreadId) ?? Promise.resolve();
+    pendingBaseSave.current.delete(activeThreadId);
+    try {
+      await pending;
+    } catch (e) {
+      console.error(e);
+    }
+    if ((baseSaveFailed.current.get(activeThreadId)?.size ?? 0) > 0) {
+      baseSaveFailed.current.delete(activeThreadId);
+      await refreshProposal(activeThreadId);
+      return;
+    }
+    try {
+      await api.approveDirection(activeThreadId, index, manualTool);
+    } catch (err) {
+      console.error(err);
+      const routeBlocked = routeBlockedErrorMessage(rawErrorMessage(err));
+      if (routeBlocked) {
+        toast(routeBlocked, "danger");
+      } else {
+        toast(i18n.t("scope.approveFailed"), "danger");
+      }
+      await refreshProposal(activeThreadId);
+      return;
+    }
+    await refreshProposal(activeThreadId);
+    await loadThreadChildren(activeThreadId);
+    try {
+      setReadOnlyGrants(await api.readOnlyGrants());
+    } catch (e) {
+      console.error(e);
+    }
+    void hydrateLiveWorkers(true);
+  }, [activeThreadId, loadThreadChildren, hydrateLiveWorkers, refreshProposal]);
+
   const approvePlanCard = useCallback(
     async (
       threadId: number,
@@ -3586,6 +3625,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     refreshProposal,
     saveProposal,
     confirmProposal,
+    approveDirection,
     setProposalDirectionBase,
     approvePlanCard,
     overview,

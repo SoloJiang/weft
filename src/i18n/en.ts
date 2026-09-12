@@ -291,6 +291,7 @@ export const en = {
     confirmWithPlan_one: "Confirm plan & create {{count}} task",
     confirmWithPlan_other: "Confirm plan & create {{count}} tasks",
     confirmFailed: "Couldn't create the tasks — try again.",
+    approveFailed: "Couldn't approve the task — try again.",
     confirming: "Creating…",
     baseBranch: "Base branch",
     baseBranchHint: "Branch the work off this (blank = the repo's default branch)",
