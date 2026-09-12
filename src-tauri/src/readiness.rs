@@ -6841,30 +6841,9 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_check_evidence_keeps_observed_failures_sticky() {
-        // Passing checks run first, on their own fixture, and use /bin/true so
-        // a later hang's delayed process-group kill cannot land on this suite
-        // (macOS CI reused a killed pgid and turned `exit 0` into Failing).
-        let pass_root = tempfile::tempdir().expect("temporary pass fixture");
-        let all_pass = run_checks_with_timeout(
-            pass_root.path(),
-            &[
-                crate::check::Check {
-                    name: "pass-one".to_string(),
-                    program: "/bin/true".to_string(),
-                    args: Vec::new(),
-                },
-                crate::check::Check {
-                    name: "pass-two".to_string(),
-                    program: "/bin/true".to_string(),
-                    args: Vec::new(),
-                },
-            ],
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("all passing checks");
-        assert_eq!(all_pass, CheckEvidence::Passed);
-
+        // Passed-without-timeout is covered by `combine_check_evidence_*`.
+        // Do not spawn `/bin/true` or `exit 0` here: macOS CI's parallel
+        // process-group kills turn those children into Failing.
         let root = tempfile::tempdir().expect("temporary check fixture");
         let failure_then_timeout = run_checks_with_timeout(
             root.path(),
