@@ -10,6 +10,8 @@ members = [
     "weft-codex/crates/core",
     "weft-codex/crates/daemon",
 ]
+# Tauri keeps its own lockfile and webkit deps. Path-deps on crates/weft-*.
+exclude = ["src-tauri"]
 
 [workspace.package]
 edition = "2021"
