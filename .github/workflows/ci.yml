@@ -71,8 +71,10 @@ jobs:
           cache: 'pnpm'
           cache-dependency-path: weft-codex/ui/pnpm-lock.yaml
 
+      # Nested package has its own lockfile. The repo-root pnpm-workspace.yaml
+      # would otherwise swallow this install and leave node_modules empty.
       - name: Install weft-codex UI dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --ignore-workspace
 
       - name: Type-check weft-codex UI
         run: pnpm typecheck
