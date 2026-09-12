@@ -7,7 +7,7 @@
 //! Party identity and bus envelopes come from `weft-brief`. Tool lists and the
 //! curator-derived sections stay in this Weft adapter.
 
-pub use weft_brief::{bus_envelope, direction_party, LEAD_PARTY};
+pub use weft_brief::{bus_envelope, direction_party, is_impl_only_mandate, LEAD_PARTY};
 
 use crate::curator;
 use crate::store::{repo, Db};
@@ -76,8 +76,7 @@ pub fn format_brief(d: &BriefData) -> String {
     s.push_str("\n## Delivery contract\n");
     s.push_str("You own delivery for this task in your write repo. You may decide how much planning is needed before editing. Use existing repository conventions and configured checks; do not invent toolchains. Coordinate when your changes affect other tasks, and announce interface/contract changes before relying on them. Ask the human only for missing requirements, product judgment, or permission decisions. Move your task status when material progress changes. When ready for review, report what changed, what was verified, and remaining risks.\n");
 
-    let mandate = d.mandate.as_str();
-    if mandate == "impl-only" {
+    if is_impl_only_mandate(&d.mandate) {
         s.push_str("\nMandate hint: **impl-only** — this scope is considered concrete enough to build directly unless you discover ambiguity that materially changes the work.\n");
     } else {
         s.push_str("\nMandate hint: **plan+impl** — expect to plan your approach first unless the path is obvious, then build and verify.\n");

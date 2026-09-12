@@ -12,17 +12,21 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 /// The deterministic worktree path for a direction branch inside its target repo:
-/// `<repo>/.worktrees/<weft|weft-dev>/<branch>`. The branch suffix keeps the path
-/// user-visible and aligned with the repo's own naming style while `.worktrees/weft`
-/// keeps Weft checkouts separate from manually-created worktrees.
+/// `<repo>/.worktrees/<weft|weft-dev>/<branch>`. Layout formula lives in
+/// `weft-worktree`; this adapter only picks the home dirname.
 pub fn worktree_path(repo_path: &Path, branch: &str) -> PathBuf {
-    worktree_root(repo_path).join(branch)
+    weft_worktree::weft_repo_worktree_path(
+        repo_path,
+        &worktree_dirname(crate::paths::weft_home().ok().as_deref()),
+        branch,
+    )
 }
 
 pub fn worktree_root(repo_path: &Path) -> PathBuf {
-    repo_path
-        .join(".worktrees")
-        .join(worktree_dirname(crate::paths::weft_home().ok().as_deref()))
+    weft_worktree::weft_repo_worktree_root(
+        repo_path,
+        &worktree_dirname(crate::paths::weft_home().ok().as_deref()),
+    )
 }
 
 /// The `.worktrees/<this>` subdir for the active weft home. Keyed on the resolved

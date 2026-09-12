@@ -1,5 +1,5 @@
 //! Idempotent git worktree create. Path layout is a trait so Weft
-//! (`<repo>/.worktrees/weft/<branch>`) and weft-codex
+//! (`<repo>/.worktrees/<home-token>/<branch>`) and weft-codex
 //! (`<home>/worktrees/<issue>/<dir>`) keep separate homes.
 #![cfg_attr(
     not(test),
@@ -8,7 +8,6 @@
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
-use tokio::process::Command;
 
 pub struct WorktreeInfo {
     pub path: PathBuf,
@@ -33,13 +32,37 @@ impl WorktreeLayout for CodexHomeLayout<'_> {
     }
 }
 
-async fn git(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = Command::new("git")
+/// Weft layout: `<repo>/.worktrees/<dirname>/<branch>`.
+///
+/// `dirname` is adapter-chosen (`weft` / `weft-dev` / `weft-<hash>`) so two
+/// Weft homes never share a root. This crate does not read `$HOME`.
+pub struct WeftRepoLayout<'a> {
+    pub repo: &'a Path,
+    pub dirname: &'a str,
+}
+
+impl WorktreeLayout for WeftRepoLayout<'_> {
+    fn worktree_path(&self, _issue_slug: &str, branch: &str) -> PathBuf {
+        weft_repo_worktree_path(self.repo, self.dirname, branch)
+    }
+}
+
+/// `<repo>/.worktrees/<dirname>`.
+pub fn weft_repo_worktree_root(repo: &Path, dirname: &str) -> PathBuf {
+    repo.join(".worktrees").join(dirname)
+}
+
+/// `<repo>/.worktrees/<dirname>/<branch>`.
+pub fn weft_repo_worktree_path(repo: &Path, dirname: &str, branch: &str) -> PathBuf {
+    weft_repo_worktree_root(repo, dirname).join(branch)
+}
+
+fn git_blocking(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let out = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
         .output()
-        .await
         .context("spawn git")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -51,7 +74,7 @@ async fn git(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
 /// Ensure the direction's worktree exists at `wt_path`, on `branch`, created
 /// off `base` (empty = repo HEAD). Idempotent: an existing directory is
 /// returned as-is (resume path).
-pub async fn ensure_worktree(
+pub fn ensure_worktree_blocking(
     repo: &Path,
     wt_path: &Path,
     branch: &str,
@@ -70,16 +93,14 @@ pub async fn ensure_worktree(
     }
     let wt = wt_path.to_string_lossy().to_string();
     let base_arg = if base.is_empty() { "HEAD" } else { base };
-    let created = git(repo, &["worktree", "add", &wt, "-b", branch, base_arg]).await;
-    match created {
+    match git_blocking(repo, &["worktree", "add", &wt, "-b", branch, base_arg]) {
         Ok(_) => Ok(WorktreeInfo {
             path: wt_path.to_path_buf(),
             branch: branch.to_string(),
             created: true,
         }),
         Err(first) => {
-            git(repo, &["worktree", "add", &wt, branch])
-                .await
+            git_blocking(repo, &["worktree", "add", &wt, branch])
                 .with_context(|| format!("attach existing branch after: {first:#}"))?;
             Ok(WorktreeInfo {
                 path: wt_path.to_path_buf(),
@@ -87,6 +108,27 @@ pub async fn ensure_worktree(
                 created: false,
             })
         }
+    }
+}
+
+/// Async wrapper around [`ensure_worktree_blocking`] for Codex `Orchestrator`.
+pub async fn ensure_worktree(
+    repo: &Path,
+    wt_path: &Path,
+    branch: &str,
+    base: &str,
+) -> anyhow::Result<WorktreeInfo> {
+    let repo = repo.to_path_buf();
+    let wt_path = wt_path.to_path_buf();
+    let branch = branch.to_string();
+    let base = base.to_string();
+    match tokio::task::spawn_blocking(move || {
+        ensure_worktree_blocking(&repo, &wt_path, &branch, &base)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(anyhow::anyhow!("ensure_worktree join: {error}")),
     }
 }
 
@@ -104,52 +146,54 @@ pub fn branch_name(issue_slug: &str, direction_slug: &str) -> String {
 mod tests {
     use super::*;
 
-    async fn run(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
+    fn run(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
             .args(args)
             .output()
-            .await
             .expect("git");
         assert!(out.status.success(), "git {args:?} failed");
     }
 
-    async fn init_repo(dir: &Path) {
-        run(dir, &["init", "-q", "-b", "main"]).await;
-        run(dir, &["config", "user.email", "test@example.com"]).await;
-        run(dir, &["config", "user.name", "test"]).await;
+    fn init_repo(dir: &Path) {
+        run(dir, &["init", "-q", "-b", "main"]);
+        run(dir, &["config", "user.email", "test@example.com"]);
+        run(dir, &["config", "user.name", "test"]);
         std::fs::write(dir.join("README"), "x").expect("write");
-        run(dir, &["add", "."]).await;
-        run(dir, &["commit", "-q", "-m", "init"]).await;
+        run(dir, &["add", "."]);
+        run(dir, &["commit", "-q", "-m", "init"]);
     }
 
-    #[tokio::test]
-    async fn ensure_creates_and_resumes() {
+    #[test]
+    fn ensure_creates_and_resumes() {
         let tmp = tempfile::tempdir().expect("tmp");
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir");
-        init_repo(&repo).await;
+        init_repo(&repo);
         let wt = tmp.path().join("wts").join("i1").join("d1");
-        let info = ensure_worktree(&repo, &wt, "weft/i1/d1", "")
-            .await
-            .expect("create");
+        let info = ensure_worktree_blocking(&repo, &wt, "weft/i1/d1", "").expect("create");
         assert!(info.created);
         assert!(wt.join("README").exists());
-        let again = ensure_worktree(&repo, &wt, "weft/i1/d1", "")
-            .await
-            .expect("resume");
+        let again = ensure_worktree_blocking(&repo, &wt, "weft/i1/d1", "").expect("resume");
         assert!(!again.created);
     }
 
     #[test]
-    fn layout_trait_matches_codex_home_convention() {
+    fn layout_trait_keeps_homes_apart() {
         let home = Path::new("/tmp/weft-codex-home");
-        let layout = CodexHomeLayout { home };
-        assert_eq!(
-            layout.worktree_path("iss", "dir"),
-            worktree_path(home, "iss", "dir")
-        );
+        let repo = Path::new("/repo");
+        let codex = CodexHomeLayout { home };
+        let weft = WeftRepoLayout {
+            repo,
+            dirname: "weft",
+        };
+        let codex_path = codex.worktree_path("iss", "dir");
+        let weft_path = weft.worktree_path("", "feat/dir");
+        assert_eq!(codex_path, worktree_path(home, "iss", "dir"));
+        assert_eq!(weft_path, weft_repo_worktree_path(repo, "weft", "feat/dir"));
+        assert!(weft_path.starts_with(repo.join(".worktrees")));
+        assert!(!codex_path.starts_with(repo.join(".worktrees")));
         assert_eq!(branch_name("iss", "dir"), "weft/iss/dir");
     }
 }

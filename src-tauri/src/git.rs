@@ -424,20 +424,12 @@ pub fn add_worktree(
     if worktree_path.exists() {
         return Ok(worktree_path.to_path_buf());
     }
-    if let Some(parent) = worktree_path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let path_str = worktree_path.to_string_lossy().to_string();
     let base = resolve_base_ref(repo, base_ref);
     // Prune stale registrations (a dir removed out-of-band) so `worktree add` recreates
     // instead of failing on the leftover registration; safe no-op when none are stale.
     git(repo, &["worktree", "prune"]).ok();
-    let res = git(repo, &["worktree", "add", "-b", branch, &path_str, &base]);
-    if res.is_err() {
-        git(repo, &["worktree", "add", &path_str, branch])
-            .context("worktree add (existing branch)")?;
-    }
-    Ok(worktree_path.to_path_buf())
+    let info = weft_worktree::ensure_worktree_blocking(repo, worktree_path, branch, &base)?;
+    Ok(info.path)
 }
 
 /// Best-effort fetch of one branch from origin into refs/remotes/origin/<branch>.
