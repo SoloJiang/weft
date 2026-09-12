@@ -1299,6 +1299,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "weft-brief"
+version = "0.1.0"
+
+[[package]]
+name = "weft-bus"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "weft-core"
 version = "0.1.1"
 dependencies = [
@@ -1311,6 +1323,31 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "weft-app-server",
+ "weft-brief",
+ "weft-bus",
+ "weft-scheduler",
+ "weft-slug",
+ "weft-worktree",
+]
+
+[[package]]
+name = "weft-scheduler"
+version = "0.1.0"
+dependencies = [
+ "weft-brief",
+]
+
+[[package]]
+name = "weft-slug"
+version = "0.1.0"
+
+[[package]]
+name = "weft-worktree"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
