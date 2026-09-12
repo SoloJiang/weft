@@ -1,0 +1,6 @@
+{
+  "files": ["crates/daemon/web/index.html"],
+  "insertBefore": "</body>",
+  "commentSyntax": "html",
+  "cspChecked": true
+}

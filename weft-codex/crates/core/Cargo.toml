@@ -1,0 +1,18 @@
+[package]
+name = "weft-core"
+version = "0.1.1"
+description = "weft-codex product core: store, bus, orchestration"
+edition.workspace = true
+
+[dependencies]
+weft-app-server = { path = "../app-server" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+axum = "0.8"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+[dev-dependencies]
+tempfile = "3"

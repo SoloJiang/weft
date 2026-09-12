@@ -1,0 +1,26 @@
+{
+  "name": "weft-codex-launcher",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "weft-codex": "./dist/cli.js",
+    "weft-codex-host": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm build && node --test dist/**/*.test.js",
+    "doctor": "pnpm build && node dist/cli.js doctor",
+    "inspect-install": "pnpm build && node dist/cli.js inspect-install",
+    "start": "pnpm build && node dist/cli.js start",
+    "attach": "pnpm build && node dist/cli.js attach"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "typescript": "~6"
+  }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "weftd"
+version = "0.1.1"
+description = "weft-codex headless daemon"
+edition.workspace = true
+
+[[bin]]
+name = "weftd"
+path = "src/main.rs"
+
+[dependencies]
+weft-core = { path = "../core" }
+weft-app-server = { path = "../app-server" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+axum = "0.8"

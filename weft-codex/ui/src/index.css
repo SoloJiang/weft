@@ -1,0 +1,2297 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@theme inline {
+  --color-background: var(--bg);
+  --color-foreground: var(--text);
+  --color-card: var(--panel-2);
+  --color-card-foreground: var(--text);
+  --color-popover: var(--panel-2);
+  --color-popover-foreground: var(--text);
+  --color-primary: var(--accent);
+  --color-primary-foreground: var(--on-accent);
+  --color-secondary: var(--panel-2);
+  --color-secondary-foreground: var(--text);
+  --color-muted: var(--hover);
+  --color-muted-foreground: var(--dim);
+  --color-accent: var(--hover);
+  --color-accent-foreground: var(--text);
+  --color-destructive: var(--danger);
+  --color-border: var(--border);
+  --color-input: var(--border);
+  --color-ring: var(--focus);
+}
+
+/* Host tokens are the source of truth in Weft mode. Fallbacks keep the same
+   visual hierarchy when this thin UI is opened in a standalone browser. */
+:root,
+:host {
+  color-scheme: dark;
+  --fb-bg: #131313;
+  --fb-panel: #181818;
+  --fb-panel-2: #212121;
+  --fb-border: rgba(252, 252, 252, 0.1);
+  --fb-border-strong: rgba(252, 252, 252, 0.18);
+  --fb-text: #fcfcfc;
+  --fb-dim: rgba(252, 252, 252, 0.7);
+  --fb-dim-2: rgba(252, 252, 252, 0.5);
+  --fb-placeholder: #b8b8b8;
+  --fb-accent: #0169cc;
+  --fb-accent-hover: #0285ff;
+  --fb-on-accent: #ffffff;
+  --fb-link: #5cadff;
+  --fb-warn: #ffc300;
+  --fb-danger: #fa423e;
+  --fb-ok: #04b84c;
+  --fb-hover: rgba(252, 252, 252, 0.08);
+}
+
+@media (prefers-color-scheme: light) {
+  :root,
+  :host {
+    color-scheme: light;
+    --fb-bg: #fcfcfc;
+    --fb-panel: #ffffff;
+    --fb-panel-2: #f3f3f3;
+    --fb-border: rgba(13, 13, 13, 0.11);
+    --fb-border-strong: rgba(13, 13, 13, 0.22);
+    --fb-text: #0d0d0d;
+    --fb-dim: rgba(13, 13, 13, 0.68);
+    --fb-dim-2: rgba(13, 13, 13, 0.5);
+    --fb-placeholder: #5f5f5f;
+    --fb-accent: #0169cc;
+    --fb-accent-hover: #005cad;
+    --fb-on-accent: #ffffff;
+    --fb-link: #0169cc;
+    --fb-warn: #946f00;
+    --fb-danger: #d62925;
+    --fb-ok: #087d35;
+    --fb-hover: rgba(13, 13, 13, 0.06);
+  }
+}
+
+:root[data-host-theme="dark"],
+:host([data-host-theme="dark"]) {
+  color-scheme: dark;
+  --fb-bg: #131313;
+  --fb-panel: #181818;
+  --fb-panel-2: #212121;
+  --fb-border: rgba(252, 252, 252, 0.1);
+  --fb-border-strong: rgba(252, 252, 252, 0.18);
+  --fb-text: #fcfcfc;
+  --fb-dim: rgba(252, 252, 252, 0.7);
+  --fb-dim-2: rgba(252, 252, 252, 0.5);
+  --fb-placeholder: #b8b8b8;
+  --fb-accent: #0169cc;
+  --fb-accent-hover: #0285ff;
+  --fb-on-accent: #ffffff;
+  --fb-link: #5cadff;
+  --fb-warn: #ffc300;
+  --fb-danger: #fa423e;
+  --fb-ok: #04b84c;
+  --fb-hover: rgba(252, 252, 252, 0.08);
+}
+
+:root[data-host-theme="light"],
+:host([data-host-theme="light"]) {
+  color-scheme: light;
+  --fb-bg: #fcfcfc;
+  --fb-panel: #ffffff;
+  --fb-panel-2: #f3f3f3;
+  --fb-border: rgba(13, 13, 13, 0.11);
+  --fb-border-strong: rgba(13, 13, 13, 0.22);
+  --fb-text: #0d0d0d;
+  --fb-dim: rgba(13, 13, 13, 0.68);
+  --fb-dim-2: rgba(13, 13, 13, 0.5);
+  --fb-placeholder: #5f5f5f;
+  --fb-accent: #0169cc;
+  --fb-accent-hover: #005cad;
+  --fb-on-accent: #ffffff;
+  --fb-link: #0169cc;
+  --fb-warn: #946f00;
+  --fb-danger: #d62925;
+  --fb-ok: #087d35;
+  --fb-hover: rgba(13, 13, 13, 0.06);
+}
+
+:root,
+:host {
+  --bg: var(--vscode-sideBar-background, var(--fb-bg));
+  --panel: var(--color-token-main-surface-primary, var(--fb-panel));
+  --panel-2: var(--color-token-dropdown-background, var(--fb-panel-2));
+  --border: var(--color-token-border, var(--fb-border));
+  --border-strong: var(--color-token-border-heavy, var(--fb-border-strong));
+  --text: var(--color-token-foreground, var(--fb-text));
+  --dim: var(--color-token-text-secondary, var(--fb-dim));
+  --dim-2: var(--color-token-text-tertiary, var(--fb-dim-2));
+  /**
+   * Six of these read through a `--vscode-*` middle link.
+   *
+   * Codex publishes `--color-token-*` as an alias layer over its `--vscode-*`
+   * theme variables, and build 6662 shrank that layer: `button-foreground`,
+   * `input-background`, `input-placeholder-foreground` and the three
+   * `charts-*` names resolve to nothing there, so `--danger` / `--ok` /
+   * `--warn` / `--placeholder` were quietly falling all the way through to
+   * `--fb-*` and no longer matched the host at all. The variables behind them
+   * are still published, so the alias stays first for older builds, the
+   * `--vscode-*` name catches 6662, and `--fb-*` stays last for no host.
+   * See docs/compat/codex-builds.md §8.1.
+   */
+  --placeholder: var(--color-token-input-placeholder-foreground, var(--vscode-input-placeholderForeground, var(--fb-placeholder)));
+  --accent: var(--color-token-primary, var(--fb-accent));
+  --accent-hover: var(--vscode-button-hoverBackground, var(--fb-accent-hover));
+  --on-accent: var(--color-token-button-foreground, var(--vscode-button-foreground, var(--fb-on-accent)));
+  --link: var(--color-token-text-link-foreground, var(--fb-link));
+  --warn: var(--color-token-charts-yellow, var(--vscode-charts-yellow, var(--fb-warn)));
+  --danger: var(--color-token-charts-red, var(--vscode-charts-red, var(--fb-danger)));
+  --ok: var(--color-token-charts-green, var(--vscode-charts-green, var(--fb-ok)));
+  --hover: var(--color-token-list-hover-background, var(--fb-hover));
+  /**
+   * The host's own focus colour, read off its Tailwind classes:
+   * `focus-visible:outline-2 outline-offset-2 outline-token-border`.
+   *
+   * Focus is not a colour of its own here — it *is* the border token, so the
+   * fallback is the fallback's border token and the standalone path keeps the
+   * same convention rather than inventing a saturated ring of its own.
+   */
+  --focus: var(--color-token-border, var(--fb-border));
+  /* Codex native primary button: foreground fill, inverse surface text, and
+     an 80% foreground hover fill. Keep this separate from the neutral list
+     hover token, which is intentionally far too light behind inverse text. */
+  --button-primary-bg: var(--text);
+  --button-primary-fg: var(--color-token-dropdown-background, var(--panel));
+  --button-primary-hover-bg: color-mix(in oklab, var(--text) 80%, transparent);
+  /* The host's own radius scale, in pixels because that is what the agent now
+     forwards. Kept identical here so the standalone path is not a second look. */
+  --r-xl: 15px;
+  --r-lg: 12.5px;
+  --r-md: 10px;
+  --r-sm: 7.5px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+  --mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, monospace;
+  --control-h: 32px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  font-size: 16px;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+html,
+body { min-height: 100%; }
+
+#root { min-height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+select,
+textarea { font: inherit; }
+
+/**
+ * Focus outline is for controls that have no caret.
+ *
+ * Buttons, links, select triggers and summaries need a ring because nothing
+ * else moves when they take focus. Text fields already have a caret — a second
+ * outline just frames the box you are typing into. That is the standard, not
+ * a command-menu or kanban-search exception.
+ *
+ * This used to fight shadcn's `focus-visible:ring-3`: that utility paints a
+ * box-shadow, which these rules never set, so it survived the cascade and
+ * stacked a 3px halo inside this 2px outline. The components no longer carry
+ * ring utilities; buttons keep this one ring, fields keep none.
+ */
+button:focus-visible,
+.thread-link:focus-visible,
+select:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+input:focus,
+input:focus-visible,
+textarea:focus,
+textarea:focus-visible {
+  outline: none;
+}
+
+button:disabled { cursor: default; }
+button.loading { cursor: progress; }
+
+button svg,
+.thread-link svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+/**
+ * These element rules are unlayered, so they beat every Tailwind utility —
+ * utilities live in a layer and unlayered CSS always wins. That is why the
+ * shadcn classes on Input/Textarea had no effect on anything measurable, and
+ * why this file is the single source of truth for control chrome. Keep visual
+ * properties here; keep the components to structure and behaviour.
+ */
+/**
+ * The host draws edges with a hairline ring and a soft shadow, not a border.
+ *
+ * Measured on Codex's composer: `border: 0`, `box-shadow: 0 0 0 0.5px
+ * rgba(fg,.157), 0 3px 7.5px rgba(0,0,0,.04)` over a translucent surface. Its
+ * menu surface uses the same construction at a lighter alpha. A 1px CSS border
+ * reads noticeably heavier next to that, which is what made these fields look
+ * like web forms sitting inside a native app.
+ */
+input,
+textarea {
+  min-height: var(--control-h);
+  min-width: 0;
+  padding: 6px 9px;
+  border: 0;
+  border-radius: var(--r-md);
+  background: var(--color-token-input-background, var(--vscode-input-background, var(--panel-2)));
+  box-shadow: 0 0 0 0.5px var(--border-strong), 0 3px 7.5px rgb(0 0 0 / 0.04);
+  color: var(--text);
+  transition: box-shadow 120ms ease, background-color 120ms ease;
+}
+
+input { height: var(--control-h); }
+
+textarea { border-radius: var(--r-lg); }
+
+/* The host expresses emphasis as alpha on the foreground, so hover lifts the
+   hairline rather than switching to a different hue. */
+input:hover:not(:disabled, :focus),
+textarea:hover:not(:disabled, :focus) {
+  box-shadow: 0 0 0 0.5px color-mix(in srgb, var(--text) 26%, transparent),
+    0 3px 7.5px rgb(0 0 0 / 0.04);
+}
+
+input:disabled,
+textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/**
+ * Dropdowns follow the host's shape, not the web's.
+ *
+ * Codex Desktop has no native `<select>` anywhere (build 6321: 0 selects, 0
+ * listbox triggers, 14 menu-trigger buttons), so a filled bordered box reads as
+ * foreign next to it. The host's trigger is transparent until hovered, with a
+ * 1px transparent border holding the space so nothing shifts.
+ */
+.select-trigger {
+  min-width: 0;
+  height: var(--control-h);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+
+.select-trigger:hover:not([disabled]),
+.select-trigger[data-state="open"] { background: var(--hover); }
+
+.select-trigger[disabled] {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.select-trigger-value {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-align: start;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.select-trigger[data-placeholder] .select-trigger-value { color: var(--placeholder); }
+
+.select-trigger-icon {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  color: var(--dim);
+}
+
+/* Measured off the host's own menu: radius 15px, no border, a 0.5px ring in the
+   border token and a soft drop shadow over the dropdown surface, 4px padding. */
+.select-content {
+  z-index: 40;
+  min-width: var(--radix-select-trigger-width);
+  max-height: var(--radix-select-content-available-height);
+  overflow: hidden;
+  border: 0;
+  border-radius: var(--r-xl);
+  background: var(--panel-2);
+  color: var(--text);
+  box-shadow: 0 0 0 0.5px var(--border), 0 3px 7.5px rgb(0 0 0 / 0.04),
+    0 12px 32px rgb(0 0 0 / 0.12);
+}
+
+.select-viewport { padding: 4px; }
+
+/* The host's menu rows: radius --radius-lg, 5px 8px. */
+.select-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 28px;
+  padding: 5px 8px;
+  border-radius: var(--r-lg);
+  outline: none;
+  cursor: pointer;
+  user-select: none;
+}
+
+.select-item[data-highlighted] { background: var(--hover); }
+
+.select-item[data-disabled] {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.select-item-check {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  margin-inline-start: auto;
+  color: var(--accent);
+}
+
+.select-label {
+  padding: 6px 8px 2px;
+  color: var(--dim);
+  font-size: 13px;
+}
+
+.select-separator {
+  height: 1px;
+  margin: 4px;
+  background: var(--border);
+}
+
+textarea {
+  width: 100%;
+  min-height: 96px;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--placeholder);
+  opacity: 1;
+}
+
+/**
+ * The UA's own clear button is not in the host's vocabulary.
+ *
+ * Codex ships no `type="search"` anywhere in its bundle, so the accent-coloured
+ * ✕ Chromium paints inside a search field answers to no token here — and in the
+ * sidebar panel it lands directly beneath the panel's own close control, which
+ * does something else entirely. The input keeps `type="search"` for its
+ * `searchbox` role; only the decoration goes.
+ */
+input[type="search"]::-webkit-search-cancel-button,
+input[type="search"]::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+/* Every semantic state travels on the ring — nothing here carries a border for
+   a `border-color` to reach. */
+input[aria-invalid="true"],
+textarea[aria-invalid="true"] {
+  box-shadow: 0 0 0 1px var(--danger), 0 3px 7.5px rgb(0 0 0 / 0.04);
+}
+
+.select-trigger[aria-invalid="true"] { box-shadow: inset 0 0 0 1px var(--danger); }
+
+a { color: var(--link); }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 999px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+.sr-only {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+/* ── app shell ─────────────────────────────────────────────────────── */
+
+.weft-mount {
+  display: block;
+  height: 100%;
+  min-height: 100%;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 16px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+.weft-sidebar-mount {
+  background: transparent;
+  overflow: hidden;
+}
+
+.weft-workspace-mount,
+.embedded-main {
+  min-height: 100%;
+  background: var(--color-token-main-surface-primary, var(--panel));
+}
+
+.weft-overlay-mount {
+  position: relative;
+  height: 100%;
+  pointer-events: none;
+}
+
+.weft-overlay-mount > * {
+  pointer-events: auto;
+}
+
+.weft-react-host {
+  pointer-events: none;
+}
+
+.preview-shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+.preview-sidebar {
+  flex: 0 0 268px;
+  min-width: 0;
+  border-inline-end: 0.5px solid var(--border);
+}
+
+.preview-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.modal-body {
+  color-scheme: inherit;
+}
+
+.sidebar-surface {
+  position: relative;
+  height: 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: 8px;
+  overflow: hidden;
+  background: transparent;
+}
+
+.sidebar-workspace-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.sidebar-workspace-select {
+  min-width: 0;
+  flex: 1;
+  font-weight: 600;
+}
+
+.sidebar-header-entries {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.sidebar-header-entries button[data-active="true"] {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.sidebar-inbox-entry { position: relative; }
+
+.sidebar-inbox-badge {
+  position: absolute;
+  top: -1px;
+  inset-inline-end: -1px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 999px;
+  background: var(--link);
+  color: var(--on-accent);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 14px;
+  text-align: center;
+  pointer-events: none;
+}
+
+/* The panel covers the column rather than pushing it: search and the inbox are
+   momentary, and reflowing the whole tree under them loses the reader's place. */
+.sidebar-panel {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: 8px;
+  background: var(--vscode-sideBar-background, var(--bg));
+}
+
+.sidebar-panel-header {
+  min-height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.sidebar-panel-header h2 {
+  margin: 0;
+  color: var(--dim-2);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.sidebar-panel-list {
+  min-height: 0;
+  flex: 1;
+  display: grid;
+  align-content: start;
+  gap: 1px;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.sidebar-search-field {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.sidebar-search-field > svg {
+  position: absolute;
+  inset-inline-start: 8px;
+  width: 13px;
+  height: 13px;
+  color: var(--dim);
+  pointer-events: none;
+}
+
+.sidebar-search-field input {
+  width: 100%;
+  padding-inline-start: 26px;
+}
+
+.sidebar-result-row {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: start;
+  gap: 7px;
+  min-height: 38px;
+  padding: 6px 8px;
+  border-radius: var(--r-md);
+  text-align: start;
+}
+
+.sidebar-result-row:hover { background: var(--hover); }
+
+.sidebar-result-kind {
+  margin-top: 2px;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+.sidebar-primary-actions { display: grid; gap: 2px; }
+
+.sidebar-create-button {
+  width: 100%;
+  justify-content: flex-start;
+  padding-inline: 8px;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.sidebar-create-button svg { color: var(--link); }
+
+.sidebar-nav {
+  display: grid;
+  gap: 2px;
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.sidebar-nav-button {
+  width: 100%;
+  justify-content: flex-start;
+  padding-inline: 8px;
+  color: var(--dim);
+}
+
+.sidebar-nav-button[data-active="true"] {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.sidebar-scroll {
+  min-height: 0;
+  flex: 1;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 1px;
+}
+
+.sidebar-section + .sidebar-section { margin-top: var(--space-4); }
+
+.sidebar-section-heading {
+  min-height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: 2px 8px;
+  color: var(--dim);
+}
+
+/**
+ * A section heading is a row label that is one notch quieter, not a different
+ * kind of type.
+ *
+ * Codex sets Projects / Recents at exactly its row size (14px on a 16px root)
+ * and separates them by weight and colour alone — 500 against the rows' 445,
+ * `text-tertiary` against the rows' 85% foreground. No caps, no tracking, no
+ * step down in size. Weft's rows are `body`, so its headings are `body` too;
+ * the smaller all-caps label these used to be was a web idiom the host does
+ * not speak.
+ */
+.sidebar-section-heading h2 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--dim-2);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-section-count {
+  min-width: 18px;
+  font-size: 13px;
+  text-align: right;
+}
+
+.sidebar-list { display: grid; gap: 1px; }
+
+.sidebar-issue-row {
+  min-width: 0;
+  border-radius: var(--r-lg);
+}
+
+.sidebar-issue-row[data-active="true"] {
+  background: var(--hover);
+}
+
+.sidebar-issue-main,
+.thread-row,
+.sidebar-attention-row {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  border-radius: var(--r-lg);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.sidebar-issue-main {
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+}
+
+.sidebar-issue-main .sidebar-issue-title-viewport {
+  flex: 1 1 0;
+  width: auto;
+}
+
+/* The lead's chats, now inside the issue detail. */
+.issue-conversations {
+  display: grid;
+  gap: 1px;
+}
+
+.sidebar-task-chat {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.thread-row {
+  min-height: 30px;
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 7px;
+  font-size: 13px;
+}
+
+.thread-row[data-nested="true"] {
+  padding-inline-start: 17px;
+}
+
+.thread-row > svg {
+  width: 13px;
+  height: 13px;
+  color: var(--dim);
+}
+
+.thread-row:hover,
+.thread-row[data-active="true"],
+.sidebar-issue-main:hover {
+  background: var(--hover);
+}
+
+.thread-row[data-active="true"] {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.thread-row[data-active="true"] > svg {
+  color: var(--link);
+}
+
+.thread-row[data-opening="true"],
+.sidebar-issue-main[data-opening="true"] {
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+.thread-row-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-primary-chip,
+.sidebar-status-chip {
+  max-width: 68px;
+  overflow: hidden;
+  padding: 1px 5px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-primary-chip {
+  border: 1px solid transparent;
+  box-shadow: inset 0 0 0 0.5px var(--accent);
+  color: var(--link);
+}
+
+.sidebar-status-chip {
+  color: var(--dim);
+  background: var(--hover);
+}
+
+.sidebar-needs-you-chip {
+  flex: 0 0 auto;
+  max-width: 72px;
+  overflow: hidden;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: var(--hover);
+  color: var(--warn);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-status-chip.status-working { color: var(--warn); }
+.sidebar-status-chip.status-review { color: var(--link); }
+.sidebar-status-chip.status-active { color: var(--link); }
+.sidebar-status-chip.status-done { color: var(--ok); }
+
+.sidebar-chat-pending {
+  display: block;
+  margin: 0;
+  padding: 4px 7px 5px 27px;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+.sidebar-attention-row {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr);
+  align-items: start;
+  gap: 7px;
+  min-height: 38px;
+  padding: 6px 8px;
+}
+
+.sidebar-attention-row > svg {
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+  color: var(--warn);
+}
+
+.sidebar-attention-row[data-kind="review"] > svg { color: var(--ok); }
+
+.sidebar-attention-row:hover {
+  background: var(--hover);
+}
+
+.sidebar-row-title,
+.sidebar-row-meta {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-row-title { font-size: 14px; line-height: 1.45; }
+.sidebar-row-meta { color: var(--dim); font-size: 12px; line-height: 1.35; }
+
+.sidebar-issue-title-viewport {
+  min-width: 0;
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  white-space: nowrap;
+}
+
+.sidebar-issue-title-viewport::-webkit-scrollbar { display: none; }
+
+.sidebar-issue-title-viewport[data-overflow="true"] {
+  -webkit-mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 30px), transparent 100%);
+  mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 30px), transparent 100%);
+}
+
+.sidebar-issue-title-viewport .sidebar-row-title {
+  width: max-content;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.sidebar-empty {
+  margin: 0;
+  padding: 7px 8px;
+  color: var(--dim);
+  font-size: 14px;
+}
+
+.sidebar-footer {
+  min-width: 0;
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 3px 6px 0;
+  border-top: 1px solid var(--border);
+  color: var(--dim);
+  font-size: 13px;
+}
+
+.sidebar-error,
+.sidebar-status {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-error {
+  color: var(--danger);
+}
+
+.sidebar-status {
+  color: var(--dim);
+}
+
+.sidebar-footer-retry {
+  flex: none;
+  height: 22px;
+  padding-inline: 8px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.sidebar-footer-retry:hover {
+  background: var(--hover);
+}
+
+.embedded-main { padding: var(--space-4); }
+
+/**
+ * Weft's own two-pane stage.
+ *
+ * The panes carry the padding, not `main`, so the detail's edge can reach the
+ * stage's real edges — a drawer that stops short of them reads as a floating
+ * card, which is not what the host does.
+ */
+.embedded-main:has(> .stage-split:not([data-detail="closed"])) { padding: 0; }
+
+.stage-split {
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  align-items: stretch;
+}
+
+.stage-split > .stage-board {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+}
+
+.stage-split:not([data-detail="closed"]) > .stage-board { padding: var(--space-4); }
+
+/* Taking over rather than vanishing: the detail is what the card click asked
+   for, so a stage too narrow to share gives it everything. */
+.stage-split[data-detail="full"] > .stage-board { display: none; }
+
+.stage-detail {
+  min-width: 0;
+  flex: 0 0 auto;
+  width: var(--stage-detail-w, 100%);
+  padding: var(--space-4);
+  overflow: auto;
+  background: var(--panel);
+  /* Boundary is the shadow alone — the host draws no line here either. */
+  box-shadow: -8px 0 16px -8px rgb(0 0 0 / 0.18);
+}
+
+.stage-split[data-detail="full"] > .stage-detail {
+  width: 100%;
+  box-shadow: none;
+}
+
+/* Close sits at the drawer's outer edge; the slot was left-aligned back when a
+   back arrow lived in it. */
+.stage-detail .detail-nav {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.stage-detail .detail-nav > :first-child {
+  margin-inline-start: 0;
+  padding-inline: 6px;
+}
+
+/**
+ * A 16px grab area straddling the edge, with nothing drawn in it. Same shape
+ * the host gives its own panel divider (`w-4 -translate-x-2`).
+ */
+.stage-divider {
+  position: relative;
+  z-index: 1;
+  flex: 0 0 auto;
+  width: 16px;
+  margin-inline: -8px;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+#topbar {
+  min-height: 52px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 10px max(var(--space-4), env(safe-area-inset-right)) 10px max(var(--space-4), env(safe-area-inset-left));
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+#topbar nav,
+.workspace-controls,
+.analysis-actions,
+.issue-actions,
+.repo-actions,
+.btns {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.workspace-controls {
+  min-width: 0;
+  margin-left: auto;
+  gap: var(--space-2);
+}
+
+.workspace-select-shell { width: 150px; max-width: 280px; }
+#workspace-select { min-width: 0; }
+.nav-btn.active { background: var(--hover); }
+
+main {
+  min-width: 0;
+  padding: var(--space-4);
+}
+
+.app-loading {
+  padding: clamp(56px, 12vh, 112px) var(--space-4);
+  color: var(--dim);
+  text-align: center;
+}
+
+.view { display: none; }
+.view.active { display: block; }
+
+.view-heading {
+  max-width: 1100px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+.view-heading h1 { margin: 0; font-size: 16px; line-height: 1.35; }
+.view-heading p { margin: 4px 0 0; color: var(--dim); font-size: 14px; }
+
+.actions { margin: 0; }
+
+.inline-error,
+.field-error,
+.modal-error,
+.repo-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.inline-error { padding-top: 1px; }
+
+.empty-state {
+  max-width: 480px;
+  /* Fixed-ish top offset so Kanban ↔ Repositories empty screens share one
+     visual anchor instead of a soft vh band that feels different per route. */
+  margin: 96px auto 64px;
+  padding: 0 var(--space-4);
+  text-align: center;
+}
+
+.empty-state h2 {
+  margin: 0 0 var(--space-2);
+  font-size: 16px;
+  line-height: 1.3;
+}
+
+.empty-state p {
+  margin: 0 auto var(--space-4);
+  color: var(--dim);
+  line-height: 1.55;
+}
+
+/* ── kanban ───────────────────────────────────────────────────────── */
+
+/* The inline 6px lets the columns' hairline ring breathe; there is no top
+   padding because the toolbar, not the board, is the first child here. */
+#issues {
+  min-width: 0;
+  padding: 0 6px;
+}
+
+/* Keep empty-workspace / empty-list screens aligned across routes.
+   Kanban nests EmptyState under #issues (board padding); Repositories does
+   not. Zero the board padding for empty states so switching does not jump. */
+#issues:has(> .empty-state) {
+  padding: 0;
+}
+
+.kanban-toolbar {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.kanban-search {
+  position: relative;
+  width: min(320px, 42vw);
+  min-width: 220px;
+}
+
+.kanban-search > svg {
+  position: absolute;
+  top: 50%;
+  left: 11px;
+  z-index: 1;
+  width: 14px;
+  height: 14px;
+  color: var(--dim);
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+.kanban-search input {
+  height: 40px;
+  padding-inline: 34px var(--space-3);
+  border-radius: var(--r-md);
+  background: var(--color-token-input-background, var(--vscode-input-background, var(--panel)));
+}
+
+.kanban-issue-filter {
+  width: 168px;
+  min-width: 148px;
+}
+
+.kanban-issue-filter select {
+  height: 40px;
+  border-radius: var(--r-md);
+  background: var(--color-token-input-background, var(--vscode-input-background, var(--panel)));
+}
+
+.kanban-filter-empty {
+  margin: -4px 0 var(--space-2);
+  color: var(--dim);
+  font-size: 14px;
+}
+
+.kanban-board-scroll {
+  min-width: 0;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  padding-bottom: 2px;
+}
+
+.kanban-board {
+  min-width: 720px;
+  min-height: max(520px, calc(100dvh - 152px));
+  display: grid;
+  grid-template-columns: repeat(4, minmax(168px, 1fr));
+  gap: var(--space-2);
+}
+
+.kanban-column {
+  min-width: 0;
+  padding: 8px;
+  border: 0;
+  box-shadow: 0 0 0 0.5px var(--border);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--panel-2) 42%, var(--panel));
+}
+
+.kanban-column-heading {
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: 1px 3px 7px;
+  color: var(--dim);
+}
+
+.kanban-column-heading h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.kanban-column-cards {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 8px;
+}
+
+.kanban-card {
+  position: relative;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: var(--r-md);
+  background: var(--panel);
+  box-shadow: 0 0 0 0.5px var(--border), 0 3px 7.5px rgb(0 0 0 / 0.04);
+}
+
+/* No coloured outline: the host never tints a container to signal state, and a
+   ring around the whole card shouts louder than the thing it is reporting. The
+   card keeps its ordinary edge and the signal rides on the text, which is also
+   what satisfies "state must not depend on colour alone". */
+
+.issue-board-card {
+  padding: 10px;
+}
+
+/* The title leads and owns the full column width. The issue number used to sit
+   beside it as a filled pill, spending ~40px of a ~200px column on a secondary
+   identifier and forcing long titles onto a third line. */
+.issue-board-card-body {
+  display: block;
+  width: 100%;
+  text-align: start;
+}
+
+.issue-board-card-body .kanban-card-issue-title {
+  display: -webkit-box;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  -webkit-line-clamp: 3;
+}
+
+/* One meta row carries identifier, signal and action, replacing the separate
+   action row underneath. */
+.issue-board-card-meta {
+  min-width: 0;
+  margin-top: 5px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.issue-board-card-number {
+  flex: none;
+  color: var(--dim);
+}
+
+.issue-board-card-signal {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--warn);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.issue-board-card-meta .issue-board-lead-link {
+  flex: none;
+  margin-inline-start: auto;
+}
+
+.issue-board-lead-link {
+  color: var(--dim);
+}
+
+.issue-board-lead-link:hover {
+  color: var(--text);
+}
+
+.thread-link-icon,
+.async-button-icon {
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+}
+
+.kanban-column-count {
+  min-width: 18px;
+  height: 18px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--hover);
+  color: var(--dim);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.kanban-card-issue {
+  width: 100%;
+  min-width: 0;
+  min-height: 22px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  text-align: left;
+}
+
+.kanban-card-issue:hover .kanban-card-issue-title { color: var(--link); }
+
+.kanban-card-issue-title {
+  min-width: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  font-size: 13px;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.kanban-card .name {
+  margin: 9px 0 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.kanban-card .sub {
+  margin: 4px 0 7px;
+  overflow: hidden;
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kanban-card-actions {
+  position: relative;
+  min-height: 27px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-1);
+  padding-top: 1px;
+}
+
+.kanban-card-actions > button,
+.kanban-card-actions > .thread-link {
+  height: 27px;
+  min-height: 27px;
+  padding: 0 7px;
+  font-size: 13px;
+}
+
+.kanban-card-actions > .thread-link:first-child,
+.kanban-card-actions > button:first-child {
+  margin-inline-start: -1px;
+  padding-inline-start: 0;
+}
+
+.issue-head {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+}
+
+.issue-identity,
+.repo-identity,
+.task-detail-identity {
+  min-width: 0;
+}
+
+.issue-identity h2 { margin: 0; }
+
+.issue-title-link {
+  height: auto;
+  min-height: 28px;
+  max-width: 100%;
+  justify-content: flex-start;
+  padding: 1px 2px;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.4;
+  text-align: left;
+  vertical-align: top;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.issue-title-link:hover { color: var(--link); }
+.meta { color: var(--dim); font-size: 14px; }
+.issue-identity .meta { display: block; margin-top: 2px; }
+.issue-context {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.issue-context .meta { display: inline; margin: 0; }
+
+.issue-kind {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  box-shadow: inset 0 0 0 0.5px var(--border);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--dim);
+  font-size: 12px;
+  line-height: 1;
+}
+.issue-actions { justify-content: flex-end; flex-wrap: wrap; }
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: var(--r-sm);
+  /* A tint carrying warn-coloured text, not a solid warn fill with literal
+     dark text: --warn is amber in dark and a deep brown in light, so one fixed
+     ink cannot stay readable on both. Alpha on the semantic colour can. */
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+  color: var(--warn);
+  font-size: 12px;
+  font-weight: 600;
+  vertical-align: 1px;
+}
+
+/* Attention reads as a quiet marker rather than a solid block: the card
+   already carries a warning border, so repeating it at full strength made a
+   routine "needs you" look like a crash. */
+.badge-attention {
+  gap: 3px;
+  padding: 1px 5px 1px 4px;
+  background: color-mix(in srgb, var(--warn) 18%, transparent);
+  color: var(--warn);
+  font-weight: 500;
+}
+
+.badge-attention > svg {
+  width: 11px;
+  height: 11px;
+  flex: 0 0 auto;
+}
+
+/* The promote control sits beside the row, not inside it — a button within a
+   button is invalid markup. Dimmed until hover or focus, but always tabbable. */
+.thread-row-wrap {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.thread-row-wrap > .thread-row { flex: 1 1 auto; }
+
+.thread-row-promote {
+  flex: 0 0 auto;
+  opacity: 0.35;
+  color: var(--dim);
+}
+
+.thread-row-wrap:hover .thread-row-promote,
+.thread-row-promote:focus-visible { opacity: 1; color: var(--text); }
+
+/* ── artifacts ────────────────────────────────────────────────────── */
+
+.sidebar-artifacts {
+  min-width: 0;
+  padding: 4px 0 6px;
+  border-top: 1px solid var(--border);
+}
+
+.sidebar-artifacts-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 8px 4px;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+.sidebar-artifacts-heading h3 {
+  margin: 0;
+  font-size: inherit;
+  font-weight: 600;
+}
+
+.sidebar-artifact-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 2px 6px;
+  width: 100%;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: var(--r-lg);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.sidebar-artifact-row:hover,
+.sidebar-artifact-row:focus-visible {
+  background: var(--hover);
+  outline: none;
+}
+
+.sidebar-artifact-row:focus-visible { box-shadow: inset 0 0 0 1px var(--focus); }
+
+.sidebar-artifact-row > svg { width: 13px; height: 13px; color: var(--dim); }
+
+.sidebar-artifact-name {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Status rides in the text, never in colour alone. */
+.sidebar-artifact-meta {
+  grid-column: 2;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+.sidebar-artifact-row[data-status="stale"] .sidebar-artifact-meta { color: var(--warn); }
+.sidebar-artifact-row[data-status="superseded"] .sidebar-artifact-name { text-decoration: line-through; }
+
+.artifact-view {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 16px 16px;
+}
+
+.artifact-header { display: flex; align-items: flex-start; gap: 10px; }
+.artifact-heading { min-width: 0; }
+.artifact-heading h2 { margin: 0; font-size: 16px; }
+.artifact-meta { margin: 2px 0 0; color: var(--dim); font-size: 13px; }
+
+.artifact-stale {
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+  color: var(--warn);
+  font-size: 14px;
+}
+
+.artifact-conflict {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 0;
+  box-shadow: 0 0 0 0.5px var(--warn);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+
+.artifact-conflict p { margin: 0; font-size: 14px; }
+
+.artifact-content {
+  min-height: 0;
+  flex: 1 1 auto;
+  padding: 10px 12px;
+  border: 0;
+  box-shadow: 0 0 0 0.5px var(--border);
+  border-radius: var(--r-md);
+  background: var(--color-token-input-background, var(--vscode-input-background, transparent));
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.6;
+  resize: none;
+}
+
+.artifact-actions { display: flex; justify-content: flex-end; }
+
+/* ── mindmap ──────────────────────────────────────────────────────── */
+
+.artifact-header-actions { display: flex; align-items: center; gap: 4px; margin-inline-start: auto; }
+
+/* Fullscreen is a plain overlay, not an animated transition: the point is to
+   read a long tree, and motion here would only get in the way. */
+.artifact-view[data-fullscreen="true"] {
+  position: fixed;
+  z-index: 40;
+  inset: 0;
+  background: var(--panel);
+}
+
+.artifact-map {
+  min-height: 0;
+  flex: 1 1 auto;
+  padding: 4px 2px;
+  overflow: auto;
+}
+
+.mindmap-preamble { margin: 0 0 8px; color: var(--dim); font-size: 14px; }
+.mindmap-empty { margin: 0; color: var(--dim); font-size: 14px; }
+
+.mindmap-root,
+.mindmap-children { margin: 0; padding: 0; list-style: none; }
+
+/* The guide line is what makes depth readable once a tree gets deep. */
+.mindmap-children {
+  margin-inline-start: 9px;
+  padding-inline-start: 12px;
+  border-inline-start: 1px solid var(--border);
+}
+
+.mindmap-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  min-width: 0;
+  padding: 2px 4px;
+  border-radius: var(--r-sm);
+}
+
+.mindmap-row:hover { background: var(--hover); }
+.mindmap-row:focus-within { background: var(--hover); }
+
+.mindmap-toggle,
+.mindmap-ask {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  margin-top: 1px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.mindmap-toggle svg,
+.mindmap-ask svg { width: 12px; height: 12px; }
+
+.mindmap-toggle:hover,
+.mindmap-ask:hover { color: var(--text); background: var(--border); }
+
+/* Dim until hovered or focused, but always present and always tabbable —
+   a control that only exists on hover cannot be reached by keyboard. */
+.mindmap-ask { margin-inline-start: auto; opacity: 0.35; }
+.mindmap-row:hover .mindmap-ask,
+.mindmap-ask:focus-visible { opacity: 1; }
+
+.mindmap-bullet {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  position: relative;
+}
+
+.mindmap-bullet::before {
+  content: "";
+  position: absolute;
+  top: 8px;
+  left: 7px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--border-strong);
+}
+
+.mindmap-text { min-width: 0; font-size: 14px; line-height: 1.55; }
+.mindmap-node[data-leaf="false"] > .mindmap-row > .mindmap-text { font-weight: 600; }
+
+.mindmap-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0 6px 23px;
+  padding: 8px;
+  border: 0;
+  box-shadow: 0 0 0 0.5px var(--border);
+  border-radius: var(--r-md);
+  background: var(--panel-2);
+}
+
+.mindmap-composer-kinds { display: flex; gap: 4px; }
+
+.mindmap-kind {
+  padding: 2px 8px;
+  border: 1px solid transparent;
+  box-shadow: inset 0 0 0 0.5px var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--dim);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.mindmap-kind[data-active="true"] {
+  box-shadow: inset 0 0 0 0.5px var(--accent);
+  color: var(--accent);
+}
+
+.mindmap-composer-input { min-height: 52px; font-size: 14px; }
+.mindmap-composer-actions { display: flex; justify-content: flex-end; gap: 6px; }
+
+/* ── issue detail ─────────────────────────────────────────────────── */
+
+.detail-nav { margin-bottom: var(--space-3); }
+.detail-nav > :first-child {
+  margin-inline-start: -1px;
+  padding-inline-start: 0;
+}
+.detail-head {
+  margin-bottom: 0;
+  border: 0;
+  border-radius: var(--r-lg);
+  box-shadow: 0 0 0 0.5px var(--border);
+}
+.detail-title { font-size: 16px; font-weight: 650; overflow-wrap: anywhere; }
+
+.section-title,
+#repo-map-heading {
+  margin: var(--space-5) 0 var(--space-2);
+  color: var(--dim);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.task-list {
+  max-width: 1040px;
+  overflow: hidden;
+  border: 0;
+  box-shadow: 0 0 0 0.5px var(--border);
+  border-radius: var(--r-lg);
+  background: var(--panel);
+}
+
+.task-list > .meta { display: block; padding: var(--space-4); }
+
+.task-detail { padding: var(--space-3); }
+.task-detail + .task-detail { border-top: 1px solid var(--border); }
+
+.task-detail-head {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.task-detail-identity { flex: 1; }
+.task-detail h3 { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
+.task-detail .meta { margin: 2px 0 0; overflow-wrap: anywhere; }
+.task-detail .btns { flex-wrap: wrap; justify-content: flex-end; }
+
+.status-chip,
+.runstate {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: var(--hover);
+  color: var(--dim);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.status-working,
+.runstate-running { color: var(--warn); }
+.status-done,
+.runstate-done { color: var(--ok); }
+.runstate-failed { color: var(--danger); }
+
+.task-reason {
+  margin: var(--space-2) 0 0;
+  color: var(--dim);
+  font-size: 14px;
+}
+
+.task-attention,
+.issue-lead-attention {
+  color: var(--warn);
+  font-size: 14px;
+}
+
+.task-attention {
+  margin: var(--space-2) 0 0;
+}
+
+.task-brief { margin-top: var(--space-3); }
+.task-brief h4 { margin: 0 0 6px; color: var(--dim); font-size: 14px; font-weight: 600; }
+.task-brief .spec {
+  max-height: 280px;
+  margin: 0;
+  overflow: auto;
+  padding: 10px 11px;
+  border-radius: var(--r-md);
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.timeline { max-width: 860px; }
+.timeline .msg { padding: 10px 2px; }
+.timeline .msg + .msg { border-top: 1px solid var(--border); }
+.timeline .msg-meta { margin-bottom: 4px; color: var(--dim); font-size: 13px; }
+.timeline .msg-text { font-size: 14px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.timeline .msg.human .msg-text {
+  display: inline-block;
+  padding: 8px 12px;
+  border-radius: var(--r-lg);
+  background: var(--panel-2);
+}
+
+/* ── repositories ─────────────────────────────────────────────────── */
+
+#repo-list,
+.repo-map-section { max-width: 1100px; }
+
+.repo {
+  margin-bottom: 10px;
+  padding: 12px 14px;
+  border: 0;
+  box-shadow: 0 0 0 0.5px var(--border);
+  border-radius: var(--r-lg);
+  background: var(--panel);
+}
+
+.repo-head {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.repo h2 { margin: 0; font-size: 14px; }
+.repo .path {
+  display: block;
+  margin-top: 3px;
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+.repo-base {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  color: var(--dim);
+  font-size: 13px;
+}
+
+.repo-base svg { width: 12px; height: 12px; }
+
+.repo-actions { flex: none; }
+.repo .summary { margin: 10px 0 0; line-height: 1.55; }
+.repo .tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 9px 0 0; }
+.repo-error { margin-top: var(--space-2); }
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 1px 7px;
+  border: 1px solid transparent;
+  box-shadow: inset 0 0 0 0.5px var(--border);
+  border-radius: var(--r-sm);
+  background: var(--panel-2);
+  color: var(--dim);
+  font-size: 13px;
+}
+
+.tag.layer { box-shadow: inset 0 0 0 0.5px var(--link); color: var(--link); }
+.repo-components { margin-top: var(--space-3); border-top: 1px solid var(--border); }
+.repo-components summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  color: var(--dim);
+  font-size: 14px;
+  cursor: pointer;
+  list-style: none;
+}
+.repo-components summary::-webkit-details-marker { display: none; }
+.repo-components summary svg { width: 13px; height: 13px; }
+.repo-component-list {
+  display: grid;
+  gap: 1px;
+  overflow: hidden;
+  border: 0;
+  box-shadow: 0 0 0 0.5px var(--border);
+  border-radius: var(--r-md);
+}
+.repo-component { padding: 9px 10px; background: var(--panel-2); }
+.repo-component + .repo-component { border-top: 1px solid var(--border); }
+.repo-component > div { display: flex; align-items: baseline; gap: var(--space-2); }
+.repo-component strong { font-size: 14px; }
+.repo-component code {
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.repo-component p { margin: 4px 0 0; color: var(--dim); font-size: 14px; }
+.relations { margin-top: var(--space-5); }
+.rel { padding: 9px 0; color: var(--dim); font-size: 14px; overflow-wrap: anywhere; }
+.rel + .rel { border-top: 1px solid var(--border); }
+.rel strong { display: block; color: var(--text); font-weight: 600; }
+.rel span { display: block; margin-top: 2px; font-size: 13px; }
+.rel p { margin: 4px 0 0; }
+.repo-map-section { margin-top: var(--space-5); }
+
+#repo-map-doc {
+  max-width: 100%;
+  max-height: 560px;
+  margin: 0;
+  overflow: auto;
+  padding: 14px;
+  border: 0;
+  border-radius: var(--r-lg);
+  background: var(--panel);
+  box-shadow: 0 0 0 0.5px var(--border);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ── modal and feedback ───────────────────────────────────────────── */
+
+.modal {
+  width: fit-content;
+  max-width: calc(100vw - 24px);
+  height: fit-content;
+  max-height: calc(100dvh - 24px);
+  margin: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  overflow: visible;
+}
+
+.modal:not([open]) { display: none; }
+.modal::backdrop { background: rgba(0, 0, 0, 0.2); }
+
+/**
+ * Chrome for the Radix dialog. The component keeps positioning and animation;
+ * everything visual lives here. Utilities left on the component leak whatever
+ * this file does not declare — `text-sm` did exactly that, landing form fields
+ * at 0.875rem (10.5px at our 13px root) instead of body size.
+ */
+.dialog-content {
+  gap: var(--space-4);
+  color: var(--text);
+  font-size: 14px;
+}
+
+.dialog-overlay-scrim { background: rgb(0 0 0 / 0.2); }
+
+.dialog-description {
+  color: var(--dim);
+  font-size: 13px;
+}
+
+.modal-body {
+  width: min(440px, calc(100vw - 32px));
+  max-width: calc(100vw - 32px);
+  max-height: calc(100dvh - 32px);
+  overflow: auto;
+  padding: 20px;
+  border: 0;
+  border-radius: var(--r-xl);
+  background: var(--panel-2);
+  color: var(--text);
+  box-shadow: 0 0 0 0.5px var(--border), 0 24px 64px rgb(0 0 0 / 0.18);
+  animation: modal-in 150ms ease-out;
+}
+
+@keyframes modal-in {
+  from { opacity: 0; transform: scale(0.98) translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+
+.modal-header {
+  align-items: flex-start;
+  flex-direction: row;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: 18px;
+}
+
+.modal-heading { min-width: 0; flex: 1; }
+.modal-body h2,
+.modal-body [data-slot="dialog-title"] {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+.modal-heading p,
+.modal-body [data-slot="dialog-description"] {
+  margin: 6px 0 0;
+  color: var(--dim);
+  font-size: 14px;
+  line-height: 1.45;
+}
+.modal-close {
+  flex: none;
+  margin: -6px -6px 0 0;
+  color: var(--dim);
+}
+.modal-close:hover { color: var(--text); }
+.form-stack { display: grid; gap: 14px; }
+.form-field { min-width: 0; }
+
+.form-field label {
+  display: block;
+  margin: 0 0 6px;
+  color: var(--dim);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.form-field input,
+.form-field textarea,
+.form-field .select-trigger { width: 100%; }
+
+/* Modal fields sit on a larger surface, so they take the next radius up.
+   Text fields still follow the no-outline standard; the caret is the signal. */
+.modal-body [data-slot="input"],
+.modal-body [data-slot="textarea"],
+.modal-body [data-slot="select-trigger"] {
+  border-radius: var(--r-lg);
+}
+.field-error { margin-top: 5px; }
+.repo-paths-input { min-height: 132px; font-family: var(--mono); font-size: 14px; }
+.repo-picker-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--dim);
+  font-size: 14px;
+}
+.repo-picker-row > span { min-width: 0; }
+.form-hint,
+.import-summary { margin: 0; color: var(--dim); font-size: 14px; line-height: 1.5; }
+.import-summary { color: var(--warn); }
+.field-error { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.modal-error { margin-top: 12px; }
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 10px;
+  margin-top: 20px;
+}
+.modal-actions [data-slot="button"][data-variant="ghost"] {
+  color: var(--dim);
+  min-width: 64px;
+}
+.modal-actions [data-slot="button"][data-variant="contrast"],
+.modal-actions [data-slot="button"][data-variant="default"] {
+  min-width: 72px;
+  border-radius: 999px;
+  padding-inline: 14px;
+}
+
+.notifications {
+  position: fixed;
+  right: 18px;
+  bottom: max(18px, env(safe-area-inset-bottom));
+  z-index: 30;
+  display: grid;
+  justify-items: end;
+  gap: var(--space-2);
+  pointer-events: none;
+}
+
+.weft-overlay-toasts {
+  z-index: 60;
+}
+
+.weft-overlay-mount > .weft-overlay-toasts {
+  pointer-events: none;
+}
+
+.toast {
+  max-width: min(420px, calc(100vw - 36px));
+  padding: 9px 12px;
+  border: 0;
+  border-radius: var(--r-md);
+  background: var(--panel-2);
+  color: var(--text);
+  box-shadow: 0 0 0 0.5px var(--border), 0 3px 7.5px rgb(0 0 0 / 0.04), 0 12px 32px rgb(0 0 0 / 0.12);
+}
+
+.toast-success { box-shadow: 0 0 0 0.5px var(--ok), 0 3px 7.5px rgb(0 0 0 / 0.04), 0 12px 32px rgb(0 0 0 / 0.12); }
+.toast-error { box-shadow: 0 0 0 0.5px var(--danger), 0 3px 7.5px rgb(0 0 0 / 0.04), 0 12px 32px rgb(0 0 0 / 0.12); }
+
+/* ── responsive behavior ──────────────────────────────────────────── */
+
+@media (min-width: 721px) and (max-width: 1050px) {
+  .kanban-board { min-width: 656px; grid-template-columns: repeat(4, minmax(148px, 1fr)); }
+}
+
+@media (max-width: 720px) {
+  :root { --control-h: 44px; font-size: 14px; }
+
+  #topbar {
+    flex-wrap: wrap;
+    align-items: stretch;
+    gap: 7px;
+    padding: 8px max(12px, env(safe-area-inset-right)) 8px max(12px, env(safe-area-inset-left));
+  }
+
+  #topbar nav { width: 100%; }
+  #topbar nav .nav-btn { flex: 1; }
+
+  .workspace-controls {
+    width: 100%;
+    margin-left: 0;
+    gap: 6px;
+  }
+
+  .workspace-select-shell { width: auto; max-width: none; flex: 1; }
+  main { padding: 12px; }
+
+  .view-heading { align-items: stretch; flex-direction: column; }
+  .view-heading > button { align-self: flex-start; }
+
+  #issues { padding: 0; }
+
+  .kanban-toolbar {
+    align-items: stretch;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-bottom: var(--space-4);
+  }
+
+  .kanban-search {
+    width: auto;
+    min-width: 180px;
+    flex: 1;
+  }
+
+  .kanban-issue-filter { width: 148px; min-width: 132px; }
+
+  .kanban-board {
+    min-width: 0;
+    min-height: 500px;
+    grid-template-columns: none;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(246px, 82vw);
+  }
+
+  .kanban-board-scroll { scroll-snap-type: inline proximity; }
+  .kanban-column { scroll-snap-align: start; }
+
+  .issue-head,
+  .repo-head,
+  .task-detail-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .issue-actions,
+  .repo-actions,
+  .task-detail .btns { justify-content: flex-start; }
+
+  .issue-actions > :first-child,
+  .task-detail .btns > :first-child {
+    margin-inline-start: -1px;
+    padding-inline-start: 0;
+  }
+
+  .status-chip { align-self: flex-start; }
+
+  .issue-title-link { min-height: 44px; }
+  .kanban-card-actions > button,
+  .kanban-card-actions > .thread-link { height: 44px; min-height: 44px; padding: 0 10px; font-size: 14px; }
+
+  .empty-state { margin: 72px auto 48px; }
+  .modal-body { width: calc(100vw - 24px); max-height: calc(100dvh - 24px); padding: 16px; }
+  .notifications { right: 12px; left: 12px; justify-items: stretch; }
+  .toast { max-width: none; }
+}
+
+@media (max-width: 430px) {
+  .modal-actions button { flex: 1; }
+}
+
+@media (pointer: coarse) {
+  button,
+  .thread-link,
+  input,
+  select,
+  summary { min-height: 44px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
