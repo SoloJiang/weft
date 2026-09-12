@@ -515,34 +515,7 @@ async fn list_repos(state: &McpState, issue_id: i64, party: &str) -> Value {
 }
 
 fn task_slug(name: &str) -> String {
-    let mut slug = String::new();
-    let mut length = 0;
-    let mut separator_pending = false;
-    for character in name.chars().flat_map(char::to_lowercase) {
-        let is_cjk = ('\u{4e00}'..='\u{9fff}').contains(&character);
-        if character.is_ascii_alphanumeric() || is_cjk {
-            if separator_pending && !slug.is_empty() {
-                if length + 1 >= 48 {
-                    break;
-                }
-                slug.push('-');
-                length += 1;
-            }
-            separator_pending = false;
-            if length >= 48 {
-                break;
-            }
-            slug.push(character);
-            length += 1;
-        } else if !slug.is_empty() {
-            separator_pending = true;
-        }
-    }
-    if slug.is_empty() {
-        "task".to_string()
-    } else {
-        slug
-    }
+    weft_slug::task_slug(name)
 }
 
 async fn create_task(state: &McpState, issue_id: i64, party: &str, args: &Value) -> Value {

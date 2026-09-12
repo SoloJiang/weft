@@ -1,0 +1,6 @@
+[package]
+name = "weft-slug"
+version = "0.1.0"
+description = "Workspace / issue / direction slugs"
+edition.workspace = true
+license.workspace = true

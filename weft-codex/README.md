@@ -215,15 +215,19 @@ weft-codex install-skills --force
 
 cd ui && pnpm typecheck && pnpm build
 cd launcher && pnpm typecheck && pnpm test
+# from the weft monorepo root:
 cargo test --workspace
 git diff --check
 ```
 
+This tree now lives inside the weft monorepo. Shared scheduler crates are
+`../crates/weft-*`. Homes stay separate: `~/.weft-codex` is not `~/.weft`.
+
 ## Project layout
 
 ```text
-crates/app-server/   Codex app-server protocol and process runtime
-crates/core/         orchestration, store, repository intake, worktrees, and bus
+crates/app-server/   Codex app-server protocol (`turn/steer` stays here)
+crates/core/         Codex orchestrator + store (adapters over weft-*)
 crates/daemon/       local HTTP, MCP, and UI daemon
 launcher/            Codex Desktop lifecycle and renderer Host
 ui/                  React Workspace, Issue, Kanban, and repository surfaces

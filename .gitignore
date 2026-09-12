@@ -27,8 +27,9 @@ dist-ssr
 # Rust
 target/
 
-# Docs (design specs, plans, diagrams — kept local)
-docs/
+# Docs (design specs, plans, diagrams — kept local). Only the repo-root
+# folder; weft-codex/docs/ is tracked product spec.
+/docs/
 
 # weft local worktrees (materialized per task)
 .claude/worktrees/

@@ -43,23 +43,7 @@ use crate::bus::{BusRegistry, Msg};
 use crate::store::{Store, ThreadBindingRow};
 use crate::{brief, events, runtime, worktree};
 
-/// Stable attention reason stored when automatic worker dispatch fails. The UI
-/// translates this code instead of exposing backend error text as product copy.
-pub const WORKER_START_FAILED: &str = "worker-start-failed";
-
-/// Kanban status for a freshly spawned direction.
-///
-/// Planning and implementation share the in-progress column; mandate still
-/// chooses the brief, not the board column.
-pub fn initial_status() -> &'static str {
-    "working"
-}
-
-/// The status a direction lands in when its turn completes (success or not —
-/// an errored turn also sets `attention`; both then wait on the next pass).
-pub fn status_after_turn_end() -> &'static str {
-    "review"
-}
+pub use weft_scheduler::{initial_status, status_after_turn_end, WORKER_START_FAILED};
 
 fn non_empty(s: String) -> Option<String> {
     if s.is_empty() {
@@ -402,9 +386,9 @@ impl Orchestrator {
     /// Codex thread id.
     /// Reasons are stable codes, not error prose: the UI renders them through
     /// i18n, and a raw error chain would leak internals into the interface.
-    pub const LEAD_START_FAILED: &'static str = "start-failed";
-    pub const LEAD_RESUME_FAILED: &'static str = "resume-failed";
-    pub const LEAD_TURN_ERROR: &'static str = "turn-error";
+    pub const LEAD_START_FAILED: &'static str = weft_scheduler::LEAD_START_FAILED;
+    pub const LEAD_RESUME_FAILED: &'static str = weft_scheduler::LEAD_RESUME_FAILED;
+    pub const LEAD_TURN_ERROR: &'static str = weft_scheduler::LEAD_TURN_ERROR;
 
     /// Record that the lead needs a human, and say so. Persisting matters more
     /// than the event: the resume failures happen at daemon boot, before any UI
@@ -520,13 +504,21 @@ impl Orchestrator {
     /// human-driven busy thread returns Ok but never runs (the spike-
     /// documented silent drop), so attempting it would fabricate a phantom
     /// active turn. The TurnEnd watcher flushes what parked meanwhile.
+    ///
+    /// Protocol names stay here: the scheduler only says idle-start / active-merge.
     async fn inject(&self, client: &Client, thread_id: &str, text: &str) -> bool {
         if self.foreign_turn(thread_id).is_some() {
             return false;
         }
-        if let Some(turn_id) = client.active_turn(thread_id).await {
-            if client.steer_turn(thread_id, &turn_id, text).await.is_ok() {
-                return true;
+        let active = client.active_turn(thread_id).await;
+        if matches!(
+            weft_scheduler::delivery_mode(active.is_some()),
+            weft_scheduler::DeliveryMode::MergeActive
+        ) {
+            if let Some(turn_id) = active {
+                if client.steer_turn(thread_id, &turn_id, text).await.is_ok() {
+                    return true;
+                }
             }
         }
         match client.start_turn(thread_id, text).await {

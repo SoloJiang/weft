@@ -209,27 +209,29 @@ pnpm dev             # Vite 前端
 pnpm build           # TypeScript 检查 + 生产前端 Bundle
 pnpm tauri dev       # 完整桌面应用
 pnpm tauri build     # Release 应用包
-cd src-tauri && cargo test
+cargo test --workspace
+cargo test --manifest-path src-tauri/Cargo.toml
 git diff --check
+```
+
+Codex Desktop / weftd（仓内 `weft-codex/`）：
+
+```bash
+./weft-codex/scripts/start.sh --mode=weft
 ```
 
 ## 目录结构
 
 ```text
-src/
-  board/                Workspace 和 Issue 看板
-  session/              对话、观测、Diff、权限请求
-  components/           共享 React UI
-  i18n/                 中英文文案
-src-tauri/src/
-  lead_chat/            Headless Agent Session 引擎
-  im/                   飞书/Lark 与钉钉桥接
-  store/                SQLite/SeaORM 实体与迁移
-  bus/                  本地 MCP/Thread Bus
-  computer/             受控的桌面 Computer Use
-  ask.rs                桌面端与 IM 共用的权限注册中心
-  git.rs                仓库和 Worktree 操作
-  materialize.rs        有边界的 Worktree 创建
+src/                    Weft Tauri UI（看板、会话、i18n）
+src-tauri/              Weft Tauri 后端（lead_chat、store、bus、materialize）
+crates/
+  weft-scheduler/       状态机、party 路由、wake 合并
+  weft-bus/             inbox / wake / 持久恢复
+  weft-brief/           brief 骨架（工具列表留在 adapter）
+  weft-worktree/        幂等 git worktree 创建
+  weft-slug/            workspace / issue / direction slug
+weft-codex/             Codex Host、weftd、launcher、UI、规格
 assets/
   screenshots/          README 截图
   diagrams/             架构图

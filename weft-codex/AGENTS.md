@@ -2,8 +2,9 @@
 
 ## What you're working on
 
-weft-codex: Weft 的编排能力移植到 Codex Desktop 的独立项目。Rust workspace
-（`crates/`）+ 未来的 TS launcher 与 React UI。产品形态与 Desktop 壳层的规范在
+weft-codex 现在是 weft monorepo 里的 Codex Desktop 产品线（`weft-codex/`）。
+共享调度核在仓库根 `crates/weft-*`；本树保留 weftd / app-server / Host UI。
+`~/.weft-codex` 不与 `~/.weft` 互通。产品形态与 Desktop 壳层的规范在
 `docs/specs/2026-08-16-weft-third-mode-design.md`（canonical）。
 协议 spike 与 bus 投递经验仍在
 `docs/specs/2026-08-08-codex-desktop-migration-design.md` §5–6、§9。
@@ -25,7 +26,7 @@ weft-codex: Weft 的编排能力移植到 Codex Desktop 的独立项目。Rust w
 
 ## Verify before you claim done
 
-- `cargo test --workspace`
+- 在 weft 仓库根：`cargo test --workspace`（含 weft-scheduler / weft-core / weftd）
 - `git diff --check`
 - Daemon 冒烟：隔离 `WEFT_CODEX_HOME` 启动 weftd，curl `/healthz` 与一个
   MCP roundtrip。
@@ -39,4 +40,4 @@ weft-codex: Weft 的编排能力移植到 Codex Desktop 的独立项目。Rust w
 
 - Conventional commits: `feat|fix|polish|chore(scope): ...`，提交信息用中文。
 - Stage explicit paths only. Never `git add -A` / `git add .`.
-- docs/ 在本仓库是 tracked 设计文档（与 weft 仓库的 gitignored 习惯不同）。
+- `weft-codex/docs/` 是 tracked 设计文档（weft 根目录 `docs/` 仍 gitignore）。

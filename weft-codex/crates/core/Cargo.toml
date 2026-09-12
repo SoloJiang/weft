@@ -6,6 +6,11 @@ edition.workspace = true
 
 [dependencies]
 weft-app-server = { path = "../app-server" }
+weft-scheduler.workspace = true
+weft-bus.workspace = true
+weft-brief.workspace = true
+weft-worktree.workspace = true
+weft-slug.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

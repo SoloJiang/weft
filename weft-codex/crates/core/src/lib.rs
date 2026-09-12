@@ -1,4 +1,5 @@
-//! weft-codex product core: store, thread bus, MCP server, UI event channel.
+//! weft-codex product core: store, MCP, events. Shared inbox/brief/worktree/
+//! scheduler live in `weft-*` crates; this crate is the Codex SessionPort adapter.
 #![cfg_attr(
     not(test),
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)

@@ -1,0 +1,9 @@
+[package]
+name = "weft-scheduler"
+version = "0.1.0"
+description = "Shared Weft dispatch state machine: status, party routing, wake merge"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+weft-brief.workspace = true

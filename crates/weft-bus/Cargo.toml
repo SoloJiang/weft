@@ -1,0 +1,13 @@
+[package]
+name = "weft-bus"
+version = "0.1.0"
+description = "Thread-bus inbox, wake, and durable restore (no HTTP/MCP)"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

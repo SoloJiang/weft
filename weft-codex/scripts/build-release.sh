@@ -3,6 +3,7 @@ set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+MONOREPO_ROOT=$(CDPATH= cd -- "$PROJECT_ROOT/.." && pwd)
 VERSION=${WEFT_CODEX_VERSION:-0.1.1}
 BUILD_NUMBER=$(date -u +%Y%m%d%H%M%S)
 MACHINE_ARCH=$(uname -m)
@@ -45,8 +46,8 @@ pnpm --dir "$PROJECT_ROOT/launcher" typecheck
 pnpm --dir "$PROJECT_ROOT/launcher" test
 
 echo "[release] verifying and building daemon"
-cargo test --manifest-path "$PROJECT_ROOT/Cargo.toml" --workspace --locked
-cargo build --manifest-path "$PROJECT_ROOT/Cargo.toml" --release --locked -p weftd
+cargo test --manifest-path "$MONOREPO_ROOT/Cargo.toml" --workspace --locked
+cargo build --manifest-path "$MONOREPO_ROOT/Cargo.toml" --release --locked -p weftd
 
 echo "[release] compiling self-contained Host"
 bun build "$PROJECT_ROOT/launcher/src/cli.ts" \
@@ -60,7 +61,7 @@ mkdir -p "$RUNTIME_ROOT/bin" "$RUNTIME_ROOT/libexec" \
   "$RUNTIME_ROOT/share/weft-codex/web" \
   "$RUNTIME_ROOT/share/weft-codex/skills"
 install -m 755 "$STAGING_DIR/weft-codex" "$RUNTIME_ROOT/bin/weft-codex"
-install -m 755 "$PROJECT_ROOT/target/release/weftd" "$RUNTIME_ROOT/bin/weftd"
+install -m 755 "$MONOREPO_ROOT/target/release/weftd" "$RUNTIME_ROOT/bin/weftd"
 install -m 755 "$PROJECT_ROOT/packaging/install.sh" "$RUNTIME_ROOT/install.sh"
 install -m 755 "$PROJECT_ROOT/packaging/weft-codex-wrapper" \
   "$RUNTIME_ROOT/libexec/weft-codex-wrapper"

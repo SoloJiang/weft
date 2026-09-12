@@ -13,6 +13,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+weft-scheduler = { path = "../crates/weft-scheduler" }
+weft-bus = { path = "../crates/weft-bus" }
+weft-brief = { path = "../crates/weft-brief" }
+weft-worktree = { path = "../crates/weft-worktree" }
+weft-slug = { path = "../crates/weft-slug" }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"

@@ -192,6 +192,7 @@ weft-codex install-skills --force
 
 cd ui && pnpm typecheck && pnpm build
 cd launcher && pnpm typecheck && pnpm test
+# 在 weft monorepo 根目录：
 cargo test --workspace
 git diff --check
 ```
