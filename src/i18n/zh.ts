@@ -284,6 +284,7 @@ export const zh = {
     confirm_other: "创建 {{count}} 个任务",
     confirmWithPlan_other: "确认方案并创建 {{count}} 个任务",
     confirmFailed: "创建任务失败，请重试。",
+    approveFailed: "批准任务失败，请重试。",
     confirming: "创建中…",
     baseBranch: "基线分支",
     baseBranchHint: "从该分支拉出工作分支（留空 = 仓库默认分支）",
