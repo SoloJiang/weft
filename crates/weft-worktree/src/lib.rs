@@ -180,6 +180,19 @@ mod tests {
     }
 
     #[test]
+    fn ensure_attaches_an_existing_branch() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        init_repo(&repo);
+        run(&repo, &["branch", "weft/i1/exist"]);
+        let wt = tmp.path().join("wts").join("i1").join("exist");
+        let info = ensure_worktree_blocking(&repo, &wt, "weft/i1/exist", "").expect("attach");
+        assert!(!info.created);
+        assert!(wt.join("README").exists());
+    }
+
+    #[test]
     fn layout_trait_keeps_homes_apart() {
         let home = Path::new("/tmp/weft-codex-home");
         let repo = Path::new("/repo");
