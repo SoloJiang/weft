@@ -13,6 +13,10 @@ changes—not just chat logs.
 [中文说明](README.zh-CN.md)
 </div>
 
+> **SoloJiang/weft-codex is retired.** Codex Desktop / weftd / Host UI live in this
+> repository under [`weft-codex/`](weft-codex/). Clone and contribute here. Do not
+> use the old standalone repository.
+
 <p align="center">
   <img src="assets/readme/weft-delivery-workbench.jpg" alt="A hand-drawn local delivery workbench: one product goal enters Weft, repository worktrees run on the same machine, and their diffs, checks, PR state, and one exceptional Gate converge into a review surface" width="940" />
 </p>
@@ -259,7 +263,8 @@ cargo test --manifest-path src-tauri/Cargo.toml
 git diff --check
 ```
 
-Codex Desktop / weftd (in-tree `weft-codex/`):
+Codex Desktop / weftd is in-tree under `weft-codex/` (the standalone
+`SoloJiang/weft-codex` repository is retired):
 
 ```bash
 ./weft-codex/scripts/start.sh --mode=weft

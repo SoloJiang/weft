@@ -1,3 +1,7 @@
+> **This tree lives in [SoloJiang/weft](https://github.com/SoloJiang/weft).**
+> The standalone `SoloJiang/weft-codex` repository is retired. Clone weft and
+> work in `weft-codex/`.
+
 <div align="center">
 
 # weft-codex
@@ -138,8 +142,8 @@ Git hosting, product management, or Codex itself.
 The current Developer Preview supports macOS arm64 and expects the official app
 at `/Applications/ChatGPT.app`.
 
-Download the archive and checksum from
-[GitHub Releases](https://github.com/SoloJiang/weft-codex/releases), then run:
+Build a local archive from this tree (`./scripts/build-release.sh` at the weft
+repository root's `weft-codex/` directory), then run:
 
 ```sh
 shasum -a 256 -c weft-codex-0.1.1-macos-arm64.tar.gz.sha256
@@ -220,8 +224,10 @@ cargo test --workspace
 git diff --check
 ```
 
-This tree now lives inside the weft monorepo. Shared scheduler crates are
-`../crates/weft-*`. Homes stay separate: `~/.weft-codex` is not `~/.weft`.
+This tree is the in-repo Codex line of [SoloJiang/weft](https://github.com/SoloJiang/weft).
+The standalone `SoloJiang/weft-codex` repository is retired. Shared scheduler
+crates are `../crates/weft-*`. Homes stay separate: `~/.weft-codex` is not
+`~/.weft`.
 
 ## Project layout
 

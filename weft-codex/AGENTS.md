@@ -3,6 +3,7 @@
 ## What you're working on
 
 weft-codex 现在是 weft monorepo 里的 Codex Desktop 产品线（`weft-codex/`）。
+独立仓库 `SoloJiang/weft-codex` 已退役，不要再往那里贡献或指引读者。
 共享调度核在仓库根 `crates/weft-*`；本树保留 weftd / app-server / Host UI。
 `~/.weft-codex` 不与 `~/.weft` 互通。产品形态与 Desktop 壳层的规范在
 `docs/specs/2026-08-16-weft-third-mode-design.md`（canonical）。

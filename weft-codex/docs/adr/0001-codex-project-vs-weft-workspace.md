@@ -1,7 +1,7 @@
 # ADR 0001：Codex Local Project 与 Weft Workspace 的关系
 
 - 状态：**Accepted**（2026-08-10）
-- 相关：[#3](https://github.com/SoloJiang/weft-codex/issues/3)（N0-02）、umbrella [#1](https://github.com/SoloJiang/weft-codex/issues/1)
+- 相关：历史 issue #3（N0-02）、umbrella #1（原 `SoloJiang/weft-codex`，该仓库已退役，源码在 [SoloJiang/weft](https://github.com/SoloJiang/weft) 的 `weft-codex/`）
 - 影响：N0 的 sidebar 形态、R4 的 Project knowledge 归属
 
 ## 背景

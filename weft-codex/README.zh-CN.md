@@ -1,3 +1,6 @@
+> **本树在 [SoloJiang/weft](https://github.com/SoloJiang/weft) 的 `weft-codex/`。**
+> 独立仓库 `SoloJiang/weft-codex` 已退役。请克隆 weft，不要再使用原仓库。
+
 <div align="center">
 
 # weft-codex
@@ -118,8 +121,8 @@ Thread 协同推进的开发者和技术负责人。
 当前 Developer Preview 支持 macOS arm64，并要求官方应用位于
 `/Applications/ChatGPT.app`。
 
-从 [GitHub Releases](https://github.com/SoloJiang/weft-codex/releases) 下载压缩包
-与校验文件，然后运行：
+在 weft 仓库的 `weft-codex/` 下运行 `./scripts/build-release.sh` 生成本地发行包，
+然后运行：
 
 ```sh
 shasum -a 256 -c weft-codex-0.1.1-macos-arm64.tar.gz.sha256
@@ -196,6 +199,10 @@ cd launcher && pnpm typecheck && pnpm test
 cargo test --workspace
 git diff --check
 ```
+
+本树是 [SoloJiang/weft](https://github.com/SoloJiang/weft) 的仓内 Codex 产品线。
+独立仓库 `SoloJiang/weft-codex` 已退役。共享调度 crate 在 `../crates/weft-*`。
+家目录仍然分开：`~/.weft-codex` 不是 `~/.weft`。
 
 ## 项目结构
 

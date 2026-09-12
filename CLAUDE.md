@@ -2,7 +2,7 @@
 
 ## What you're working on
 
-Weft is the home monorepo. The Tauri desktop app lives in `src/` + `src-tauri/`. Shared Rust crates live in `crates/`. The Codex Desktop / weftd line lives in `weft-codex/` (ui, launcher, crates, scripts, specs). `~/.weft` and `~/.weft-codex` stay separate. DESIGN.md and chat shells stay per product.
+Weft is the home monorepo. The Tauri desktop app lives in `src/` + `src-tauri/`. Shared Rust crates live in `crates/`. The Codex Desktop / weftd line lives in `weft-codex/` (ui, launcher, crates, scripts, specs). `SoloJiang/weft-codex` is retired — do not send people back there. `~/.weft` and `~/.weft-codex` stay separate. DESIGN.md and chat shells stay per product.
 
 ## Layout gotchas
 

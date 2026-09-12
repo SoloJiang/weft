@@ -12,6 +12,9 @@ OpenCode，把每个仓库的改动隔离在独立 Worktree 中，再把 Diff、
 [English](README.md)
 </div>
 
+> **SoloJiang/weft-codex 已退役。** Codex Desktop / weftd / Host UI 的源码在本仓库
+> [`weft-codex/`](weft-codex/)。请在这里克隆和贡献，不要再使用原来的独立仓库。
+
 <p align="center">
   <img src="assets/readme/weft-delivery-workbench.jpg" alt="手绘风格的本地交付工作台：一个产品目标进入 Weft，多个仓库在同一台电脑的独立 Worktree 中执行，最后把 Diff、检查、PR 状态和一项异常 Gate 汇合到 Review 界面" width="940" />
 </p>
@@ -214,7 +217,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 git diff --check
 ```
 
-Codex Desktop / weftd（仓内 `weft-codex/`）：
+Codex Desktop / weftd 在仓内 `weft-codex/`（独立仓库 `SoloJiang/weft-codex` 已退役）：
 
 ```bash
 ./weft-codex/scripts/start.sh --mode=weft
