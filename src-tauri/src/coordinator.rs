@@ -1,20 +1,17 @@
 //! Consumes bus Wake events and drives the target's session to read its inbox.
 //! This is the honest "push" half of bus + coordinator = near-realtime.
 //!
-//! Three wake targets: the human (`"you"` → refresh the Needs-you UI), the
-//! thread lead (`"lead"` → drive the lead engine), and a worker (a numeric
-//! direction id → drive that worker's engine, lazily attaching it if idle).
+//! Shape: **wake → `weft_scheduler::route` → [`SessionPort`]**. Skip / attach /
+//! human-notify policy lives in the crate. This file observes store + engine
+//! facts, then speaks to `lead_chat` (both [`DeliveryMode`]s map to
+//! `TurnState::request_bus_read`). HumanPort is the Needs-you emit — not grown
+//! here. `turn/steer` stays in the Codex adapter.
 //!
 //! Coalescing is busy-aware, not time-based: per (thread, dir) at most one
 //! `deliver` runs at a time, and a wake arriving while one is in flight is
-//! re-delivered the instant it finishes (no fixed delay). The engine itself
-//! collapses wakes that land mid-turn into a SINGLE inbox-read fired exactly at
-//! turn-end (`TurnState::request_bus_read`), so a busy agent reads new messages
-//! the moment it frees up — never on a timer, never one redundant turn per post.
+//! re-delivered the instant it finishes (no fixed delay).
 //!
-//! Single-writer safety: a session the human has taken over in their terminal is
-//! persisted `STATUS_STOPPED`; a wake never spawns a competing headless process
-//! for it. A cleanly-idle session is still driven (its message goes through).
+//! Single-writer safety is crate policy: taken-over + not live → skip.
 
 use crate::bus::Wake;
 use crate::lead_chat::engine::STATUS_STOPPED;
@@ -23,8 +20,9 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 use weft_scheduler::{
-    classify_party, enqueue, enqueue_promotes_status, EnqueueJob, Inflight, PartyRoute,
-    WORKER_START_FAILED,
+    classify_party, delivery_mode, enqueue, enqueue_promotes_status, inflight_key, party_ref,
+    route, DeliveryMode, EnqueueJob, Inflight, PartyRef, PartyRoute, SchedulerError, SessionPort,
+    WakeAction, WakeFacts, STATUS_DONE, WORKER_START_FAILED,
 };
 
 fn classify(dir: &str) -> Option<PartyRoute> {
@@ -64,9 +62,7 @@ pub(crate) async fn persist_enqueued_or_flag(
                 if let Err(flag_error) =
                     repo::set_direction_attention(db, direction_id, Some(WORKER_START_FAILED)).await
                 {
-                    eprintln!(
-                        "[weft] set enqueue attention {direction_id}: {flag_error}"
-                    );
+                    eprintln!("[weft] set enqueue attention {direction_id}: {flag_error}");
                 }
             }
             Err(error)
@@ -80,19 +76,15 @@ pub fn run(app: AppHandle, rx: Receiver<Wake>) {
     std::thread::spawn(move || {
         let inflight: Arc<Mutex<Inflight>> = Arc::new(Mutex::new(Inflight::default()));
         while let Ok(w) = rx.recv() {
-            let Some(route) = classify(&w.dir) else {
+            let Some(party) = classify(&w.dir) else {
                 continue;
             };
-            // A wake addressed to the human means an agent asked a question:
-            // nudge the UI to refresh its Needs-you surface, don't touch an
-            // engine.
-            if route == PartyRoute::Human {
+            // HumanPort: crate says notify; emit stays in this adapter.
+            if matches!(route(party, WakeFacts::default()), WakeAction::NotifyHuman) {
                 let _ = app.emit("needs-you://changed", w.thread);
                 continue;
             }
-            // The lead's dir ("lead") repeats across threads, so the thread must
-            // be part of the key.
-            let key = format!("{}/{}", w.thread, w.dir);
+            let key = inflight_key(w.thread, &w.dir);
             let start = {
                 let mut g = inflight.lock().unwrap_or_else(|e| e.into_inner());
                 g.begin(&key)
@@ -104,8 +96,11 @@ pub fn run(app: AppHandle, rx: Receiver<Wake>) {
             let inflight2 = inflight.clone();
             tauri::async_runtime::spawn(async move {
                 loop {
-                    if let Err(e) = deliver(&app2, w.thread, route).await {
-                        eprintln!("[weft][coordinator] wake {route:?}@{} failed: {e}", w.thread);
+                    if let Err(e) = deliver(&app2, w.thread, party).await {
+                        eprintln!(
+                            "[weft][coordinator] wake {party:?}@{} failed: {e}",
+                            w.thread
+                        );
                     }
                     let again = {
                         let mut g = inflight2.lock().unwrap_or_else(|e| e.into_inner());
@@ -138,74 +133,212 @@ async fn live_resident(app: &AppHandle, key: i64) -> bool {
         .is_some_and(|c| matches!(c.try_wait(), Ok(None)))
 }
 
-/// Deliver a bus-wake to the routed engine via `nudge_bus_read`, which coalesces
-/// wakes that land mid-turn into one inbox-read at turn-end. An idle/not-yet-
-/// resident worker is lazily attached so a bus post still drives it. A session
-/// taken over in the user's terminal (`STATUS_STOPPED`, not currently live under
-/// weft) is skipped so we never spawn a competing headless process.
-async fn deliver(app: &AppHandle, thread: i32, route: PartyRoute) -> anyhow::Result<()> {
+/// Observe adapter facts, then `route` → [`SessionPort`].
+async fn deliver(app: &AppHandle, thread: i32, party: PartyRoute) -> anyhow::Result<()> {
     let Some(db) = app.try_state::<crate::store::Db>() else {
         return Ok(());
     };
     let db = crate::store::Db(db.0.clone(), db.1);
-    match route {
-        // Handled inline in run(); never reaches deliver().
-        PartyRoute::Human => Ok(()),
-        PartyRoute::Lead => {
-            let key = crate::lead_chat::commands::lead_key(thread);
-            let taken_over = crate::store::repo::lead_status(&db, thread).await?.as_deref()
-                == Some(STATUS_STOPPED);
-            if taken_over && !live_resident(app, key).await {
-                return Ok(());
-            }
-            // Get-or-create the lead engine, then drive it to read its inbox.
-            let eng = crate::lead_chat::commands::lead_engine(app, &db, thread, "en").await?;
-            crate::lead_chat::engine::nudge_bus_read(app, &db, &eng).await
+    let (facts, worker) = match party {
+        PartyRoute::Human => (WakeFacts::default(), None),
+        PartyRoute::Lead => lead_facts(app, &db, thread).await?,
+        PartyRoute::Worker(dir) => worker_facts(app, &db, thread, dir).await?,
+    };
+    match route(party, facts) {
+        WakeAction::NotifyHuman | WakeAction::Skip(_) => Ok(()),
+        WakeAction::Deliver { attach } => {
+            let port = WeftSessionPort {
+                app: app.clone(),
+                db,
+                thread,
+                attach,
+                worker,
+            };
+            port.deliver(
+                &party_ref(i64::from(thread), party),
+                "",
+                delivery_mode(facts.live),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!(error))
         }
-        PartyRoute::Worker(dir) => {
-            let Ok(dir) = i32::try_from(dir) else {
-                return Ok(());
+    }
+}
+
+async fn lead_facts(
+    app: &AppHandle,
+    db: &Db,
+    thread: i32,
+) -> anyhow::Result<(WakeFacts, Option<WorkerAttach>)> {
+    let key = crate::lead_chat::commands::lead_key(thread);
+    let taken_over = crate::store::repo::lead_status(db, thread)
+        .await?
+        .as_deref()
+        == Some(STATUS_STOPPED);
+    let live = live_resident(app, key).await;
+    let resident = app
+        .state::<crate::lead_chat::engine::LeadChatState>()
+        .get(key)
+        .is_some();
+    Ok((
+        WakeFacts {
+            taken_over,
+            live,
+            resident,
+            ..WakeFacts::default()
+        },
+        None,
+    ))
+}
+
+async fn worker_facts(
+    app: &AppHandle,
+    db: &Db,
+    thread: i32,
+    dir: i64,
+) -> anyhow::Result<(WakeFacts, Option<WorkerAttach>)> {
+    let Ok(dir) = i32::try_from(dir) else {
+        return Ok((
+            WakeFacts {
+                missing_target: true,
+                ..WakeFacts::default()
+            },
+            None,
+        ));
+    };
+    let Some(d) = crate::store::repo::get_direction(db, dir).await? else {
+        return Ok((
+            WakeFacts {
+                missing_target: true,
+                ..WakeFacts::default()
+            },
+            None,
+        ));
+    };
+    if d.thread_id != thread {
+        return Ok((
+            WakeFacts {
+                foreign_thread: true,
+                ..WakeFacts::default()
+            },
+            None,
+        ));
+    }
+    let Some(s) = crate::store::repo::latest_session_for_direction(db, dir).await? else {
+        return Ok((
+            WakeFacts {
+                missing_target: true,
+                ..WakeFacts::default()
+            },
+            None,
+        ));
+    };
+    let live = live_resident(app, i64::from(s.id)).await;
+    let resident = app
+        .state::<crate::lead_chat::engine::LeadChatState>()
+        .get(i64::from(s.id))
+        .is_some();
+    Ok((
+        WakeFacts {
+            taken_over: s.status == STATUS_STOPPED,
+            live,
+            resident,
+            worker_done: d.status == STATUS_DONE,
+            ..WakeFacts::default()
+        },
+        Some(WorkerAttach {
+            dir,
+            repo_id: s.repo_id,
+            session_id: s.id,
+        }),
+    ))
+}
+
+#[derive(Clone, Copy)]
+struct WorkerAttach {
+    dir: i32,
+    repo_id: i32,
+    session_id: i32,
+}
+
+/// Weft SessionPort: both delivery modes become `nudge_bus_read`.
+/// Attach (lazy `chat_open_worker_impl` / `lead_engine`) stays in this adapter.
+struct WeftSessionPort {
+    app: AppHandle,
+    db: Db,
+    thread: i32,
+    attach: bool,
+    worker: Option<WorkerAttach>,
+}
+
+impl SessionPort for WeftSessionPort {
+    fn deliver(
+        &self,
+        party: &PartyRef,
+        _text: &str,
+        mode: DeliveryMode,
+    ) -> impl std::future::Future<Output = Result<bool, SchedulerError>> + Send {
+        let app = self.app.clone();
+        let db = Db(self.db.0.clone(), self.db.1);
+        let thread = self.thread;
+        let attach = self.attach;
+        let worker = self.worker;
+        let party = party.clone();
+        async move {
+            weft_session_deliver(&app, &db, thread, attach, worker, &party, mode)
+                .await
+                .map_err(|error| SchedulerError::new(error.to_string()))
+        }
+    }
+}
+
+async fn weft_session_deliver(
+    app: &AppHandle,
+    db: &Db,
+    thread: i32,
+    attach: bool,
+    worker: Option<WorkerAttach>,
+    party: &PartyRef,
+    mode: DeliveryMode,
+) -> anyhow::Result<bool> {
+    // Protocol names stay out of this adapter. Both modes are inbox-read.
+    match mode {
+        DeliveryMode::MergeActive | DeliveryMode::StartIdle => {}
+    }
+    let Some(target) = classify_party(&party.party) else {
+        return Ok(false);
+    };
+    match target {
+        PartyRoute::Human => Ok(true),
+        PartyRoute::Lead => {
+            let eng = crate::lead_chat::commands::lead_engine(app, db, thread, "en").await?;
+            crate::lead_chat::engine::nudge_bus_read(app, db, &eng).await?;
+            Ok(true)
+        }
+        PartyRoute::Worker(_) => {
+            let Some(worker) = worker else {
+                return Ok(false);
             };
-            // Direction ids are global, but a wake belongs to the thread it was
-            // posted on. A post to a foreign dir (an id that lives in another
-            // thread) must not drive that unrelated worker — it would read its
-            // own thread's inbox, not where the message actually landed.
-            let Some(d) = crate::store::repo::get_direction(&db, dir).await? else {
-                return Ok(());
-            };
-            if d.thread_id != thread {
-                return Ok(());
-            }
-            let Some(s) = crate::store::repo::latest_session_for_direction(&db, dir).await? else {
-                return Ok(());
-            };
-            let live = live_resident(app, s.id as i64).await;
-            // Taken over in the user's terminal: never spawn a competing process.
-            // A live resident process means weft re-owns it, so drive on.
-            if !live && s.status == STATUS_STOPPED {
-                return Ok(());
-            }
             let state = app.state::<crate::lead_chat::engine::LeadChatState>();
-            let eng = match state.get(s.id as i64) {
-                Some(e) => e,
-                None => {
-                    // Not resident: lazily open the worker so an idle/closed
-                    // worker can still be driven by a bus post. Never resurrect a
-                    // finished direction — a stray message must not restart it.
-                    if d.status == "done" {
-                        return Ok(());
-                    }
-                    let info = crate::lead_chat::commands::chat_open_worker_impl(
-                        app, &db, dir, s.repo_id, "en",
-                    )
-                    .await?;
-                    match state.get(info.session_id as i64) {
-                        Some(e) => e,
-                        None => return Ok(()),
-                    }
-                }
+            let eng = if attach {
+                let info = crate::lead_chat::commands::chat_open_worker_impl(
+                    app,
+                    db,
+                    worker.dir,
+                    worker.repo_id,
+                    "en",
+                )
+                .await?;
+                state.get(i64::from(info.session_id))
+            } else {
+                state.get(i64::from(worker.session_id))
             };
-            crate::lead_chat::engine::nudge_bus_read(app, &db, &eng).await
+            let Some(eng) = eng else {
+                return Ok(false);
+            };
+            crate::lead_chat::engine::nudge_bus_read(app, db, &eng).await?;
+            Ok(true)
         }
     }
 }
@@ -236,13 +369,13 @@ mod tests {
     #[test]
     fn inflight_serializes_and_coalesces() {
         let mut f = Inflight::default();
-        let k = "7/lead";
-        assert!(f.begin(k)); // first wake → start a loop
-        assert!(!f.begin(k)); // wake during the loop → coalesced, no new loop
-        assert!(!f.begin(k)); // another → still coalesced
-        assert!(f.next(k)); // loop end sees the coalesced wake → re-deliver
-        assert!(!f.next(k)); // nothing pending → release the key
-        assert!(f.begin(k)); // a later wake starts a fresh loop
+        let k = inflight_key(7, "lead");
+        assert!(f.begin(&k)); // first wake → start a loop
+        assert!(!f.begin(&k)); // wake during the loop → coalesced, no new loop
+        assert!(!f.begin(&k)); // another → still coalesced
+        assert!(f.next(&k)); // loop end sees the coalesced wake → re-deliver
+        assert!(!f.next(&k)); // nothing pending → release the key
+        assert!(f.begin(&k)); // a later wake starts a fresh loop
     }
 
     #[test]
@@ -253,5 +386,24 @@ mod tests {
         assert_eq!(jobs[0].status, weft_scheduler::initial_status());
         assert!(enqueue_promotes_status("queued"));
         assert!(!enqueue_promotes_status("review"));
+    }
+
+    #[test]
+    fn wake_policy_is_scheduler_route() {
+        assert_eq!(
+            route(PartyRoute::Human, WakeFacts::default()),
+            WakeAction::NotifyHuman
+        );
+        assert_eq!(
+            route(
+                PartyRoute::Lead,
+                WakeFacts {
+                    taken_over: true,
+                    live: false,
+                    ..WakeFacts::default()
+                }
+            ),
+            weft_scheduler::WakeAction::Skip(weft_scheduler::WakeSkip::TakenOver)
+        );
     }
 }

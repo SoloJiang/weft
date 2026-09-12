@@ -175,6 +175,105 @@ impl Inflight {
     }
 }
 
+/// Inflight / coalescing key: thread (or issue) plus the wake's party dir.
+pub fn inflight_key(issue_id: impl std::fmt::Display, dir: &str) -> String {
+    format!("{issue_id}/{dir}")
+}
+
+impl PartyRoute {
+    /// Bus party string for this route (`you` / `lead` / direction id).
+    pub fn party_id(self) -> String {
+        match self {
+            Self::Human => HUMAN_PARTY.to_string(),
+            Self::Lead => LEAD_PARTY.to_string(),
+            Self::Worker(id) => id.to_string(),
+        }
+    }
+}
+
+/// Adapter-observed facts. The scheduler decides; the adapter does not
+/// re-derive skip/attach policy at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WakeFacts {
+    /// Persisted single-writer release (`STATUS_STOPPED` / human terminal).
+    pub taken_over: bool,
+    /// Adapter still owns a live child for this party.
+    pub live: bool,
+    /// Session engine is already in the adapter's map (may be a dead child).
+    pub resident: bool,
+    /// Worker direction is `done`. Lead ignores this.
+    pub worker_done: bool,
+    /// Wake's numeric dir belongs to another thread. Lead / human ignore this.
+    pub foreign_thread: bool,
+    /// Direction or session row is missing. Lead / human ignore this.
+    pub missing_target: bool,
+}
+
+/// Why [`route`] asked the adapter not to deliver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeSkip {
+    TakenOver,
+    AlreadyDone,
+    ForeignThread,
+    MissingTarget,
+}
+
+/// What the adapter should do after `classify_party`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeAction {
+    NotifyHuman,
+    Deliver { attach: bool },
+    Skip(WakeSkip),
+}
+
+/// Wake → route. Adapters then speak through [`SessionPort`].
+///
+/// Taken-over + not live → skip (never spawn a competing headless process).
+/// A live resident process means the adapter re-owns the slot, so deliver.
+/// Done workers are not attached; a still-resident engine may be nudged.
+pub fn route(party: PartyRoute, facts: WakeFacts) -> WakeAction {
+    match party {
+        PartyRoute::Human => WakeAction::NotifyHuman,
+        PartyRoute::Lead => route_lead(facts),
+        PartyRoute::Worker(_) => route_worker(facts),
+    }
+}
+
+fn route_lead(facts: WakeFacts) -> WakeAction {
+    if facts.taken_over && !facts.live {
+        return WakeAction::Skip(WakeSkip::TakenOver);
+    }
+    WakeAction::Deliver {
+        attach: !facts.resident,
+    }
+}
+
+fn route_worker(facts: WakeFacts) -> WakeAction {
+    if facts.missing_target {
+        return WakeAction::Skip(WakeSkip::MissingTarget);
+    }
+    if facts.foreign_thread {
+        return WakeAction::Skip(WakeSkip::ForeignThread);
+    }
+    if facts.taken_over && !facts.live {
+        return WakeAction::Skip(WakeSkip::TakenOver);
+    }
+    if facts.worker_done && !facts.resident {
+        return WakeAction::Skip(WakeSkip::AlreadyDone);
+    }
+    WakeAction::Deliver {
+        attach: !facts.resident,
+    }
+}
+
+/// Abstract party the scheduler asks an adapter to nudge.
+pub fn party_ref(issue_id: i64, party: PartyRoute) -> PartyRef {
+    PartyRef {
+        issue_id,
+        party: party.party_id(),
+    }
+}
+
 /// Abstract party the scheduler asks an adapter to nudge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartyRef {
@@ -254,6 +353,153 @@ mod tests {
     fn delivery_mode_is_idle_or_merge_not_protocol() {
         assert_eq!(delivery_mode(true), DeliveryMode::MergeActive);
         assert_eq!(delivery_mode(false), DeliveryMode::StartIdle);
+    }
+
+    #[test]
+    fn inflight_key_joins_issue_and_dir() {
+        assert_eq!(inflight_key(7, "lead"), "7/lead");
+        assert_eq!(inflight_key(3, "10"), "3/10");
+    }
+
+    #[test]
+    fn party_ref_uses_bus_identity() {
+        assert_eq!(party_ref(9, PartyRoute::Human).party, HUMAN_PARTY);
+        assert_eq!(party_ref(9, PartyRoute::Lead).party, LEAD_PARTY);
+        assert_eq!(party_ref(9, PartyRoute::Worker(4)).party, "4");
+        assert_eq!(party_ref(9, PartyRoute::Lead).issue_id, 9);
+    }
+
+    #[test]
+    fn route_human_is_notify_regardless_of_facts() {
+        let facts = WakeFacts {
+            taken_over: true,
+            live: true,
+            resident: true,
+            worker_done: true,
+            foreign_thread: true,
+            missing_target: true,
+        };
+        assert_eq!(route(PartyRoute::Human, facts), WakeAction::NotifyHuman);
+        assert_eq!(
+            route(PartyRoute::Human, WakeFacts::default()),
+            WakeAction::NotifyHuman
+        );
+    }
+
+    #[test]
+    fn route_lead_skips_taken_over_when_not_live() {
+        assert_eq!(
+            route(
+                PartyRoute::Lead,
+                WakeFacts {
+                    taken_over: true,
+                    live: false,
+                    resident: false,
+                    ..WakeFacts::default()
+                }
+            ),
+            WakeAction::Skip(WakeSkip::TakenOver)
+        );
+    }
+
+    #[test]
+    fn route_lead_delivers_when_adapter_reowns() {
+        assert_eq!(
+            route(
+                PartyRoute::Lead,
+                WakeFacts {
+                    taken_over: true,
+                    live: true,
+                    resident: true,
+                    ..WakeFacts::default()
+                }
+            ),
+            WakeAction::Deliver { attach: false }
+        );
+    }
+
+    #[test]
+    fn route_lead_attaches_when_not_resident() {
+        assert_eq!(
+            route(PartyRoute::Lead, WakeFacts::default()),
+            WakeAction::Deliver { attach: true }
+        );
+    }
+
+    #[test]
+    fn route_worker_skips_store_invariants() {
+        assert_eq!(
+            route(
+                PartyRoute::Worker(2),
+                WakeFacts {
+                    missing_target: true,
+                    ..WakeFacts::default()
+                }
+            ),
+            WakeAction::Skip(WakeSkip::MissingTarget)
+        );
+        assert_eq!(
+            route(
+                PartyRoute::Worker(2),
+                WakeFacts {
+                    foreign_thread: true,
+                    ..WakeFacts::default()
+                }
+            ),
+            WakeAction::Skip(WakeSkip::ForeignThread)
+        );
+    }
+
+    #[test]
+    fn route_worker_skips_taken_over_and_done_attach() {
+        assert_eq!(
+            route(
+                PartyRoute::Worker(2),
+                WakeFacts {
+                    taken_over: true,
+                    live: false,
+                    resident: false,
+                    ..WakeFacts::default()
+                }
+            ),
+            WakeAction::Skip(WakeSkip::TakenOver)
+        );
+        assert_eq!(
+            route(
+                PartyRoute::Worker(2),
+                WakeFacts {
+                    worker_done: true,
+                    resident: false,
+                    live: false,
+                    ..WakeFacts::default()
+                }
+            ),
+            WakeAction::Skip(WakeSkip::AlreadyDone)
+        );
+    }
+
+    #[test]
+    fn route_worker_nudges_resident_done_without_attach() {
+        assert_eq!(
+            route(
+                PartyRoute::Worker(2),
+                WakeFacts {
+                    worker_done: true,
+                    resident: true,
+                    live: false,
+                    ..WakeFacts::default()
+                }
+            ),
+            WakeAction::Deliver { attach: false }
+        );
+    }
+
+    #[test]
+    fn route_worker_attaches_idle_open_direction() {
+        assert_eq!(
+            route(PartyRoute::Worker(2), WakeFacts::default()),
+            WakeAction::Deliver { attach: true }
+        );
     }
 
     #[test]
