@@ -1,4 +1,4 @@
-import { normalizeDirectionStatus } from "./issue-board";
+import { normalizeDirectionStatus } from "./issue-board.ts";
 
 export type DirectionCardPrimary = "handle" | "viewChanges" | "openSession";
 
