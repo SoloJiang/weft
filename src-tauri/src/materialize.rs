@@ -1,6 +1,10 @@
 //! Turn a direction's single bound write-repo into a git worktree under that
 //! repo's local `.worktrees/weft/` directory, and record it. Reads are unmanaged
 //! (agents read real repos directly). Weft injection files stay untracked.
+//!
+//! Shared `weft-worktree` owns idempotent `git worktree add`. This module keeps
+//! Weft path layout, GC, and home isolation. It does not share `~/.weft` with
+//! weft-codex (`<home>/worktrees/...`).
 
 use crate::git;
 use crate::store::{entities, repo, Db};
@@ -712,6 +716,15 @@ fn materialize_recreate_fault(repo_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weft_and_codex_worktree_roots_stay_apart() {
+        let repo = Path::new("/repo");
+        let weft = worktree_path(repo, "feat/dir");
+        let codex = weft_worktree::worktree_path(Path::new("/tmp/weft-codex-home"), "iss", "dir");
+        assert!(weft.starts_with(repo.join(".worktrees")));
+        assert!(!codex.starts_with(repo.join(".worktrees")));
+    }
 
     #[test]
     fn same_repo_in_two_threads_does_not_collide() {

@@ -173,6 +173,8 @@ export interface Direction {
   mandate: string;
   /** the ref the work branch was created off; "" = the repo's default branch. */
   base_branch: string;
+  /** Stable enqueue/dispatch attention code; UI maps via attention-reason. */
+  attention_reason?: string;
   created_at: string;
 }
 
@@ -825,6 +827,8 @@ export interface ThreadOverview {
   direction_ids: number[];
   /** stored lifecycle status per direction (same order as direction_ids). */
   statuses: string[];
+  /** Enqueue/dispatch attention codes (same order as direction_ids). */
+  attention_reasons?: string[];
   /** Worktree existence signatures for every card, including unopened issues. */
   readiness_worktrees?: {
     direction_id: number;

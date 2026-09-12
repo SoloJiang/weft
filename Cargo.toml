@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/weft-scheduler",
+    "crates/weft-bus",
+    "crates/weft-brief",
+    "crates/weft-worktree",
+    "crates/weft-slug",
+    "weft-codex/crates/app-server",
+    "weft-codex/crates/core",
+    "weft-codex/crates/daemon",
+]
+# Tauri keeps its own lockfile and webkit deps. Path-deps on crates/weft-*.
+exclude = ["src-tauri"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros", "rt-multi-thread", "signal", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+weft-scheduler = { path = "crates/weft-scheduler" }
+weft-bus = { path = "crates/weft-bus" }
+weft-brief = { path = "crates/weft-brief" }
+weft-worktree = { path = "crates/weft-worktree" }
+weft-slug = { path = "crates/weft-slug" }

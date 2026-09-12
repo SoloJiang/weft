@@ -2,14 +2,16 @@
 
 ## What you're working on
 
-Weft is a Tauri v2 desktop app: React/TypeScript UI in `src/`, Rust backend in `src-tauri/`. It orchestrates local coding agents across issues, lead/worker sessions, a thread bus, and git worktrees.
+Weft is the home monorepo. The Tauri desktop app lives in `src/` + `src-tauri/`. Shared Rust crates live in `crates/`. The Codex Desktop / weftd line lives in `weft-codex/` (ui, launcher, crates, scripts, specs). `SoloJiang/weft-codex` is retired — do not send people back there. `~/.weft` and `~/.weft-codex` stay separate. DESIGN.md and chat shells stay per product.
 
 ## Layout gotchas
 
-- `src/board/`, `src/session/`, `src/components/`, `src/i18n/` — main UI surfaces.
-- `src-tauri/src/lead_chat/`, `store/`, `bus/`, `git.rs`, `materialize.rs` — core backend.
-- `src-tauri/tests/` — Rust integration tests.
-- `docs/` is gitignored planning material; never commit it. If it is tracked by mistake, untrack with `git rm --cached`.
+- `src/board/`, `src/session/`, `src/components/`, `src/i18n/` — Weft UI surfaces.
+- `src-tauri/src/lead_chat/`, `store/`, `bus/`, `git.rs`, `materialize.rs` — Weft backend adapters.
+- `crates/weft-scheduler`, `weft-bus`, `weft-brief`, `weft-worktree`, `weft-slug` — shared Rust (no UI/TS/CSS).
+- `weft-codex/` — Codex Host, weftd, and tracked specs (`weft-codex/docs/` is committed).
+- `src-tauri/tests/` — Rust integration tests for the Tauri app.
+- Root `docs/` is gitignored planning material; never commit it. If it is tracked by mistake, untrack with `git rm --cached`.
 
 ## Hard constraints
 
@@ -20,14 +22,15 @@ Weft is a Tauri v2 desktop app: React/TypeScript UI in `src/`, Rust backend in `
 - Command/handler registry edits are high-risk; diff neighboring entries so nothing adjacent is dropped.
 - Recursive filesystem work needs tests for symlink containment, large-directory truncation, and skipped artifact directories.
 - UI path tokens may be relative or carry line/column suffixes; absolute filesystem openers are a separate path.
-- Do not write cross-repo wiring into canonical repositories. Use launch flags, worktree-local ignored files, or Weft-managed state.
+- Do not write Weft wiring into *user* canonical repositories. Use launch flags, worktree-local ignored files, or Weft-managed state. Shared crates in this monorepo are the in-tree exception (weft is the home repo).
 - Prefer isolated worktrees for feature work so unrelated dirty state stays out of the main checkout.
 - Avoid adding embedded terminal/TUI dependencies; Weft owns the chat UI and uses terminal takeover only as an escape hatch.
 
 ## Verify before you claim done
 
 - Frontend/TS: `pnpm build`
-- Rust: `cd src-tauri && cargo test` (scoped is fine when the change is local)
+- Shared + weft-codex Rust: `cargo test --workspace`
+- Tauri Rust: `cargo test --manifest-path src-tauri/Cargo.toml` (scoped is fine when the change is local)
 - Patch hygiene: `git diff --check`
 - Visible UI: reproduce on the running Tauri/WebView surface when behavior matters
 

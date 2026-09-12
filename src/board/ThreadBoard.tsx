@@ -5,7 +5,6 @@ import * as DM from "@radix-ui/react-dropdown-menu";
 import { listen } from "@tauri-apps/api/event";
 import {
   Check,
-  ChevronDown,
   Copy,
   FolderGit2,
   FolderTree,
@@ -16,6 +15,7 @@ import {
   MoreHorizontal,
   Pencil,
   ScanEye,
+  Send,
   TerminalSquare,
   Trash2,
   X,
@@ -41,6 +41,12 @@ import { ScopeReview } from "./ScopeReview";
 import { DeleteWorktreeDialog, RenameDialog } from "../nav/dialogs";
 import { LeadTab } from "../session/LeadTab";
 import { cn } from "../lib/cn";
+import { directionAttentionKey } from "../lib/attention-reason";
+import {
+  canComplete,
+  canContinueDirection,
+  directionCardPrimary,
+} from "../lib/direction-card-actions";
 import {
   beginReadinessRefresh,
   buildReadinessWorktreeSignatures,
@@ -63,14 +69,6 @@ type PrChangedEvent = { thread_id: number };
 
 const COLUMNS: { key: TaskState; label: string; dot: string }[] = [
   { key: "working", label: "thread.colRunning", dot: "bg-running" },
-  { key: "review", label: "thread.colReview", dot: "bg-brand" },
-  { key: "done", label: "thread.colDone", dot: "bg-accent" },
-];
-
-/** Stored statuses a human may set directly (sub-states of the lifecycle). */
-const SETTABLE: { key: string; label: string; dot: string }[] = [
-  { key: "planning", label: "thread.statusPlanning", dot: "bg-idle" },
-  { key: "working", label: "thread.statusBuilding", dot: "bg-running" },
   { key: "review", label: "thread.colReview", dot: "bg-brand" },
   { key: "done", label: "thread.colDone", dot: "bg-accent" },
 ];
@@ -385,6 +383,8 @@ function DirectionCard({
   const {
     worktreesByDirection,
     viewDirection,
+    driveDirection,
+    completeDirection,
     attentionItems,
     checksByDirection,
     requestSkillReview,
@@ -393,6 +393,7 @@ function DirectionCard({
   } = useStore();
   const { t } = useTranslation();
   const [wtToDelete, setWtToDelete] = useState<Worktree | null>(null);
+  const [completing, setCompleting] = useState(false);
   const writes = worktreesByDirection[direction.id] ?? [];
   // Only worktrees whose directory is still on disk back live actions. A row can
   // outlive its directory (reclaimed via the Done-card delete, or removed out of
@@ -405,16 +406,20 @@ function DirectionCard({
   const passed = allChecks.filter((c) => c.status === "pass").length;
   const hasNeed = attentionItems.some((item) => attentionDirectionId(item) === direction.id);
   const firstWrite = liveWrites[0];
+  const attentionReason = direction.attention_reason ?? "";
+  const flagged = hasNeed || Boolean(attentionReason);
 
   const testsKind = deriveTestsKind(failed, passed, allChecks.length);
-  // The review-column primary action is honest: open the actual diff for human
-  // eyes (Task→PR is the delivery boundary; weft does not fake a PR step).
-  const action = hasNeed
-    ? { label: t("thread.handle"), variant: "primary" as const, diff: false }
-    : direction.status === "review"
-      ? { label: t("thread.viewChanges"), variant: "primary" as const, diff: true }
-      : { label: t("thread.openSession"), variant: "default" as const, diff: false };
+  const primaryKind = directionCardPrimary(hasNeed, direction.status);
+  const PRIMARY = {
+    handle: { label: t("thread.handle"), variant: "primary" as const, diff: false },
+    viewChanges: { label: t("thread.viewChanges"), variant: "default" as const, diff: true },
+    openSession: { label: t("thread.openSession"), variant: "default" as const, diff: false },
+  } as const;
+  const action = PRIMARY[primaryKind];
   const canRunReview = direction.status === "review";
+  const showContinue = canContinueDirection(direction.status);
+  const showAccept = canComplete(direction.status);
 
   return (
     <>
@@ -422,7 +427,7 @@ function DirectionCard({
       layout
       className={cn(
         "group flex flex-col rounded-[var(--radius-lg)] border bg-surface text-left transition-colors hover:border-border-strong",
-        hasNeed ? "border-waiting/45" : "border-border",
+        flagged ? "border-waiting/45" : "border-border",
       )}
     >
       <div className="flex items-start gap-2.5 px-3 pb-2.5 pt-3">
@@ -467,9 +472,17 @@ function DirectionCard({
               >
                 <Pencil size={12} />
               </button>
-              <StatusMenu direction={direction} />
             </div>
           </div>
+          {attentionReason ? (
+            <p
+              className="mt-1 text-[11px] leading-snug text-waiting"
+              title={t(directionAttentionKey(attentionReason))}
+              data-attention-reason={attentionReason}
+            >
+              {t(directionAttentionKey(attentionReason))}
+            </p>
+          ) : null}
         </div>
       </div>
 
@@ -492,7 +505,7 @@ function DirectionCard({
             onDeleteWorktree={setWtToDelete}
           />
         </div>
-        <div className="flex shrink-0 items-center gap-1.5">
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
           {canRunReview && (
             <Tooltip label={t("thread.reviewTip")}>
               <button
@@ -521,6 +534,35 @@ function DirectionCard({
             {action.diff ? <GitCompare size={13} /> : <TerminalSquare size={13} />}
             {action.label}
           </Button>
+          {showContinue && (
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={!firstWrite}
+              title={firstWrite ? undefined : t("thread.noWriteCopy")}
+              onClick={() =>
+                firstWrite && void driveDirection(direction.id, firstWrite.repo_id, true)
+              }
+            >
+              <Send size={13} />
+              {t("thread.continue")}
+            </Button>
+          )}
+          {showAccept && (
+            <Button
+              size="sm"
+              variant="primary"
+              className="task-complete-action"
+              disabled={completing}
+              onClick={() => {
+                setCompleting(true);
+                void completeDirection(direction.id).finally(() => setCompleting(false));
+              }}
+            >
+              <Check size={13} />
+              {completing ? t("thread.acceptingResult") : t("thread.acceptResult")}
+            </Button>
+          )}
         </div>
       </div>
     </motion.div>
@@ -732,48 +774,6 @@ function TrustSignal({ kind, label }: { kind: TrustKind; label: string }) {
       )}
       <span className="truncate">{label}</span>
     </span>
-  );
-}
-
-/** Keyboard/click path to restatus a task. Sets the stored status (§4.6);
- *  Needs-you is a weft-derived tag, not a status, so it isn't offered. */
-function StatusMenu({ direction }: { direction: Direction }) {
-  const { setTaskStatus } = useStore();
-  const { t } = useTranslation();
-  const settable = SETTABLE;
-  const current = settable.find((c) => c.key === direction.status) ?? settable[0];
-  return (
-    <DM.Root>
-      <DM.Trigger
-        title={t("thread.setStatus")}
-        aria-label={t("thread.setStatus")}
-        onClick={(e) => e.stopPropagation()}
-        className="flex items-center gap-1 rounded-full px-1.5 py-0.5 text-ink-faint outline-none transition-colors hover:bg-brand-ghost hover:text-ink data-[state=open]:bg-brand-ghost data-[state=open]:text-ink"
-      >
-        <span className={cn("h-2 w-2 rounded-full", current.dot)} />
-        <ChevronDown size={11} />
-      </DM.Trigger>
-      <DM.Portal>
-        <DM.Content
-          align="end"
-          sideOffset={4}
-          onClick={(e) => e.stopPropagation()}
-          className="weft-pop z-[60] w-40 rounded-[var(--radius-md)] border border-border bg-raised p-1 shadow-[0_8px_24px_-8px_rgba(0,0,0,0.5)]"
-        >
-          {settable.map((c) => (
-            <DM.Item
-              key={c.key}
-              onSelect={() => void setTaskStatus(direction.id, c.key)}
-              className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-[12px] text-ink-muted outline-none data-[highlighted]:bg-brand-ghost data-[highlighted]:text-ink"
-            >
-              <span className={cn("h-1.5 w-1.5 rounded-full", c.dot)} />
-              {t(c.label)}
-              {c.key === current.key && <Check size={12} className="ml-auto text-brand" />}
-            </DM.Item>
-          ))}
-        </DM.Content>
-      </DM.Portal>
-    </DM.Root>
   );
 }
 

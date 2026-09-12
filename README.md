@@ -13,6 +13,10 @@ changes—not just chat logs.
 [中文说明](README.zh-CN.md)
 </div>
 
+> **SoloJiang/weft-codex is retired.** Codex Desktop / weftd / Host UI live in this
+> repository under [`weft-codex/`](weft-codex/). Clone and contribute here. Do not
+> use the old standalone repository.
+
 <p align="center">
   <img src="assets/readme/weft-delivery-workbench.jpg" alt="A hand-drawn local delivery workbench: one product goal enters Weft, repository worktrees run on the same machine, and their diffs, checks, PR state, and one exceptional Gate converge into a review surface" width="940" />
 </p>
@@ -254,27 +258,35 @@ pnpm dev             # Vite frontend
 pnpm build           # TypeScript check + production frontend bundle
 pnpm tauri dev       # full desktop app
 pnpm tauri build     # release app bundle
-cd src-tauri && cargo test
+cargo test --workspace
+cargo test --manifest-path src-tauri/Cargo.toml
 git diff --check
+```
+
+Codex Desktop / weftd is in-tree under `weft-codex/` (the standalone
+`SoloJiang/weft-codex` repository is retired):
+
+```bash
+./weft-codex/scripts/start.sh --mode=weft
 ```
 
 ## Project layout
 
 ```text
-src/
-  board/                Workspace and Issue boards
-  session/              chat, observe, diff, permissions
-  components/           shared React UI
-  i18n/                 English and Chinese strings
-src-tauri/src/
-  lead_chat/            headless agent session engine
-  im/                   Feishu/Lark and DingTalk bridge
-  store/                SQLite/SeaORM entities and migrations
-  bus/                  local MCP/thread bus
-  computer/             controlled desktop computer use
-  ask.rs                permission registry shared by desktop and IM
-  git.rs                repository and worktree operations
-  materialize.rs        scoped worktree materialization
+src/                    Weft Tauri UI (board, session, i18n)
+src-tauri/              Weft Tauri backend (lead_chat, store, bus, materialize)
+crates/
+  weft-scheduler/       status machine, party routing, wake merge
+  weft-bus/             inbox / wake / durable restore
+  weft-brief/           brief skeleton (tool lists stay in adapters)
+  weft-worktree/        idempotent git worktree create
+  weft-slug/            workspace / issue / direction slugs
+weft-codex/             Codex Host, weftd, launcher, UI, specs
+  crates/core/          Codex orchestrator + store (SessionPort adapter)
+  crates/app-server/    Codex app-server client (`turn/steer` stays here)
+  crates/daemon/        weftd
+  ui/                   Codex Weft-mode UI (own DESIGN.md)
+  launcher/             Desktop Host
 assets/
   screenshots/          README screenshots
   diagrams/             architecture diagrams

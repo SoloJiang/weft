@@ -150,10 +150,16 @@ export const api = {
     invoke<Direction[]>("list_directions", { threadId }),
   issueReadiness: (threadId: number) =>
     invoke<IssueReadinessDto>("issue_readiness", { threadId }),
-  setTaskStatus: (directionId: number, status: string) =>
-    invoke<void>("set_task_status", { directionId, status }),
   renameDirection: (directionId: number, name: string) =>
     invoke<Direction>("rename_direction", { directionId, name }),
+  completeDirection: (directionId: number) =>
+    invoke<Direction>("complete_direction", { directionId }),
+  approveDirection: (threadId: number, index: number, manualTool?: string) =>
+    invoke<number>("approve_direction", {
+      threadId,
+      index,
+      manualTool: manualTool ?? null,
+    }),
 
   // Planner: the lead's proposed Task → scope decomposition (§4.10, §5.1).
   getProposal: (threadId: number) =>
@@ -164,14 +170,6 @@ export const api = {
     invoke<number[]>("confirm_proposal", { threadId, manualTool: manualTool ?? null }),
   setProposalDirectionBase: (threadId: number, index: number, name: string, repo: string, expectedBase: string, expectedVersion: string, base: string) =>
     invoke<void>("set_proposal_direction_base", { threadId, index, name, repo, expectedBase, expectedVersion, base }),
-  createDirection: (
-    threadId: number,
-    name: string,
-    tool: string,
-    repoId: number,
-    reason: string,
-  ) =>
-    invoke<Direction>("create_direction", { threadId, name, tool, repoId, reason }),
 
   listWorktrees: (directionId: number) =>
     invoke<Worktree[]>("list_worktrees", { directionId }),

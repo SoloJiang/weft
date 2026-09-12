@@ -16,63 +16,60 @@
 //! persisted `STATUS_STOPPED`; a wake never spawns a competing headless process
 //! for it. A cleanly-idle session is still driven (its message goes through).
 
-use crate::bus::{Wake, HUMAN, LEAD};
+use crate::bus::Wake;
 use crate::lead_chat::engine::STATUS_STOPPED;
-use std::collections::HashSet;
+use crate::store::{repo, Db};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
+use weft_scheduler::{
+    classify_party, enqueue, enqueue_promotes_status, EnqueueJob, Inflight, PartyRoute,
+    WORKER_START_FAILED,
+};
 
-/// Where a wake's direction routes. The bus identity is either the human, the
-/// thread lead, or a worker (its direction id). Anything else is ignored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Route {
-    Human,
-    Lead,
-    Worker(i32),
+fn classify(dir: &str) -> Option<PartyRoute> {
+    classify_party(dir)
 }
 
-/// Pure classifier over a wake's `dir` string — unit-testable without a runtime.
-fn classify(dir: &str) -> Option<Route> {
-    if dir == HUMAN {
-        Some(Route::Human)
-    } else if dir == LEAD {
-        Some(Route::Lead)
-    } else {
-        dir.parse::<i32>().ok().map(Route::Worker)
-    }
-}
-
-/// Per-key (`"{thread}/{dir}"`) serialization. At most one delivery runs per key
-/// at a time so concurrent wakes can't race the lazy-attach; a wake that lands
-/// while one is in flight is remembered and re-delivered the instant it ends.
-#[derive(Default)]
-struct Inflight {
-    running: HashSet<String>,
-    dirty: HashSet<String>,
-}
-
-impl Inflight {
-    /// Register a wake. Returns true if the caller should start a delivery loop;
-    /// false means one is already running and this wake was coalesced into it.
-    fn begin(&mut self, key: &str) -> bool {
-        if self.running.contains(key) {
-            self.dirty.insert(key.to_string());
-            false
-        } else {
-            self.running.insert(key.to_string());
-            true
+/// Persist the shared enqueue after the human gate. Does not spawn sessions —
+/// the command layer starts workers via SessionPort (`chat_open_worker_impl`).
+pub(crate) async fn persist_enqueued(
+    db: &Db,
+    direction_ids: &[i32],
+) -> anyhow::Result<Vec<EnqueueJob>> {
+    let jobs = enqueue(direction_ids.iter().copied().map(i64::from));
+    for job in &jobs {
+        let direction_id = i32::try_from(job.direction_id)
+            .map_err(|_| anyhow::anyhow!("direction id out of i32 range"))?;
+        let Some(direction) = repo::get_direction(db, direction_id).await? else {
+            continue;
+        };
+        if enqueue_promotes_status(&direction.status) {
+            repo::set_direction_status(db, direction_id, job.status).await?;
         }
     }
+    Ok(jobs)
+}
 
-    /// After one delivery completes. Returns true if a wake coalesced during it
-    /// (re-deliver now); false releases the key so the next wake starts fresh.
-    fn next(&mut self, key: &str) -> bool {
-        if self.dirty.remove(key) {
-            true
-        } else {
-            self.running.remove(key);
-            false
+/// Persist enqueue after the human gate. On failure, stamp
+/// [`WORKER_START_FAILED`] so the UI can map it via attention-reason.
+pub(crate) async fn persist_enqueued_or_flag(
+    db: &Db,
+    direction_ids: &[i32],
+) -> anyhow::Result<Vec<EnqueueJob>> {
+    match persist_enqueued(db, direction_ids).await {
+        Ok(jobs) => Ok(jobs),
+        Err(error) => {
+            for &direction_id in direction_ids {
+                if let Err(flag_error) =
+                    repo::set_direction_attention(db, direction_id, Some(WORKER_START_FAILED)).await
+                {
+                    eprintln!(
+                        "[weft] set enqueue attention {direction_id}: {flag_error}"
+                    );
+                }
+            }
+            Err(error)
         }
     }
 }
@@ -89,7 +86,7 @@ pub fn run(app: AppHandle, rx: Receiver<Wake>) {
             // A wake addressed to the human means an agent asked a question:
             // nudge the UI to refresh its Needs-you surface, don't touch an
             // engine.
-            if route == Route::Human {
+            if route == PartyRoute::Human {
                 let _ = app.emit("needs-you://changed", w.thread);
                 continue;
             }
@@ -146,15 +143,15 @@ async fn live_resident(app: &AppHandle, key: i64) -> bool {
 /// resident worker is lazily attached so a bus post still drives it. A session
 /// taken over in the user's terminal (`STATUS_STOPPED`, not currently live under
 /// weft) is skipped so we never spawn a competing headless process.
-async fn deliver(app: &AppHandle, thread: i32, route: Route) -> anyhow::Result<()> {
+async fn deliver(app: &AppHandle, thread: i32, route: PartyRoute) -> anyhow::Result<()> {
     let Some(db) = app.try_state::<crate::store::Db>() else {
         return Ok(());
     };
     let db = crate::store::Db(db.0.clone(), db.1);
     match route {
         // Handled inline in run(); never reaches deliver().
-        Route::Human => Ok(()),
-        Route::Lead => {
+        PartyRoute::Human => Ok(()),
+        PartyRoute::Lead => {
             let key = crate::lead_chat::commands::lead_key(thread);
             let taken_over = crate::store::repo::lead_status(&db, thread).await?.as_deref()
                 == Some(STATUS_STOPPED);
@@ -165,7 +162,10 @@ async fn deliver(app: &AppHandle, thread: i32, route: Route) -> anyhow::Result<(
             let eng = crate::lead_chat::commands::lead_engine(app, &db, thread, "en").await?;
             crate::lead_chat::engine::nudge_bus_read(app, &db, &eng).await
         }
-        Route::Worker(dir) => {
+        PartyRoute::Worker(dir) => {
+            let Ok(dir) = i32::try_from(dir) else {
+                return Ok(());
+            };
             // Direction ids are global, but a wake belongs to the thread it was
             // posted on. A post to a foreign dir (an id that lives in another
             // thread) must not drive that unrelated worker — it would read its
@@ -216,10 +216,10 @@ mod tests {
 
     #[test]
     fn classify_routes_each_bus_identity() {
-        assert_eq!(classify("you"), Some(Route::Human));
-        assert_eq!(classify("lead"), Some(Route::Lead));
-        assert_eq!(classify("10"), Some(Route::Worker(10)));
-        assert_eq!(classify("1"), Some(Route::Worker(1)));
+        assert_eq!(classify("you"), Some(PartyRoute::Human));
+        assert_eq!(classify("lead"), Some(PartyRoute::Lead));
+        assert_eq!(classify("10"), Some(PartyRoute::Worker(10)));
+        assert_eq!(classify("1"), Some(PartyRoute::Worker(1)));
     }
 
     #[test]
@@ -243,5 +243,15 @@ mod tests {
         assert!(f.next(k)); // loop end sees the coalesced wake → re-deliver
         assert!(!f.next(k)); // nothing pending → release the key
         assert!(f.begin(k)); // a later wake starts a fresh loop
+    }
+
+    #[test]
+    fn enqueue_after_gate_is_the_shared_scheduler() {
+        let jobs = enqueue([4, 4, 0]);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].direction_id, 4);
+        assert_eq!(jobs[0].status, weft_scheduler::initial_status());
+        assert!(enqueue_promotes_status("queued"));
+        assert!(!enqueue_promotes_status("review"));
     }
 }

@@ -2526,6 +2526,10 @@ pub struct ThreadOverview {
     /// Stored lifecycle status of each direction (same order as direction_ids),
     /// so the workspace board derives the thread's phase deterministically.
     pub statuses: Vec<String>,
+    /// Enqueue/dispatch attention codes (same order as direction_ids). Empty
+    /// string = none. UI maps via attention-reason; not a Needs You item.
+    #[serde(default)]
+    pub attention_reasons: Vec<String>,
     /// Every registered worktree row needed by an unopened workspace card's
     /// readiness key. This avoids depending on the selected thread's hydrated
     /// `worktreesByDirection` cache.
@@ -2671,6 +2675,7 @@ async fn workspace_overview_inner(db: &Db, workspace_id: i32) -> R<Vec<ThreadOve
             plan_created_at,
             direction_ids: dirs.iter().map(|d| d.id).collect(),
             statuses: dirs.iter().map(|d| d.status.clone()).collect(),
+            attention_reasons: dirs.iter().map(|d| d.attention_reason.clone()).collect(),
             readiness_worktrees,
             write_repos: seen
                 .into_iter()
@@ -2815,6 +2820,7 @@ async fn confirm_proposal_and_propagate_read_only_with_manual_tool(
 ) -> anyhow::Result<Vec<i32>> {
     let ids = crate::planner::confirm_with_manual_tool(db, thread_id, manual_tool).await?;
     asks.grant_read_only_issue(thread_id);
+    crate::coordinator::persist_enqueued_or_flag(db, &ids).await?;
     Ok(ids)
 }
 
@@ -2833,14 +2839,16 @@ async fn confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sess
     )
     .await?;
     asks.grant_read_only_issue(thread_id);
-    // Evidence write site 4 (issue #174 R1-04): this is the ONLY production
-    // path that materializes a Lane decision today — `planner::
-    // approve_direction`/`deny_direction` also record decision evidence
-    // (for future per-lane UI/bus wiring) but neither is currently called
-    // from a tauri command or bus tool. `confirm` only ever dispatches
-    // AllowedByPolicy lanes (see `readiness::proposal_lane_policy`'s
-    // Confirmed-phase rule), so every id here gets that verdict.
+    // Evidence write site 4 (issue #174 R1-04): `confirm` is the batch
+    // materialize path. Per-lane `approve_direction` records its own
+    // decision evidence and now also enqueues through the same adapter.
+    // `confirm` only ever dispatches AllowedByPolicy lanes (see
+    // `readiness::proposal_lane_policy`'s Confirmed-phase rule), so every
+    // id here gets that verdict.
     record_confirm_decision_evidence(db, thread_id, &ids).await;
+    // Human gate is done. Shared enqueue persists initial_status; spawn is
+    // the SessionPort adapter in the tauri command (not lead_chat).
+    crate::coordinator::persist_enqueued_or_flag(db, &ids).await?;
     Ok(ids)
 }
 
@@ -2900,9 +2908,179 @@ pub async fn confirm_proposal(
     )
     .await
     .map_err(e)?;
+    let jobs = weft_scheduler::enqueue(ids.iter().copied().map(i64::from));
+    start_enqueued_workers(&app, &db, &jobs).await;
     use tauri::Emitter;
     let _ = app.emit("needs-you://changed", thread_id);
     Ok(ids)
+}
+
+/// Approve one proposed lane, then enqueue it through `weft-scheduler`.
+/// Planner materialize stays status-agnostic; persist + spawn live here,
+/// matching `confirm_proposal`.
+async fn approve_direction_and_enqueue(
+    db: &Db,
+    asks: &crate::ask::AskRegistry,
+    thread_id: i32,
+    index: usize,
+    manual_tool: Option<&str>,
+    is_session_live: Option<&(dyn Fn(i32) -> bool + Send + Sync)>,
+) -> anyhow::Result<i32> {
+    let direction_id = if let Some(is_session_live) = is_session_live {
+        crate::planner::approve_direction_with_pin_and_live_sessions(
+            db,
+            thread_id,
+            index,
+            manual_tool,
+            is_session_live,
+        )
+        .await?
+    } else {
+        crate::planner::approve_direction_with_pin(db, thread_id, index, manual_tool).await?
+    };
+    asks.grant_read_only_issue(thread_id);
+    crate::coordinator::persist_enqueued_or_flag(db, &[direction_id]).await?;
+    Ok(direction_id)
+}
+
+#[tauri::command]
+pub async fn approve_direction(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    asks: tauri::State<'_, crate::ask::AskRegistry>,
+    thread_id: i32,
+    index: i32,
+    manual_tool: Option<String>,
+) -> R<i32> {
+    if index < 0 {
+        return Err("write trigger index out of range".into());
+    }
+    let index = usize::try_from(index).map_err(e)?;
+    let live_sessions = app.state::<crate::lead_chat::engine::LeadChatState>();
+    let is_session_live = |session_id| live_sessions.worker_is_running(session_id);
+    let direction_id = approve_direction_and_enqueue(
+        &db,
+        &asks,
+        thread_id,
+        index,
+        manual_tool.as_deref(),
+        Some(&is_session_live),
+    )
+    .await
+    .map_err(e)?;
+    let jobs = weft_scheduler::enqueue(std::iter::once(i64::from(direction_id)));
+    start_enqueued_workers(&app, &db, &jobs).await;
+    use tauri::Emitter;
+    let _ = app.emit("needs-you://changed", thread_id);
+    Ok(direction_id)
+}
+
+/// SessionPort adapter: open each enqueued worker. Enqueue policy stays in
+/// `weft-scheduler`; `lead_chat` only speaks to the session.
+async fn start_enqueued_workers(
+    app: &tauri::AppHandle,
+    db: &Db,
+    jobs: &[weft_scheduler::EnqueueJob],
+) {
+    use crate::lead_chat::commands::chat_open_worker_impl;
+    use tauri::Emitter;
+    let mut started = 0usize;
+    for job in jobs {
+        let Ok(direction_id) = i32::try_from(job.direction_id) else {
+            continue;
+        };
+        let mut attempted = false;
+        let mut failed = false;
+        let worktrees = match repo::list_worktrees(db, Some(direction_id)).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                eprintln!("[weft] list worktrees for enqueued {direction_id}: {error}");
+                failed = true;
+                Vec::new()
+            }
+        };
+        for worktree in worktrees {
+            if !std::path::Path::new(&worktree.path).exists() {
+                continue;
+            }
+            attempted = true;
+            match chat_open_worker_impl(app, db, direction_id, worktree.repo_id, "en").await {
+                Ok(_) => started += 1,
+                Err(error) => {
+                    failed = true;
+                    eprintln!(
+                        "[weft] enqueue dispatch {direction_id}@{} failed: {error}",
+                        worktree.repo_id
+                    );
+                }
+            }
+        }
+        if weft_scheduler::enqueue_dispatch_failed(attempted, failed) {
+            if let Err(error) = repo::set_direction_attention(
+                db,
+                direction_id,
+                Some(weft_scheduler::WORKER_START_FAILED),
+            )
+            .await
+            {
+                eprintln!("[weft] set enqueue attention {direction_id}: {error}");
+            }
+        } else if let Err(error) = repo::clear_direction_attention_if(
+            db,
+            direction_id,
+            weft_scheduler::WORKER_START_FAILED,
+        )
+        .await
+        {
+            eprintln!("[weft] clear enqueue attention {direction_id}: {error}");
+        }
+    }
+    if started > 0 {
+        let _ = app.emit("worker-revived", ());
+    }
+}
+
+async fn complete_direction_inner(
+    db: &Db,
+    direction_id: i32,
+) -> anyhow::Result<entities::direction::Model> {
+    let Some(direction) = repo::get_direction(db, direction_id).await? else {
+        anyhow::bail!("direction {direction_id} not found");
+    };
+    if direction.status == weft_scheduler::STATUS_DONE {
+        return Ok(direction);
+    }
+    if !weft_scheduler::can_complete(&direction.status) {
+        anyhow::bail!(
+            "cannot complete task {direction_id} from status {:?}; expected review",
+            direction.status
+        );
+    }
+    if !repo::complete_direction_if_review(db, direction_id).await? {
+        let Some(current) = repo::get_direction(db, direction_id).await? else {
+            anyhow::bail!("direction {direction_id} not found");
+        };
+        if current.status == weft_scheduler::STATUS_DONE {
+            return Ok(current);
+        }
+        anyhow::bail!(
+            "cannot complete task {direction_id} from status {:?}; expected review",
+            current.status
+        );
+    }
+    repo::get_direction(db, direction_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("direction {direction_id} not found"))
+}
+
+/// Accept a worker result. The only human status transition is review → done
+/// (`weft_scheduler::can_complete`). Already-done is idempotent.
+#[tauri::command]
+pub async fn complete_direction(
+    db: State<'_, Db>,
+    direction_id: i32,
+) -> R<entities::direction::Model> {
+    complete_direction_inner(&db, direction_id).await.map_err(e)
 }
 
 /// The brief a worker for this direction would be dispatched with (§4.10).
@@ -9261,6 +9439,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids.len(), 1, "the single lane should materialize");
+        let created = repo::get_direction(&db, ids[0])
+            .await
+            .unwrap()
+            .expect("confirmed direction");
+        assert_eq!(
+            created.status,
+            weft_scheduler::initial_status(),
+            "confirm enqueue promotes queued → working"
+        );
         let dir = ids[0].to_string();
 
         // the propagated grant covers a ReadOnly ask on the JUST-created direction...
@@ -9291,6 +9478,112 @@ mod tests {
         std::env::remove_var("WEFT_HOME");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn approve_direction_and_enqueue_promotes_queued_to_working() {
+        let _env = crate::paths::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tag = format!("weft-approve-enqueue-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{tag}-root"));
+        let weft_home = std::env::temp_dir().join(format!("{tag}-home"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+        std::env::set_var("WEFT_HOME", weft_home.to_str().unwrap());
+        init_main_repo(&root, "api");
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        repo::add_repo_ref(
+            &db,
+            ws.id,
+            "api",
+            root.join("api").to_str().unwrap(),
+            "main",
+            "",
+            true,
+        )
+        .await
+        .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude")
+            .await
+            .unwrap();
+        let proposal = crate::planner::Proposal {
+            rationale: "r".into(),
+            directions: vec![crate::planner::ProposedDirection {
+                name: "A".into(),
+                repo: "api".into(),
+                reason: "r".into(),
+                mandate: "".into(),
+                base_branch: "".into(),
+                decision: "".into(),
+                direction_id: 0,
+            }],
+        };
+        crate::planner::save_proposal(&db, t.id, &proposal)
+            .await
+            .unwrap();
+
+        let asks = crate::ask::AskRegistry::new();
+        let direction_id =
+            approve_direction_and_enqueue(&db, &asks, t.id, 0, Some("codex"), None)
+                .await
+                .unwrap();
+        let created = repo::get_direction(&db, direction_id)
+            .await
+            .unwrap()
+            .expect("approved direction");
+        assert_eq!(
+            created.status,
+            weft_scheduler::initial_status(),
+            "approve enqueue promotes queued → working"
+        );
+        assert!(created.attention_reason.is_empty());
+        assert_eq!(
+            asks.auto_decision(t.id, &direction_id.to_string(), crate::ask::RiskLevel::ReadOnly, "ls"),
+            Some(crate::ask::Decision::Allow)
+        );
+
+        let removed = repo::delete_thread_cascade(&db, t.id).await.unwrap();
+        let _ = materialize::cleanup_worktrees(&db, &removed).await;
+        std::env::remove_var("WEFT_HOME");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&weft_home);
+    }
+
+    #[tokio::test]
+    async fn complete_direction_inner_is_review_only_and_idempotent() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let ws = repo::create_workspace(&db, "ws").await.unwrap();
+        let repo = repo::add_repo_ref(&db, ws.id, "api", "/tmp/weft-complete-dir", "main", "", true)
+            .await
+            .unwrap();
+        let t = repo::create_thread(&db, ws.id, "t1", "feature", "claude")
+            .await
+            .unwrap();
+        let dir = repo::create_direction(
+            &db,
+            t.id,
+            "A",
+            "codex",
+            repo.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(complete_direction_inner(&db, dir.id).await.is_err());
+
+        repo::set_direction_status(&db, dir.id, weft_scheduler::STATUS_REVIEW)
+            .await
+            .unwrap();
+        let accepted = complete_direction_inner(&db, dir.id).await.unwrap();
+        assert_eq!(accepted.status, weft_scheduler::STATUS_DONE);
+
+        let again = complete_direction_inner(&db, dir.id).await.unwrap();
+        assert_eq!(again.status, weft_scheduler::STATUS_DONE);
     }
 
     // —— stale enable vs. a later Stop ——

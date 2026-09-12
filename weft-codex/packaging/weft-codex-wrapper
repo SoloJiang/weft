@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+SELF_PATH=$0
+case "$SELF_PATH" in
+  /*) ;;
+  *)
+    RESOLVED_PATH=$(command -v "$SELF_PATH" 2>/dev/null || true)
+    if [ -z "$RESOLVED_PATH" ]; then
+      echo "weft-codex: cannot resolve the global launcher path" >&2
+      exit 1
+    fi
+    SELF_PATH=$RESOLVED_PATH
+    ;;
+esac
+
+BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$SELF_PATH")" && pwd)
+PREFIX=$(CDPATH= cd -- "$BIN_DIR/.." && pwd)
+RUNTIME="$PREFIX/share/weft-codex/current/bin/weft-codex"
+
+if [ ! -x "$RUNTIME" ]; then
+  echo "weft-codex: installed runtime is missing: $RUNTIME" >&2
+  echo "Run the package install.sh again to repair the installation." >&2
+  exit 1
+fi
+
+exec "$RUNTIME" "$@"

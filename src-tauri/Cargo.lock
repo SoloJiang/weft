@@ -8975,9 +8975,45 @@ dependencies = [
  "toml_edit 0.22.27",
  "tower",
  "user-notify",
+ "weft-brief",
+ "weft-bus",
+ "weft-scheduler",
+ "weft-slug",
+ "weft-worktree",
  "windows 0.61.3",
  "x11rb",
  "xcap",
+]
+
+[[package]]
+name = "weft-brief"
+version = "0.1.0"
+
+[[package]]
+name = "weft-bus"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tokio",
+]
+
+[[package]]
+name = "weft-scheduler"
+version = "0.1.0"
+dependencies = [
+ "weft-brief",
+]
+
+[[package]]
+name = "weft-slug"
+version = "0.1.0"
+
+[[package]]
+name = "weft-worktree"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tokio",
 ]
 
 [[package]]

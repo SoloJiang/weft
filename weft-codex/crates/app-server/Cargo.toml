@@ -1,0 +1,17 @@
+[package]
+name = "weft-app-server"
+version = "0.1.1"
+description = "Codex app-server client (ported from weft codex_app_server.rs)"
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

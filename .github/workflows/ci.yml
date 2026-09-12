@@ -114,6 +114,10 @@ jobs:
         if: runner.os == 'Windows'
         run: protoc --version
 
+      - name: Shared crate and weft-codex tests
+        if: runner.os != 'Windows'
+        run: cargo test --workspace
+
       - name: Run Rust tests
         if: runner.os != 'Windows'
         run: cargo test --manifest-path src-tauri/Cargo.toml

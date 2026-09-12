@@ -1,0 +1,6 @@
+[package]
+name = "weft-brief"
+version = "0.1.0"
+description = "Shared Weft brief skeleton; adapters fill tool lists"
+edition.workspace = true
+license.workspace = true

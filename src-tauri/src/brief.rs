@@ -3,6 +3,11 @@
 //! must respect (derived from the dependency graph), what it must NOT edit, and
 //! how to coordinate. Assembled deterministically from the plan + repo map; the
 //! lead can enrich it later.
+//!
+//! Party identity and bus envelopes come from `weft-brief`. Tool lists and the
+//! curator-derived sections stay in this Weft adapter.
+
+pub use weft_brief::{bus_envelope, direction_party, LEAD_PARTY};
 
 use crate::curator;
 use crate::store::{repo, Db};

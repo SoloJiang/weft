@@ -25,9 +25,22 @@ import {
   type ReadinessFetchState,
   type StoredReadiness,
 } from "../lib/readinessKey";
+import {
+  deriveIssueStatus,
+  ISSUE_BOARD_STATUSES,
+  type IssueBoardStatus,
+} from "../lib/issue-board";
+import { issueBoardSignalKey, issueBoardSignalReason } from "../lib/attention-reason";
 
-type Phase = "planning" | "working" | "review" | "done";
+type Phase = IssueBoardStatus;
 type PrChangedEvent = { thread_id: number };
+
+const COLUMN_META: Record<IssueBoardStatus, { label: string; dot: string }> = {
+  queued: { label: "wsboard.queued", dot: "bg-idle" },
+  working: { label: "wsboard.working", dot: "bg-running" },
+  review: { label: "wsboard.review", dot: "bg-brand" },
+  done: { label: "wsboard.done", dot: "bg-accent" },
+};
 
 function threadAttentionCount(o: ThreadOverview, items: AttentionItem[]): number {
   return items.filter((item) => attentionThreadId(item) === o.thread_id).length;
@@ -47,12 +60,10 @@ function progressBarColor(attention: number, failing: number): string {
   return "bg-brand";
 }
 
-const COLUMNS: { key: Phase; label: string; dot: string }[] = [
-  { key: "planning", label: "wsboard.planning", dot: "bg-idle" },
-  { key: "working", label: "thread.colRunning", dot: "bg-running" },
-  { key: "review", label: "thread.colReview", dot: "bg-brand" },
-  { key: "done", label: "thread.colDone", dot: "bg-accent" },
-];
+const COLUMNS: { key: Phase; label: string; dot: string }[] = ISSUE_BOARD_STATUSES.map((key) => ({
+  key,
+  ...COLUMN_META[key],
+}));
 
 export function WorkspaceKanban() {
   const {
@@ -78,23 +89,16 @@ export function WorkspaceKanban() {
     };
   }, []);
 
-  // Phase from the stored direction statuses — deterministic across restarts
-  // (no dependency on in-memory sessions). Needs-you is a tag on the card, not
-  // a stage: an open ask never moves a card out of its lifecycle column.
-  // planning = the thread is still being scoped (no tasks yet); any task not
-  // yet through coding = working; only review-and-beyond remains = review.
-  const phaseOf = (o: ThreadOverview): Phase => {
-    if (o.direction_ids.length === 0) return "planning";
-    if (o.statuses.every((s) => s === "done")) return "done";
-    if (o.statuses.some((s) => s !== "done" && s !== "review")) return "working";
-    return "review";
-  };
+  // Phase from the stored direction statuses — same rollup as weft-codex
+  // `deriveIssueStatus`. Needs-you is a tag on the card, not a stage.
+  const phaseOf = (o: ThreadOverview): Phase => deriveIssueStatus(o.statuses);
 
   // Cards waiting on the human (or with a failing check) bubble to the top of
   // their column — the attention signal without hijacking the stage. Same
   // thread-level accounting as the card badge, so lead questions sort up too.
   const urgent = (o: ThreadOverview): boolean =>
     threadAttentionCount(o, attentionItems) > 0 ||
+    (o.attention_reasons ?? []).some(Boolean) ||
     o.direction_ids.some((id) =>
       (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
     );
@@ -329,6 +333,17 @@ function ThreadCard({
   const readOnlyTrusted = readOnlyGrants.issue.includes(o.thread_id);
   const done = o.statuses.filter((s) => s === "done").length;
   const attention = threadAttentionCount(o, attentionItems);
+  const directionReasons = (o.attention_reasons ?? []).filter(Boolean);
+  const dispatchSignalOptions = {
+    leadAttention: false,
+    leadReason: "",
+    directionReasons,
+  };
+  const dispatchSignal = directionReasons.length
+    ? t(issueBoardSignalKey(dispatchSignalOptions))
+    : "";
+  const dispatchReason = issueBoardSignalReason(dispatchSignalOptions);
+  const flagged = attention > 0 || directionReasons.length > 0;
   const failing = o.direction_ids.filter((id) =>
     (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
   ).length;
@@ -342,7 +357,7 @@ function ThreadCard({
       onClick={onOpen}
       className={cn(
         "group flex flex-col gap-2.5 rounded-[var(--radius-lg)] border bg-surface p-3 text-left transition-colors hover:border-border-strong hover:bg-raised",
-        attention > 0 ? "border-waiting/45" : "border-border",
+        flagged ? "border-waiting/45" : "border-border",
       )}
     >
       <div className="flex items-start gap-2">
@@ -386,6 +401,15 @@ function ThreadCard({
         />
         {inherited && <InheritedAccessChip threadId={o.thread_id} />}
         {readOnlyTrusted && <ReadOnlyTrustChip threadId={o.thread_id} />}
+        {dispatchSignal ? (
+          <span
+            className="max-w-full truncate rounded-full border border-waiting/30 bg-waiting/10 px-1.5 py-0.5 text-[10.5px] text-waiting"
+            title={dispatchSignal}
+            data-attention-reason={dispatchReason || undefined}
+          >
+            {dispatchSignal}
+          </span>
+        ) : null}
       </div>
 
       {(o.direction_ids.length > 0 || activity.kind !== "idle") && (

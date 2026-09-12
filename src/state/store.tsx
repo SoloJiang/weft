@@ -505,6 +505,8 @@ interface Store {
   deleteWorkspace: (workspaceId: number) => Promise<void>;
   renameThread: (threadId: number, title: string) => Promise<void>;
   renameDirection: (directionId: number, name: string) => Promise<void>;
+  /** Accept a review result (`can_complete`: review → done). */
+  completeDirection: (directionId: number) => Promise<void>;
   addRepo: (name: string, path: string) => Promise<void>;
   /** Batch add of existing local repos, sequential + tolerant. Reports per-item
    *  progress; refreshes the repo list once at the end. Duplicates are deduped
@@ -525,13 +527,6 @@ interface Store {
   ) => Promise<void>;
   createRepo: (name: string, dest: string) => Promise<void>;
   createThread: (title: string, kind: string) => Promise<Thread>;
-  createDirection: (
-    threadId: number,
-    name: string,
-    tool: string,
-    repoId: number,
-    reason: string,
-  ) => Promise<void>;
   deleteThread: (threadId: number) => Promise<void>;
   /** Delete a finished task's worktree (directory + record); keeps the branch. */
   deleteWorktree: (worktreeId: number, directionId: number) => Promise<void>;
@@ -561,8 +556,6 @@ interface Store {
   ) => Promise<void>;
   reviveDirection: (directionId: number) => Promise<void>;
   closeObserve: () => void;
-  /** Set a task's lifecycle status (human override). */
-  setTaskStatus: (directionId: number, status: string) => Promise<void>;
   /** Quality loop: executable-check results + in-flight set, per direction. */
   checksByDirection: Record<number, RepoChecks[]>;
   checkingDirections: Record<number, boolean>;
@@ -1475,6 +1468,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [refreshOverview],
   );
 
+  const completeDirection = useCallback(async (directionId: number) => {
+    try {
+      const updated = await api.completeDirection(directionId);
+      setDirections((m) => ({
+        ...m,
+        [updated.thread_id]: (m[updated.thread_id] ?? []).map((x) =>
+          x.id === updated.id ? updated : x,
+        ),
+      }));
+      void refreshOverview();
+    } catch (err) {
+      console.error(err);
+      toast(i18n.t("thread.acceptResultFailed"), "danger");
+    }
+  }, [refreshOverview]);
+
   const renameDirection = useCallback(async (directionId: number, name: string) => {
     const d = await api.renameDirection(directionId, name);
     setDirections((m) => ({
@@ -1678,35 +1687,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setShowNeeds(false);
     setHomeTab("board");
   }, []);
-
-  // Spawn (or focus) a worker for a (direction, repo) slot. focus=true opens it
-  // full-screen (a click); focus=false dispatches it in the background.
-  const spawnWorker = useCallback(
-    async (directionId: number, repoId: number, focus: boolean) => {
-      const existing = Object.values(sessionsRef.current).find(
-        (s) => s.directionId === directionId && s.repoId === repoId,
-      );
-      if (existing) {
-        if (focus) openWorker(directionId, repoId);
-        return;
-      }
-      const info = await api.chatOpenWorker(directionId, repoId, currentLang());
-      setSessions((m) => ({
-        ...m,
-        [info.session_id]: {
-          info,
-          status: "running",
-          directionId,
-          repoId,
-          threadId: info.thread_id,
-          nativeId: info.native_id,
-          eventDriven: true,
-        },
-      }));
-      if (focus) openWorker(directionId, repoId);
-    },
-    [openWorker],
-  );
 
   const viewDirection = useCallback(
     (directionId: number, repoId: number, opts?: { sidePanel?: "diff" | "files" }) => {
@@ -1982,30 +1962,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [driveDirection],
   );
 
-  // Automation-first (§4 principle 7): once a task is materialized, dispatch its
-  // worker(s) right away — every write worktree gets an agent, no human click.
-  const dispatchDirection = useCallback(
-    async (directionId: number) => {
-      let wts;
-      try {
-        wts = await api.listWorktrees(directionId);
-      } catch (e) {
-        return;
-      }
-      // Skip reclaimed worktrees (exists=false): the directory is gone, so
-      // spawning a worker in it would fail.
-      for (const w of wts.filter((w) => w.exists)) {
-        try {
-          await spawnWorker(directionId, w.repo_id, false);
-        } catch (error) {
-          notifyBackgroundWorkerDispatchFailed(error);
-          return;
-        }
-      }
-    },
-    [spawnWorker],
-  );
-
   // Restart continuity (§4 principle 7): bring a working task's worker back by
   // RESUME (not a fresh re-run) once per repo. Reuses driveDirection's
   // resume-or-fresh + dedupe-by-live logic.
@@ -2029,21 +1985,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       }
     },
     [driveDirection],
-  );
-
-  const createDirection = useCallback(
-    async (
-      threadId: number,
-      name: string,
-      tool: string,
-      repoId: number,
-      reason: string,
-    ) => {
-      const dir = await api.createDirection(threadId, name, tool, repoId, reason);
-      await loadThreadChildren(threadId);
-      void dispatchDirection(dir.id);
-    },
-    [loadThreadChildren, dispatchDirection],
   );
 
   // ── Lead chat (weft-owned conversation; engine pushes via `lead-chat`) ──
@@ -2553,25 +2494,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     await api.leadInterrupt(threadId);
   }, []);
 
-  const setTaskStatus = useCallback(async (directionId: number, status: string) => {
-    // optimistic: flip the card now, then persist
-    setDirections((m) => {
-      const next: Record<number, Direction[]> = {};
-      for (const [tid, list] of Object.entries(m)) {
-        next[Number(tid)] = list.map((d) =>
-          d.id === directionId ? { ...d, status } : d,
-        );
-      }
-      return next;
-    });
-    try {
-      await api.setTaskStatus(directionId, status);
-    } catch (e) {
-      /* reverts on next poll */
-      console.error(e);
-    }
-  }, []);
-
   const verifyingRef = useRef<Set<number>>(new Set());
   const verifyAgainRef = useRef<Set<number>>(new Set());
   const verifyDirection = useCallback(async (directionId: number) => {
@@ -3011,9 +2933,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     // now reachable right after a merged plan-approve in the same click, so a failure here
     // must land visibly/recoverably, not half-silently — mirrors the base-save-failed
     // branch above: toast, refresh to the real state, and return so a retry acts on it).
-    let ids: number[];
     try {
-      ids = await api.confirmProposal(activeThreadId, manualTool);
+      await api.confirmProposal(activeThreadId, manualTool);
     } catch (err) {
       console.error(err);
       const routeBlocked = routeBlockedErrorMessage(rawErrorMessage(err));
@@ -3037,9 +2958,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       console.error(e);
     }
-    // Automation-first: dispatch every new task's worker immediately.
-    for (const id of ids) void dispatchDirection(id);
-  }, [activeThreadId, loadThreadChildren, dispatchDirection, refreshProposal]);
+    // Workers start from the shared enqueue on confirm_proposal; adopt them.
+    void hydrateLiveWorkers(true);
+  }, [activeThreadId, loadThreadChildren, hydrateLiveWorkers, refreshProposal]);
 
   const approvePlanCard = useCallback(
     async (
@@ -3680,13 +3601,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     deleteWorkspace,
     renameThread,
     renameDirection,
+    completeDirection,
     addRepo,
     addRepos,
     cloneRepo,
     importRepos,
     createRepo,
     createThread,
-    createDirection,
     deleteThread,
     deleteWorktree,
     viewing,
@@ -3695,7 +3616,6 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     sendToWorker,
     reviveDirection,
     closeObserve,
-    setTaskStatus,
     checksByDirection,
     checkingDirections,
     verifyDirection,

@@ -1,0 +1,9 @@
+target/
+node_modules/
+dist/
+artifacts/
+# 设计探索的产物（原型、截图、QA 报告）。定稿的设计文档进 docs/，是 tracked 的。
+designs/
+design-qa.md
+.DS_Store
+__pycache__/
