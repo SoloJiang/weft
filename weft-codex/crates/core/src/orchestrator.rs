@@ -799,7 +799,7 @@ impl Orchestrator {
         if direction.status == "done" {
             return Ok(());
         }
-        if direction.status != "review" {
+        if !weft_scheduler::can_complete(&direction.status) {
             return Err(ApiError::conflict(
                 "cannot_complete",
                 format!(

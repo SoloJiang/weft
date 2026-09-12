@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 use weft_scheduler::{
     classify_party, enqueue, enqueue_promotes_status, EnqueueJob, Inflight, PartyRoute,
+    WORKER_START_FAILED,
 };
 
 fn classify(dir: &str) -> Option<PartyRoute> {
@@ -48,6 +49,29 @@ pub(crate) async fn persist_enqueued(
         }
     }
     Ok(jobs)
+}
+
+/// Persist enqueue after the human gate. On failure, stamp
+/// [`WORKER_START_FAILED`] so the UI can map it via attention-reason.
+pub(crate) async fn persist_enqueued_or_flag(
+    db: &Db,
+    direction_ids: &[i32],
+) -> anyhow::Result<Vec<EnqueueJob>> {
+    match persist_enqueued(db, direction_ids).await {
+        Ok(jobs) => Ok(jobs),
+        Err(error) => {
+            for &direction_id in direction_ids {
+                if let Err(flag_error) =
+                    repo::set_direction_attention(db, direction_id, Some(WORKER_START_FAILED)).await
+                {
+                    eprintln!(
+                        "[weft] set enqueue attention {direction_id}: {flag_error}"
+                    );
+                }
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Run the coordinator loop on a dedicated OS thread (the mpsc Receiver is

@@ -30,6 +30,7 @@ import {
   ISSUE_BOARD_STATUSES,
   type IssueBoardStatus,
 } from "../lib/issue-board";
+import { issueBoardSignalKey, issueBoardSignalReason } from "../lib/attention-reason";
 
 type Phase = IssueBoardStatus;
 type PrChangedEvent = { thread_id: number };
@@ -97,6 +98,7 @@ export function WorkspaceKanban() {
   // thread-level accounting as the card badge, so lead questions sort up too.
   const urgent = (o: ThreadOverview): boolean =>
     threadAttentionCount(o, attentionItems) > 0 ||
+    (o.attention_reasons ?? []).some(Boolean) ||
     o.direction_ids.some((id) =>
       (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
     );
@@ -331,6 +333,17 @@ function ThreadCard({
   const readOnlyTrusted = readOnlyGrants.issue.includes(o.thread_id);
   const done = o.statuses.filter((s) => s === "done").length;
   const attention = threadAttentionCount(o, attentionItems);
+  const directionReasons = (o.attention_reasons ?? []).filter(Boolean);
+  const dispatchSignalOptions = {
+    leadAttention: false,
+    leadReason: "",
+    directionReasons,
+  };
+  const dispatchSignal = directionReasons.length
+    ? t(issueBoardSignalKey(dispatchSignalOptions))
+    : "";
+  const dispatchReason = issueBoardSignalReason(dispatchSignalOptions);
+  const flagged = attention > 0 || directionReasons.length > 0;
   const failing = o.direction_ids.filter((id) =>
     (checksByDirection[id] ?? []).some((rc) => rc.checks.some((c) => c.status === "fail")),
   ).length;
@@ -344,7 +357,7 @@ function ThreadCard({
       onClick={onOpen}
       className={cn(
         "group flex flex-col gap-2.5 rounded-[var(--radius-lg)] border bg-surface p-3 text-left transition-colors hover:border-border-strong hover:bg-raised",
-        attention > 0 ? "border-waiting/45" : "border-border",
+        flagged ? "border-waiting/45" : "border-border",
       )}
     >
       <div className="flex items-start gap-2">
@@ -388,6 +401,15 @@ function ThreadCard({
         />
         {inherited && <InheritedAccessChip threadId={o.thread_id} />}
         {readOnlyTrusted && <ReadOnlyTrustChip threadId={o.thread_id} />}
+        {dispatchSignal ? (
+          <span
+            className="max-w-full truncate rounded-full border border-waiting/30 bg-waiting/10 px-1.5 py-0.5 text-[10.5px] text-waiting"
+            title={dispatchSignal}
+            data-attention-reason={dispatchReason || undefined}
+          >
+            {dispatchSignal}
+          </span>
+        ) : null}
       </div>
 
       {(o.direction_ids.length > 0 || activity.kind !== "idle") && (

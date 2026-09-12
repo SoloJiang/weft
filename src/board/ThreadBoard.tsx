@@ -15,6 +15,7 @@ import {
   MoreHorizontal,
   Pencil,
   ScanEye,
+  Send,
   TerminalSquare,
   Trash2,
   X,
@@ -40,6 +41,12 @@ import { ScopeReview } from "./ScopeReview";
 import { DeleteWorktreeDialog, RenameDialog } from "../nav/dialogs";
 import { LeadTab } from "../session/LeadTab";
 import { cn } from "../lib/cn";
+import { directionAttentionKey } from "../lib/attention-reason";
+import {
+  canComplete,
+  canContinueDirection,
+  directionCardPrimary,
+} from "../lib/direction-card-actions";
 import {
   beginReadinessRefresh,
   buildReadinessWorktreeSignatures,
@@ -376,6 +383,8 @@ function DirectionCard({
   const {
     worktreesByDirection,
     viewDirection,
+    driveDirection,
+    completeDirection,
     attentionItems,
     checksByDirection,
     requestSkillReview,
@@ -384,6 +393,7 @@ function DirectionCard({
   } = useStore();
   const { t } = useTranslation();
   const [wtToDelete, setWtToDelete] = useState<Worktree | null>(null);
+  const [completing, setCompleting] = useState(false);
   const writes = worktreesByDirection[direction.id] ?? [];
   // Only worktrees whose directory is still on disk back live actions. A row can
   // outlive its directory (reclaimed via the Done-card delete, or removed out of
@@ -396,16 +406,20 @@ function DirectionCard({
   const passed = allChecks.filter((c) => c.status === "pass").length;
   const hasNeed = attentionItems.some((item) => attentionDirectionId(item) === direction.id);
   const firstWrite = liveWrites[0];
+  const attentionReason = direction.attention_reason ?? "";
+  const flagged = hasNeed || Boolean(attentionReason);
 
   const testsKind = deriveTestsKind(failed, passed, allChecks.length);
-  // The review-column primary action is honest: open the actual diff for human
-  // eyes (Task→PR is the delivery boundary; weft does not fake a PR step).
-  const action = hasNeed
-    ? { label: t("thread.handle"), variant: "primary" as const, diff: false }
-    : direction.status === "review"
-      ? { label: t("thread.viewChanges"), variant: "primary" as const, diff: true }
-      : { label: t("thread.openSession"), variant: "default" as const, diff: false };
+  const primaryKind = directionCardPrimary(hasNeed, direction.status);
+  const PRIMARY = {
+    handle: { label: t("thread.handle"), variant: "primary" as const, diff: false },
+    viewChanges: { label: t("thread.viewChanges"), variant: "default" as const, diff: true },
+    openSession: { label: t("thread.openSession"), variant: "default" as const, diff: false },
+  } as const;
+  const action = PRIMARY[primaryKind];
   const canRunReview = direction.status === "review";
+  const showContinue = canContinueDirection(direction.status);
+  const showAccept = canComplete(direction.status);
 
   return (
     <>
@@ -413,7 +427,7 @@ function DirectionCard({
       layout
       className={cn(
         "group flex flex-col rounded-[var(--radius-lg)] border bg-surface text-left transition-colors hover:border-border-strong",
-        hasNeed ? "border-waiting/45" : "border-border",
+        flagged ? "border-waiting/45" : "border-border",
       )}
     >
       <div className="flex items-start gap-2.5 px-3 pb-2.5 pt-3">
@@ -460,6 +474,15 @@ function DirectionCard({
               </button>
             </div>
           </div>
+          {attentionReason ? (
+            <p
+              className="mt-1 text-[11px] leading-snug text-waiting"
+              title={t(directionAttentionKey(attentionReason))}
+              data-attention-reason={attentionReason}
+            >
+              {t(directionAttentionKey(attentionReason))}
+            </p>
+          ) : null}
         </div>
       </div>
 
@@ -482,7 +505,7 @@ function DirectionCard({
             onDeleteWorktree={setWtToDelete}
           />
         </div>
-        <div className="flex shrink-0 items-center gap-1.5">
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
           {canRunReview && (
             <Tooltip label={t("thread.reviewTip")}>
               <button
@@ -511,6 +534,35 @@ function DirectionCard({
             {action.diff ? <GitCompare size={13} /> : <TerminalSquare size={13} />}
             {action.label}
           </Button>
+          {showContinue && (
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={!firstWrite}
+              title={firstWrite ? undefined : t("thread.noWriteCopy")}
+              onClick={() =>
+                firstWrite && void driveDirection(direction.id, firstWrite.repo_id, true)
+              }
+            >
+              <Send size={13} />
+              {t("thread.continue")}
+            </Button>
+          )}
+          {showAccept && (
+            <Button
+              size="sm"
+              variant="primary"
+              className="task-complete-action"
+              disabled={completing}
+              onClick={() => {
+                setCompleting(true);
+                void completeDirection(direction.id).finally(() => setCompleting(false));
+              }}
+            >
+              <Check size={13} />
+              {completing ? t("thread.acceptingResult") : t("thread.acceptResult")}
+            </Button>
+          )}
         </div>
       </div>
     </motion.div>

@@ -102,6 +102,12 @@ pub fn enqueue_promotes_status(stored: &str) -> bool {
     normalize_status(stored) == STATUS_QUEUED
 }
 
+/// Persist [`WORKER_START_FAILED`] when enqueue spawn never started or any
+/// attempt failed. Adapters clear that code only after a successful start.
+pub fn enqueue_dispatch_failed(attempted: bool, failed: bool) -> bool {
+    failed || !attempted
+}
+
 /// How the scheduler tells a SessionPort to speak to the model.
 ///
 /// The crate never names `turn/steer` — that string stays in the Codex adapter.
@@ -277,6 +283,14 @@ mod tests {
         assert!(!enqueue_promotes_status("working"));
         assert!(!enqueue_promotes_status("review"));
         assert!(!enqueue_promotes_status("done"));
+    }
+
+    #[test]
+    fn enqueue_dispatch_failed_when_unattempted_or_errored() {
+        assert!(!enqueue_dispatch_failed(true, false));
+        assert!(enqueue_dispatch_failed(true, true));
+        assert!(enqueue_dispatch_failed(false, false));
+        assert!(enqueue_dispatch_failed(false, true));
     }
 
     struct FakePort;

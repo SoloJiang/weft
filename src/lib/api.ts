@@ -152,6 +152,14 @@ export const api = {
     invoke<IssueReadinessDto>("issue_readiness", { threadId }),
   renameDirection: (directionId: number, name: string) =>
     invoke<Direction>("rename_direction", { directionId, name }),
+  completeDirection: (directionId: number) =>
+    invoke<Direction>("complete_direction", { directionId }),
+  approveDirection: (threadId: number, index: number, manualTool?: string) =>
+    invoke<number>("approve_direction", {
+      threadId,
+      index,
+      manualTool: manualTool ?? null,
+    }),
 
   // Planner: the lead's proposed Task → scope decomposition (§4.10, §5.1).
   getProposal: (threadId: number) =>

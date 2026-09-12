@@ -68,6 +68,7 @@ impl MigratorTrait for Migrator {
             Box::new(M0053LeadHiddenDelivery),
             Box::new(M0054DirectionDependency),
             Box::new(M0055Evidence),
+            Box::new(M0056DirectionAttention),
         ]
     }
 }
@@ -2651,6 +2652,52 @@ impl MigrationTrait for M0055Evidence {
     }
 }
 
+/// Adds the direction-level enqueue/dispatch attention code. M0001 reflects
+/// the current entity, so a fresh db already has `attention_reason`; this
+/// only matters for dbs created before the column existed. sqlite has no
+/// ADD COLUMN IF NOT EXISTS, so tolerate the duplicate.
+pub struct M0056DirectionAttention;
+impl MigrationName for M0056DirectionAttention {
+    fn name(&self) -> &str {
+        "m0056_direction_attention"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M0056DirectionAttention {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let r = manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("direction"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("attention_reason"))
+                            .string()
+                            .not_null()
+                            .default(""),
+                    )
+                    .to_owned(),
+            )
+            .await;
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.to_string().to_lowercase().contains("duplicate column") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("direction"))
+                    .drop_column(Alias::new("attention_reason"))
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2658,7 +2705,7 @@ mod tests {
         M0046DirectionUpstream, M0047PullRequestThreadStatus, M0048HumanRequest,
         M0049HumanRequestSourceMessage, M0050HumanRequestImRoutes,
         M0051HumanCardTerminalOutbox, M0052RepoActionExecution, M0053LeadHiddenDelivery,
-        M0054DirectionDependency, M0055Evidence,
+        M0054DirectionDependency, M0055Evidence, M0056DirectionAttention,
     };
 
     #[test]
@@ -3411,6 +3458,34 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert!(indexes.contains("idx_evidence_thread"));
         assert!(indexes.contains("idx_evidence_direction_kind"));
+    }
+
+    #[tokio::test]
+    async fn m0056_direction_attention_is_rerunnable_and_defaults_empty() {
+        use crate::store::Db;
+        use sea_orm::{ConnectionTrait, Statement};
+        use sea_orm_migration::{MigrationTrait, SchemaManager};
+
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let manager = SchemaManager::new(&db.0);
+        M0056DirectionAttention.up(&manager).await.unwrap();
+        M0056DirectionAttention.up(&manager).await.unwrap();
+
+        let columns = db
+            .0
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "PRAGMA table_info(direction)".to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| row.try_get::<String>("", "name").ok())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            columns.contains("attention_reason"),
+            "direction.attention_reason must exist after m0056"
+        );
     }
 
     /// M0047 (issue #110): the same upgrade-path coverage M0046 gets, for the

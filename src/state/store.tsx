@@ -505,6 +505,8 @@ interface Store {
   deleteWorkspace: (workspaceId: number) => Promise<void>;
   renameThread: (threadId: number, title: string) => Promise<void>;
   renameDirection: (directionId: number, name: string) => Promise<void>;
+  /** Accept a review result (`can_complete`: review → done). */
+  completeDirection: (directionId: number) => Promise<void>;
   addRepo: (name: string, path: string) => Promise<void>;
   /** Batch add of existing local repos, sequential + tolerant. Reports per-item
    *  progress; refreshes the repo list once at the end. Duplicates are deduped
@@ -1465,6 +1467,22 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     },
     [refreshOverview],
   );
+
+  const completeDirection = useCallback(async (directionId: number) => {
+    try {
+      const updated = await api.completeDirection(directionId);
+      setDirections((m) => ({
+        ...m,
+        [updated.thread_id]: (m[updated.thread_id] ?? []).map((x) =>
+          x.id === updated.id ? updated : x,
+        ),
+      }));
+      void refreshOverview();
+    } catch (err) {
+      console.error(err);
+      toast(i18n.t("thread.acceptResultFailed"), "danger");
+    }
+  }, [refreshOverview]);
 
   const renameDirection = useCallback(async (directionId: number, name: string) => {
     const d = await api.renameDirection(directionId, name);
@@ -3583,6 +3601,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     deleteWorkspace,
     renameThread,
     renameDirection,
+    completeDirection,
     addRepo,
     addRepos,
     cloneRepo,

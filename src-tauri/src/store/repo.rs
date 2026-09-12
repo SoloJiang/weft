@@ -3594,6 +3594,62 @@ pub async fn pin_unstarted_unpinned_direction_route(
     Ok(())
 }
 
+/// Persist or clear a direction's enqueue/dispatch attention code.
+/// `None` / empty clears. No-op if the row is gone.
+pub async fn set_direction_attention(
+    db: &Db,
+    direction_id: i32,
+    reason: Option<&str>,
+) -> Result<()> {
+    let Some(d) = get_direction(db, direction_id).await? else {
+        return Ok(());
+    };
+    let next = reason.unwrap_or("").to_string();
+    if d.attention_reason == next {
+        return Ok(());
+    }
+    let mut a: direction::ActiveModel = d.into();
+    a.attention_reason = Set(next);
+    a.update(&db.0).await?;
+    Ok(())
+}
+
+/// Clear attention only when it still matches `reason` so a different code
+/// is not wiped by a later successful start.
+pub async fn clear_direction_attention_if(
+    db: &Db,
+    direction_id: i32,
+    reason: &str,
+) -> Result<()> {
+    let Some(d) = get_direction(db, direction_id).await? else {
+        return Ok(());
+    };
+    if d.attention_reason != reason {
+        return Ok(());
+    }
+    let mut a: direction::ActiveModel = d.into();
+    a.attention_reason = Set(String::new());
+    a.update(&db.0).await?;
+    Ok(())
+}
+
+/// Accept result: review → done. Returns whether this call flipped the row.
+pub async fn complete_direction_if_review(db: &Db, direction_id: i32) -> Result<bool> {
+    let result = db
+        .0
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "UPDATE direction SET status = ? WHERE id = ? AND status = ?",
+            [
+                weft_scheduler::STATUS_DONE.into(),
+                direction_id.into(),
+                weft_scheduler::STATUS_REVIEW.into(),
+            ],
+        ))
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Set a direction's lifecycle status (agent- or human-driven). No-op if gone.
 pub async fn set_direction_status(db: &Db, direction_id: i32, status: &str) -> Result<()> {
     if let Some(d) = direction::Entity::find_by_id(direction_id)
@@ -17609,5 +17665,51 @@ mod tests {
         let rows = list_evidence(&db, thread_id, Some(12345), 10).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].direction_id, 12345);
+    }
+
+    #[tokio::test]
+    async fn direction_attention_and_complete_if_review() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let (_ws, repo, thread) = direction_parent_fixture(&db, "attention-complete").await;
+        let dir = create_direction(
+            &db,
+            thread.id,
+            "A",
+            "codex",
+            repo.id,
+            "r",
+            "plan+impl",
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(dir.attention_reason.is_empty());
+
+        set_direction_attention(&db, dir.id, Some(weft_scheduler::WORKER_START_FAILED))
+            .await
+            .unwrap();
+        let flagged = get_direction(&db, dir.id).await.unwrap().unwrap();
+        assert_eq!(flagged.attention_reason, weft_scheduler::WORKER_START_FAILED);
+
+        clear_direction_attention_if(&db, dir.id, "turn failed")
+            .await
+            .unwrap();
+        let still = get_direction(&db, dir.id).await.unwrap().unwrap();
+        assert_eq!(still.attention_reason, weft_scheduler::WORKER_START_FAILED);
+
+        clear_direction_attention_if(&db, dir.id, weft_scheduler::WORKER_START_FAILED)
+            .await
+            .unwrap();
+        let cleared = get_direction(&db, dir.id).await.unwrap().unwrap();
+        assert!(cleared.attention_reason.is_empty());
+
+        assert!(!complete_direction_if_review(&db, dir.id).await.unwrap());
+        set_direction_status(&db, dir.id, weft_scheduler::STATUS_REVIEW)
+            .await
+            .unwrap();
+        assert!(complete_direction_if_review(&db, dir.id).await.unwrap());
+        let done = get_direction(&db, dir.id).await.unwrap().unwrap();
+        assert_eq!(done.status, weft_scheduler::STATUS_DONE);
+        assert!(!complete_direction_if_review(&db, dir.id).await.unwrap());
     }
 }

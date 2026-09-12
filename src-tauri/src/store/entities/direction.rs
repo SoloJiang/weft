@@ -55,6 +55,10 @@ pub struct Model {
     /// from `target_branch` (diff-comparison only); fixed once the worktree exists.
     #[sea_orm(default_value = "")]
     pub base_branch: String,
+    /// Stable enqueue/dispatch attention code. Empty = none. UI maps via
+    /// `attention-reason`; adapters must not interpolate a raw error here.
+    #[sea_orm(default_value = "")]
+    pub attention_reason: String,
     pub created_at: String,
 }
 
