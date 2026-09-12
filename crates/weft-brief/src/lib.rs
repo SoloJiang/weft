@@ -15,6 +15,11 @@ pub fn direction_party(direction_id: i64) -> String {
 
 pub const LEAD_PARTY: &str = "lead";
 
+/// Shared mandate discriminator. Adapter copy around it may differ.
+pub fn is_impl_only_mandate(mandate: &str) -> bool {
+    mandate == "impl-only"
+}
+
 /// The bus usage block appended to every brief. `extra_tools` is adapter copy
 /// (lead-only MCP tools, weft ask_human, …) inserted after the shared tools.
 pub fn bus_block(party: &str, bus_url: &str, extra_tools: &str) -> String {
@@ -80,7 +85,7 @@ pub fn direction_brief(
     } else {
         format!("\nTask:\n{spec}\n")
     };
-    let mandate_line = if mandate == "impl-only" {
+    let mandate_line = if is_impl_only_mandate(mandate) {
         "Mandate: impl-only — the scope is fully specified; build straight away."
     } else {
         "Mandate: plan+impl — plan your own direction first, then build it."
@@ -209,6 +214,13 @@ mod tests {
         assert!(b.contains("sessions expire early"));
         assert!(b.contains("party `3`"));
         assert!(b.contains("weft-bus"));
+    }
+
+    #[test]
+    fn impl_only_mandate_is_shared() {
+        assert!(is_impl_only_mandate("impl-only"));
+        assert!(!is_impl_only_mandate("plan+impl"));
+        assert!(!is_impl_only_mandate(""));
     }
 
     #[test]
