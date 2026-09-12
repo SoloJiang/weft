@@ -63,6 +63,45 @@ pub fn can_complete(status: &str) -> bool {
     normalize_status(status) == STATUS_REVIEW
 }
 
+/// A direction accepted onto the automatic-dispatch queue after a human or
+/// lead gate. Adapters persist [`EnqueueJob::status`] and start the worker;
+/// this crate does not touch a store or a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnqueueJob {
+    pub direction_id: i64,
+    pub status: &'static str,
+}
+
+/// After the adapter's human/lead gate, these direction ids become
+/// automatic-dispatch jobs. Order is preserved. Duplicates and non-positive
+/// ids are dropped.
+pub fn enqueue(direction_ids: impl IntoIterator<Item = i64>) -> Vec<EnqueueJob> {
+    let mut seen = HashSet::new();
+    let mut jobs = Vec::new();
+    for direction_id in direction_ids {
+        if direction_id <= 0 {
+            continue;
+        }
+        if !seen.insert(direction_id) {
+            continue;
+        }
+        jobs.push(EnqueueJob {
+            direction_id,
+            status: initial_status(),
+        });
+    }
+    jobs
+}
+
+/// Persist `initial_status` only for lanes that have not started yet.
+/// Already-working / review / done rows stay put on an idempotent re-confirm.
+pub fn enqueue_promotes_status(stored: &str) -> bool {
+    if stored == "planning" {
+        return true;
+    }
+    normalize_status(stored) == STATUS_QUEUED
+}
+
 /// How the scheduler tells a SessionPort to speak to the model.
 ///
 /// The crate never names `turn/steer` — that string stays in the Codex adapter.
@@ -209,6 +248,35 @@ mod tests {
     fn delivery_mode_is_idle_or_merge_not_protocol() {
         assert_eq!(delivery_mode(true), DeliveryMode::MergeActive);
         assert_eq!(delivery_mode(false), DeliveryMode::StartIdle);
+    }
+
+    #[test]
+    fn enqueue_dedupes_and_skips_non_positive() {
+        assert!(enqueue(std::iter::empty()).is_empty());
+        let jobs = enqueue([1, 1, 0, -3, 2]);
+        assert_eq!(
+            jobs,
+            vec![
+                EnqueueJob {
+                    direction_id: 1,
+                    status: STATUS_WORKING,
+                },
+                EnqueueJob {
+                    direction_id: 2,
+                    status: STATUS_WORKING,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn enqueue_promotes_only_unstarted_lanes() {
+        assert!(enqueue_promotes_status("queued"));
+        assert!(enqueue_promotes_status("planning"));
+        assert!(enqueue_promotes_status("unknown"));
+        assert!(!enqueue_promotes_status("working"));
+        assert!(!enqueue_promotes_status("review"));
+        assert!(!enqueue_promotes_status("done"));
     }
 
     struct FakePort;

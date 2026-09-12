@@ -607,7 +607,11 @@ async fn create_task(state: &McpState, issue_id: i64, party: &str, args: &Value)
         "direction.updated",
         json!({ "id": task_id, "issueId": issue_id, "status": "queued" }),
     );
-    if state.task_dispatch.send(task_id).is_err() {
+    let jobs = weft_scheduler::enqueue(std::iter::once(task_id));
+    let Some(job) = jobs.into_iter().next() else {
+        return text_result(format!("error: task {task_id} was created, but enqueue rejected it"));
+    };
+    if state.task_dispatch.send(job.direction_id).is_err() {
         let _ = state
             .store
             .set_direction_attention(task_id, Some(WORKER_START_FAILED))

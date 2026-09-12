@@ -5,7 +5,6 @@ import * as DM from "@radix-ui/react-dropdown-menu";
 import { listen } from "@tauri-apps/api/event";
 import {
   Check,
-  ChevronDown,
   Copy,
   FolderGit2,
   FolderTree,
@@ -63,14 +62,6 @@ type PrChangedEvent = { thread_id: number };
 
 const COLUMNS: { key: TaskState; label: string; dot: string }[] = [
   { key: "working", label: "thread.colRunning", dot: "bg-running" },
-  { key: "review", label: "thread.colReview", dot: "bg-brand" },
-  { key: "done", label: "thread.colDone", dot: "bg-accent" },
-];
-
-/** Stored statuses a human may set directly (sub-states of the lifecycle). */
-const SETTABLE: { key: string; label: string; dot: string }[] = [
-  { key: "planning", label: "thread.statusPlanning", dot: "bg-idle" },
-  { key: "working", label: "thread.statusBuilding", dot: "bg-running" },
   { key: "review", label: "thread.colReview", dot: "bg-brand" },
   { key: "done", label: "thread.colDone", dot: "bg-accent" },
 ];
@@ -467,7 +458,6 @@ function DirectionCard({
               >
                 <Pencil size={12} />
               </button>
-              <StatusMenu direction={direction} />
             </div>
           </div>
         </div>
@@ -732,48 +722,6 @@ function TrustSignal({ kind, label }: { kind: TrustKind; label: string }) {
       )}
       <span className="truncate">{label}</span>
     </span>
-  );
-}
-
-/** Keyboard/click path to restatus a task. Sets the stored status (§4.6);
- *  Needs-you is a weft-derived tag, not a status, so it isn't offered. */
-function StatusMenu({ direction }: { direction: Direction }) {
-  const { setTaskStatus } = useStore();
-  const { t } = useTranslation();
-  const settable = SETTABLE;
-  const current = settable.find((c) => c.key === direction.status) ?? settable[0];
-  return (
-    <DM.Root>
-      <DM.Trigger
-        title={t("thread.setStatus")}
-        aria-label={t("thread.setStatus")}
-        onClick={(e) => e.stopPropagation()}
-        className="flex items-center gap-1 rounded-full px-1.5 py-0.5 text-ink-faint outline-none transition-colors hover:bg-brand-ghost hover:text-ink data-[state=open]:bg-brand-ghost data-[state=open]:text-ink"
-      >
-        <span className={cn("h-2 w-2 rounded-full", current.dot)} />
-        <ChevronDown size={11} />
-      </DM.Trigger>
-      <DM.Portal>
-        <DM.Content
-          align="end"
-          sideOffset={4}
-          onClick={(e) => e.stopPropagation()}
-          className="weft-pop z-[60] w-40 rounded-[var(--radius-md)] border border-border bg-raised p-1 shadow-[0_8px_24px_-8px_rgba(0,0,0,0.5)]"
-        >
-          {settable.map((c) => (
-            <DM.Item
-              key={c.key}
-              onSelect={() => void setTaskStatus(direction.id, c.key)}
-              className="flex cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] px-2 py-1.5 text-[12px] text-ink-muted outline-none data-[highlighted]:bg-brand-ghost data-[highlighted]:text-ink"
-            >
-              <span className={cn("h-1.5 w-1.5 rounded-full", c.dot)} />
-              {t(c.label)}
-              {c.key === current.key && <Check size={12} className="ml-auto text-brand" />}
-            </DM.Item>
-          ))}
-        </DM.Content>
-      </DM.Portal>
-    </DM.Root>
   );
 }
 

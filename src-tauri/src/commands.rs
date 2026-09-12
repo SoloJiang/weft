@@ -2815,6 +2815,7 @@ async fn confirm_proposal_and_propagate_read_only_with_manual_tool(
 ) -> anyhow::Result<Vec<i32>> {
     let ids = crate::planner::confirm_with_manual_tool(db, thread_id, manual_tool).await?;
     asks.grant_read_only_issue(thread_id);
+    crate::coordinator::persist_enqueued(db, &ids).await?;
     Ok(ids)
 }
 
@@ -2841,6 +2842,9 @@ async fn confirm_proposal_and_propagate_read_only_with_manual_tool_and_live_sess
     // AllowedByPolicy lanes (see `readiness::proposal_lane_policy`'s
     // Confirmed-phase rule), so every id here gets that verdict.
     record_confirm_decision_evidence(db, thread_id, &ids).await;
+    // Human gate is done. Shared enqueue persists initial_status; spawn is
+    // the SessionPort adapter in the tauri command (not lead_chat).
+    crate::coordinator::persist_enqueued(db, &ids).await?;
     Ok(ids)
 }
 
@@ -2900,9 +2904,50 @@ pub async fn confirm_proposal(
     )
     .await
     .map_err(e)?;
+    let jobs = weft_scheduler::enqueue(ids.iter().copied().map(i64::from));
+    start_enqueued_workers(&app, &db, &jobs).await;
     use tauri::Emitter;
     let _ = app.emit("needs-you://changed", thread_id);
     Ok(ids)
+}
+
+/// SessionPort adapter: open each enqueued worker. Enqueue policy stays in
+/// `weft-scheduler`; `lead_chat` only speaks to the session.
+async fn start_enqueued_workers(
+    app: &tauri::AppHandle,
+    db: &Db,
+    jobs: &[weft_scheduler::EnqueueJob],
+) {
+    use crate::lead_chat::commands::chat_open_worker_impl;
+    use tauri::Emitter;
+    let mut started = 0usize;
+    for job in jobs {
+        let Ok(direction_id) = i32::try_from(job.direction_id) else {
+            continue;
+        };
+        let worktrees = match repo::list_worktrees(db, Some(direction_id)).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                eprintln!("[weft] list worktrees for enqueued {direction_id}: {error}");
+                continue;
+            }
+        };
+        for worktree in worktrees {
+            if !std::path::Path::new(&worktree.path).exists() {
+                continue;
+            }
+            match chat_open_worker_impl(app, db, direction_id, worktree.repo_id, "en").await {
+                Ok(_) => started += 1,
+                Err(error) => eprintln!(
+                    "[weft] enqueue dispatch {direction_id}@{} failed: {error}",
+                    worktree.repo_id
+                ),
+            }
+        }
+    }
+    if started > 0 {
+        let _ = app.emit("worker-revived", ());
+    }
 }
 
 /// The brief a worker for this direction would be dispatched with (§4.10).
@@ -9261,6 +9306,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ids.len(), 1, "the single lane should materialize");
+        let created = repo::get_direction(&db, ids[0])
+            .await
+            .unwrap()
+            .expect("confirmed direction");
+        assert_eq!(
+            created.status,
+            weft_scheduler::initial_status(),
+            "confirm enqueue promotes queued → working"
+        );
         let dir = ids[0].to_string();
 
         // the propagated grant covers a ReadOnly ask on the JUST-created direction...

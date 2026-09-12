@@ -18,13 +18,36 @@
 
 use crate::bus::Wake;
 use crate::lead_chat::engine::STATUS_STOPPED;
+use crate::store::{repo, Db};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
-use weft_scheduler::{classify_party, Inflight, PartyRoute};
+use weft_scheduler::{
+    classify_party, enqueue, enqueue_promotes_status, EnqueueJob, Inflight, PartyRoute,
+};
 
 fn classify(dir: &str) -> Option<PartyRoute> {
     classify_party(dir)
+}
+
+/// Persist the shared enqueue after the human gate. Does not spawn sessions —
+/// the command layer starts workers via SessionPort (`chat_open_worker_impl`).
+pub(crate) async fn persist_enqueued(
+    db: &Db,
+    direction_ids: &[i32],
+) -> anyhow::Result<Vec<EnqueueJob>> {
+    let jobs = enqueue(direction_ids.iter().copied().map(i64::from));
+    for job in &jobs {
+        let direction_id = i32::try_from(job.direction_id)
+            .map_err(|_| anyhow::anyhow!("direction id out of i32 range"))?;
+        let Some(direction) = repo::get_direction(db, direction_id).await? else {
+            continue;
+        };
+        if enqueue_promotes_status(&direction.status) {
+            repo::set_direction_status(db, direction_id, job.status).await?;
+        }
+    }
+    Ok(jobs)
 }
 
 /// Run the coordinator loop on a dedicated OS thread (the mpsc Receiver is
@@ -196,5 +219,15 @@ mod tests {
         assert!(f.next(k)); // loop end sees the coalesced wake → re-deliver
         assert!(!f.next(k)); // nothing pending → release the key
         assert!(f.begin(k)); // a later wake starts a fresh loop
+    }
+
+    #[test]
+    fn enqueue_after_gate_is_the_shared_scheduler() {
+        let jobs = enqueue([4, 4, 0]);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].direction_id, 4);
+        assert_eq!(jobs[0].status, weft_scheduler::initial_status());
+        assert!(enqueue_promotes_status("queued"));
+        assert!(!enqueue_promotes_status("review"));
     }
 }
